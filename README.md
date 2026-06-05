@@ -32,8 +32,8 @@ Platforms: `linux/amd64,linux/arm64` by default; override per app via
 | Repo | Owns |
 |---|---|
 | [`corpo-valley-main`](https://github.com/corpo-valley/corpo-valley-main) (this) | app source, Dockerfiles, image build workflow |
-| [`corpo-valley-chart`](https://github.com/hashtagcyber/corpo-valley-chart) | Helm chart — how to deploy |
-| [`corpo-valley-hetzner`](https://github.com/hashtagcyber/corpo-valley-hetzner) | per-cluster values, Terraform, bootstrap — where to deploy |
+| [`corpo-valley-chart`](https://github.com/corpo-valley/corpo-valley-chart) | Helm chart — how to deploy |
+| [`corpo-valley-hetzner`](https://github.com/corpo-valley/corpo-valley-hetzner) | per-cluster values, Terraform, bootstrap — where to deploy |
 
 A change to `typescript/portal/` here triggers a new image. To roll that
 image out, bump `image.tags.portal` in the consuming deployment repo's
