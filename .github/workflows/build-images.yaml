@@ -1,0 +1,161 @@
+# Build + publish Corpo Valley platform container images to GHCR.
+#
+# Triggers on push to main when app source changes, plus manual dispatch.
+# Images publish to ghcr.io/corpo-valley/corpo-valley-<app>:{latest,YYYYMMDD-<sha>}
+# under the org's public packages namespace.
+#
+# This repo does NOT bump deployment manifests with the new tag — the
+# corpo-valley-chart consumer (e.g. corpo-valley-hetzner) owns
+# values.yaml `image.tags.<component>` and is bumped separately. That's the
+# whole point of the split: build artifacts here, deploy intent there.
+
+name: Build Container Images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'typescript/**'
+      - 'python/**'
+      - 'containers/**'
+      - 'static/**'
+      - 'frontend/**'
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'App to build (empty = all changed)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  GHCR_NAMESPACE: corpo-valley
+  IMAGE_PREFIX: corpo-valley-
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.detect.outputs.apps }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed apps
+        id: detect
+        run: |
+          if [ -n "${{ github.event.inputs.app_name }}" ]; then
+            echo "apps=[\"${{ github.event.inputs.app_name }}\"]" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+            APPS=$(echo "$CHANGED_FILES" | grep -E '^(typescript|python|containers|static|frontend)/' | \
+              sed -E 's#^(typescript|python|containers|static|frontend)/([^/]+).*#\2#' | \
+              sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            if [ "$APPS" = "[]" ] || [ -z "$APPS" ]; then
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              echo "apps=[]" >> $GITHUB_OUTPUT
+            else
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+              echo "apps=$APPS" >> $GITHUB_OUTPUT
+            fi
+          fi
+          echo "Detected: $(cat $GITHUB_OUTPUT | grep apps)"
+
+  build:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.detect-changes.outputs.apps) }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine source directory
+        id: source
+        run: |
+          CONTEXT_FILE="containers/${{ matrix.app }}/context.txt"
+          if [ -f "$CONTEXT_FILE" ]; then
+            CONTEXT_DIR=$(cat "$CONTEXT_FILE" | tr -d '\n')
+            echo "dir=$CONTEXT_DIR" >> $GITHUB_OUTPUT
+          elif [ -d "frontend/${{ matrix.app }}" ] && [ -d "typescript/${{ matrix.app }}" ]; then
+            echo "dir=." >> $GITHUB_OUTPUT
+          elif [ -d "typescript/${{ matrix.app }}" ]; then
+            echo "dir=typescript/${{ matrix.app }}" >> $GITHUB_OUTPUT
+          elif [ -d "python/${{ matrix.app }}" ]; then
+            echo "dir=python/${{ matrix.app }}" >> $GITHUB_OUTPUT
+          elif [ -d "static/${{ matrix.app }}" ]; then
+            echo "dir=." >> $GITHUB_OUTPUT
+          else
+            echo "No source directory for ${{ matrix.app }}" >&2
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Version tag
+        id: version
+        run: echo "tag=$(date +%Y%m%d)-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.app }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=ref,event=branch
+            type=ref,event=tag
+
+      - name: Build platforms
+        id: platforms
+        run: |
+          PLATFORM_FILE="containers/${{ matrix.app }}/platforms.txt"
+          if [ -f "$PLATFORM_FILE" ]; then
+            PLATFORMS=$(cat "$PLATFORM_FILE" | tr '\n' ',' | sed 's/,$//')
+          else
+            PLATFORMS="linux/amd64,linux/arm64"
+          fi
+          echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: ${{ steps.source.outputs.dir }}
+          file: containers/${{ matrix.app }}/Dockerfile
+          platforms: ${{ steps.platforms.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Corpo Valley ${{ matrix.app }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image summary
+        run: |
+          echo "### Built ${{ matrix.app }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.app }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | while read tag; do
+            echo "- \`$tag\`" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Bump in deployment repo:** edit \`clusters/<cluster>/values.yaml\` \`image.tags.${{ matrix.app }}\` to \`${{ steps.version.outputs.tag }}\`." >> $GITHUB_STEP_SUMMARY
