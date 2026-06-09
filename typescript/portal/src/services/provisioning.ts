@@ -1,18 +1,10 @@
 // Platform-side provisioning for human identities: the EVERYONE membership
 // grant, a paired `.bot` identity (+ BETA tier), and Gitea accounts.
 //
-// This used to be driven by a Kratos after-registration web_hook calling the
-// portal. That coupling forced a shared secret into Kratos's config (which
-// Kratos can't deliver cleanly for a nested hook list). Instead the portal — which
-// already holds Kratos-admin, Keto, and Gitea-admin credentials — provisions the
-// user itself, idempotently, the first time it sees them authenticated:
-//   - admin-created users: synchronously at create time (routes/admin.ts), and
-//   - self-service registrants: on their first authenticated request, via the
-//     once-per-process trigger below (middleware/session.ts).
-//
-// Security note: ensureProvisioned operates ONLY on a canonical Kratos Identity
-// (from a validated session or an admin-API create/lookup) — never on
-// request-body data — so the login/registration path takes no untrusted input.
+// Self-service registration is disabled, so the only way an account is created
+// is an admin via routes/admin.ts, which calls this synchronously at create
+// time. ensureProvisioned operates ONLY on a canonical Kratos Identity (the
+// admin-API create result) — never on request-body data.
 
 import { Identity } from '@ory/client';
 import { ensureBotForHuman } from './kratos-admin';
@@ -59,25 +51,4 @@ export async function ensureProvisioned(identity: Identity): Promise<void> {
   } catch (err: any) {
     console.error('[provision] Gitea provisioning failed', identity.id, err?.message);
   }
-}
-
-// Run ensureProvisioned at most once per (user, process). Safe to call on every
-// authenticated request: after the first successful run it is a single Set
-// membership check with no Kratos/Gitea round-trip. Fire-and-forget — the caller
-// is NOT blocked (provisioning isn't needed to serve the current request; by the
-// time a freshly-registered user navigates to anything that needs their bot/repo,
-// the background pass has finished).
-const provisioned = new Set<string>();   // completed this process
-const inFlight = new Set<string>();       // currently running (dedupe concurrent first-hits)
-
-export function provisionOncePerProcess(identity: Identity | undefined | null): void {
-  const id = identity?.id;
-  if (!id || provisioned.has(id) || inFlight.has(id)) return;
-  inFlight.add(id);
-  // identity is non-null here (id derived from it).
-  ensureProvisioned(identity!)
-    .then(() => { provisioned.add(id); })
-    // On failure DON'T mark provisioned, so the user's next request retries.
-    .catch((err: any) => { console.error('[provision] ensure failed', id, err?.message); })
-    .finally(() => { inFlight.delete(id); });
 }
