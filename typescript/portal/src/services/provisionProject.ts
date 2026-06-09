@@ -11,7 +11,7 @@
 // retry from later.
 
 import type { Project } from './projects';
-import { claimOrGetPostgresPassword, setGiteaRepo, setPinTokenHash } from './projects';
+import { claimOrGetPostgresPassword, decodePostgresPassword, setGiteaRepo, setPinTokenHash } from './projects';
 import { type Capabilities, requiresPostgres, TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO } from './templates';
 import { enablePostgres, generatePostgresPassword } from './postgres';
 import { composeProjectManifests } from './manifests';
@@ -73,8 +73,9 @@ export async function provisionProject(
       // syncs the database container.
       if (requiresPostgres(caps)) {
         try {
-          const { password } = project.postgres_password
-            ? { password: project.postgres_password }
+          const existingPw = decodePostgresPassword(project);
+          const { password } = existingPw
+            ? { password: existingPw }
             : await claimOrGetPostgresPassword(project.id, generatePostgresPassword());
           await enablePostgres({ owner: ownerUsername, repo: slug, slug, password });
           result.postgresEnabled = true;

@@ -5,6 +5,8 @@
 // pixel-art. The structural CSS approach (clean, responsive, inline) is
 // carried over from the reference portal.
 
+import { cspNonce } from './lib/csp-nonce';
+
 const GOOGLE_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" style="vertical-align:middle;margin-right:8px;"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>`;
 
 // Warm valley palette: deep soil-night background, parchment text, harvest
@@ -525,7 +527,8 @@ export function renderError(title: string, error: string, details?: string): str
 export function renderConsentPage(
   clientName: string,
   scopes: string[],
-  consentChallenge: string
+  consentChallenge: string,
+  csrfField: string = ''
 ): string {
   const scopeList = scopes.map(s => `<li>${escapeHtml(s)}</li>`).join('');
   const body = `
@@ -533,15 +536,34 @@ export function renderConsentPage(
     <p style="color:#c4b698;margin-bottom:1rem;"><strong>${escapeHtml(clientName)}</strong> is requesting access to your account.</p>
     ${scopes.length > 0 ? `<p style="color:#c4b698;margin-bottom:0.5rem;">Requested permissions:</p><ul style="color:#f3ead9;margin:0 0 1.5rem 1.5rem;">${scopeList}</ul>` : ''}
     <form method="POST" action="/consent/accept" style="margin-bottom:0.5rem;">
+      ${csrfField}
       <input type="hidden" name="consent_challenge" value="${escapeHtml(consentChallenge)}">
       <button type="submit">Allow</button>
     </form>
     <form method="POST" action="/consent/deny">
+      ${csrfField}
       <input type="hidden" name="consent_challenge" value="${escapeHtml(consentChallenge)}">
       <button type="submit" style="background:#4a3c2c;color:#f3ead9;">Deny</button>
     </form>
   `;
   return layout('Authorize', body);
+}
+
+export function renderLogoutConfirm(
+  logoutChallenge: string,
+  csrfField: string = ''
+): string {
+  const body = `
+    <h1>Log out?</h1>
+    <p style="color:#c4b698;margin-bottom:1.5rem;">You're about to be signed out of Corpo Valley.</p>
+    <form method="POST" action="/logout/accept" style="margin-bottom:0.5rem;">
+      ${csrfField}
+      <input type="hidden" name="logout_challenge" value="${escapeHtml(logoutChallenge)}">
+      <button type="submit">Log out</button>
+    </form>
+    <div class="links"><a href="/">Cancel</a></div>
+  `;
+  return layout('Log out', body);
 }
 
 export function renderInfo(title: string, message: string): string {
@@ -592,8 +614,8 @@ function dashboardLayout(
   <style>${CSS}</style>
 </head>
 <body class="dashboard-body">
-  <button class="nav-toggle" onclick="document.querySelector('.nav').classList.toggle('open');document.querySelector('.nav-overlay').classList.toggle('open')" aria-label="Toggle menu">&#9776;</button>
-  <div class="nav-overlay" onclick="document.querySelector('.nav').classList.remove('open');this.classList.remove('open')"></div>
+  <button class="nav-toggle" data-nav-toggle aria-label="Toggle menu">&#9776;</button>
+  <div class="nav-overlay" data-nav-overlay></div>
   <div class="dashboard-wrap">
     <nav class="nav">
       <h2>🌱 Corpo Valley</h2>
@@ -609,6 +631,42 @@ function dashboardLayout(
       ${bodyHtml}
     </main>
   </div>
+  <script nonce="${cspNonce()}">
+    (function(){
+      // Delegated handlers replace inline on* attributes so the CSP can drop
+      // script-src 'unsafe-inline'.
+      var nav = document.querySelector('.nav');
+      var overlay = document.querySelector('[data-nav-overlay]');
+      var toggle = document.querySelector('[data-nav-toggle]');
+      if (toggle) toggle.addEventListener('click', function(){
+        if (nav) nav.classList.toggle('open');
+        if (overlay) overlay.classList.toggle('open');
+      });
+      if (overlay) overlay.addEventListener('click', function(){
+        if (nav) nav.classList.remove('open');
+        overlay.classList.remove('open');
+      });
+      // Confirm-on-submit for any form carrying data-confirm="message".
+      document.addEventListener('submit', function(e){
+        var form = e.target;
+        if (form && form.getAttribute && form.hasAttribute('data-confirm')) {
+          if (!window.confirm(form.getAttribute('data-confirm'))) e.preventDefault();
+        }
+      });
+      // Copy-to-clipboard for buttons carrying data-copy-target="<elementId>".
+      document.addEventListener('click', function(e){
+        var btn = e.target && e.target.closest ? e.target.closest('[data-copy-target]') : null;
+        if (!btn) return;
+        var el = document.getElementById(btn.getAttribute('data-copy-target'));
+        if (!el || !navigator.clipboard) return;
+        navigator.clipboard.writeText(el.innerText).then(function(){
+          var o = btn.textContent;
+          btn.textContent = 'Copied ✓';
+          setTimeout(function(){ btn.textContent = o; }, 1500);
+        });
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -809,7 +867,7 @@ export function renderProjectCreate(
       .visibility-option.selected { border-color: #e8b94a; background: #3a3120; }
     </style>
 
-    <script>
+    <script nonce="${cspNonce()}">
       (function(){
         var name = document.getElementById('name');
         var slugInput = document.getElementById('slug');
@@ -910,7 +968,7 @@ export function renderProjectDetail(
               <form method="POST"
                     action="/projects/${escapeHtml(project.id)}/secrets/${escapeHtml(s.name)}/delete"
                     class="inline-form"
-                    onsubmit="return confirm('Delete sealed secret ${escapeHtml(s.name)}? This removes it from your repo on the next sync.')">
+                    data-confirm="Delete sealed secret ${escapeHtml(s.name)}? This removes it from your repo on the next sync.">
                 ${csrf}
                 <button type="submit" class="btn btn-danger btn-sm">Delete</button>
               </form>
@@ -999,7 +1057,7 @@ claude`
       .cv-tab.active { color:#fdf6e8; border-bottom-color:#e8b94a; }
       .cv-tab-panel[hidden] { display:none; }
     </style>
-    <script>
+    <script nonce="${cspNonce()}">
       (function(){
         var tabs = document.querySelectorAll('.cv-tabs .cv-tab');
         var panels = document.querySelectorAll('.cv-tabs .cv-tab-panel');
@@ -1092,7 +1150,7 @@ claude`
       </p>
       <p class="help" style="margin-bottom:0.85rem;">Your <code>database</code> container already reads <code>DATABASE_URL</code> from the in-cluster Secret <code>postgres</code> (same namespace) via <code>secretKeyRef</code>. If you hand-write your own Deployment, project <code>DATABASE_URL</code> from the <code>postgres</code> Secret.</p>
       <form method="POST" action="/projects/${escapeHtml(project.id)}/postgres/disable"
-            onsubmit="return confirm('Remove Postgres from ${escapeHtml(project.slug)}? The database pod is removed by ArgoCD; the data volume stays unless you check &quot;also delete the data&quot; below.')">
+            data-confirm="Remove Postgres from ${escapeHtml(project.slug)}? The database pod is removed by ArgoCD; the data volume stays unless you check &quot;also delete the data&quot; below.">
         ${csrf}
         <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem;font-size:0.85rem;color:#a89878;">
           <input type="checkbox" name="destroy_data" value="true" />
@@ -1119,7 +1177,7 @@ claude`
       <h3 style="margin:0 0 0.35rem 0;color:#f3a5a5;">Danger zone</h3>
       <p class="help" style="margin-bottom:0.75rem;">Deleting removes this project record from the portal. Your Gitea repository and cluster namespace are not removed automatically — clean those up separately if you want them gone.</p>
       <form method="POST" action="/projects/${escapeHtml(project.id)}/delete"
-            onsubmit="return confirm('Delete project ${escapeHtml(project.slug)}? This cannot be undone.')">
+            data-confirm="Delete project ${escapeHtml(project.slug)}? This cannot be undone.">
         ${csrf}
         <button type="submit" class="btn btn-danger">Delete project</button>
       </form>
@@ -1194,7 +1252,7 @@ url = "${MCP_URL}"`;
       .editor-block { margin-bottom: 1rem; }
       .editor-block .snippet { margin-top: 0; }
     </style>
-    <script>
+    <script nonce="${cspNonce()}">
       (function(){
         document.querySelectorAll('.cv-copy').forEach(function(b){
           b.addEventListener('click', function(){
@@ -1260,7 +1318,7 @@ export function renderKeyManagement(
         <td>${escapeHtml(key.createdAt)}</td>
         <td>
           <form method="POST" action="/keys/${escapeHtml(key.clientId)}/revoke" class="inline-form"
-                onsubmit="return confirm('Revoke this key? Tokens issued from it will stop working.')">
+                data-confirm="Revoke this key? Tokens issued from it will stop working.">
             ${csrf}
             <button type="submit" class="btn btn-danger btn-sm">Revoke</button>
           </form>
@@ -1409,7 +1467,7 @@ claude`
       <h3 style="margin-top:1.25rem;margin-bottom:0.35rem;">Ready-to-paste commands</h3>
       <pre class="snippet" id="cv-clone-cmd-revealed">${escapeHtml(cmdBlock)}</pre>
       <button type="button" class="btn btn-sm btn-secondary"
-              onclick="(function(b){navigator.clipboard.writeText(document.getElementById('cv-clone-cmd-revealed').innerText).then(()=>{const o=b.textContent;b.textContent='Copied ✓';setTimeout(()=>b.textContent=o,1500);});})(this)"
+              data-copy-target="cv-clone-cmd-revealed"
               style="margin-top:0.5rem;">Copy commands</button>
       <p class="help" style="margin-top:0.75rem;">The token is embedded in the clone URL — git stores it in <code>.git/config</code> on first use. Pull this off any machine you trust.</p>
     ` : ''}
@@ -1640,7 +1698,7 @@ export function renderAdminApps(
       </td>
       <td>
         <form method="POST" action="/admin/apps/${escapeHtml(app.clientId)}/delete" class="inline-form"
-              onsubmit="return confirm('Delete ${escapeHtml(app.clientId)}?')">
+              data-confirm="Delete ${escapeHtml(app.clientId)}?">
           ${csrf}
           <button type="submit" class="btn btn-danger btn-sm">Delete</button>
         </form>
@@ -1924,17 +1982,23 @@ export function renderRecoveryPage(
   const code = extractField(getNode(nodes, 'code'));
   // After Kratos sends the email, the same flow page renders with a `code`
   // text input added. Switch the page's title and submit label accordingly.
-  const inCodeStage = nodes.some(n => n.attributes.name === 'code' && n.attributes.type !== 'submit');
+  const inCodeStage = nodes.some(n => n.group === 'code' && n.attributes.name === 'code' && n.attributes.type !== 'submit');
 
   const title = inCodeStage ? 'Enter recovery code' : 'Recover account';
   const submitLabel = inCodeStage ? 'Continue' : 'Send recovery email';
 
   let body = `<h1>${title}</h1>${topMessagesHtml(messages)}`;
+  // In the code stage the email is display-only and MUST NOT be submitted:
+  // Kratos's recovery `code` strategy treats a posted `email` field as a
+  // request to (re)send a code, so including it makes every code submission
+  // resend instead of verify — an endless loop. We drop `name="email"` here
+  // so the POST body carries only csrf_token + code + method=code; the flow
+  // ID in the form action is all Kratos needs to verify the code.
   body += `<form action="${escapeHtml(action)}" method="POST">
     ${hiddenCsrf(csrf)}
     <div class="field">
       <label for="email">Email</label>
-      <input type="email" name="email" id="email" value="${escapeHtml(email.value)}" required${inCodeStage ? ' readonly' : ' autofocus'}>
+      <input type="email"${inCodeStage ? '' : ' name="email"'} id="email" value="${escapeHtml(email.value)}"${inCodeStage ? ' readonly' : ' required autofocus'}>
       ${fieldErrorHtml(email.error)}
     </div>
     ${inCodeStage ? `

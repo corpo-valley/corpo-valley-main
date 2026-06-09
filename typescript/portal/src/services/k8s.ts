@@ -604,6 +604,23 @@ export async function removeMcpGateway(slug: string): Promise<void> {
 // be sealed (caller must NOT register the ArgoCD app in that case — fail
 // closed, never deploy tenant code into an unsealed namespace). Call BEFORE
 // registering the project's ArgoCD Application.
+// True iff a namespace with this name already exists in the cluster. Used as a
+// slug-availability preflight: the DB `projects.slug` UNIQUE column is not the
+// authority for whether a slug is free, because teardown is best-effort and
+// `keep_namespace` can free the DB row while the namespace (and its workloads +
+// materialised Secrets) survives. Creating a new project on such a slug would
+// hand the new owner the previous tenant's live namespace, so we refuse it.
+export async function namespaceExists(slug: string): Promise<boolean> {
+  if (!k8sEnabled()) return false;
+  try {
+    await call({ method: 'GET', path: `/api/v1/namespaces/${encodeURIComponent(slug)}` });
+    return true;
+  } catch (err) {
+    if (err instanceof K8sApiError && err.status === 404) return false;
+    throw err;
+  }
+}
+
 export async function applyNamespaceBaseline(slug: string): Promise<void> {
   if (!k8sEnabled()) return;
   await createOrIgnore('/api/v1/namespaces', tenantNamespaceObject(slug));

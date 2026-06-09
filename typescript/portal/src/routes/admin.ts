@@ -7,8 +7,9 @@ import {
   listIdentities, getIdentity, createIdentity, updateIdentityTraits,
   createRecoveryCodeForIdentity, ensureBotForHuman,
 } from '../services/kratos-admin';
-import { listClients, getClientTier, createClient, deleteClient, updateClientMetadata, API_KEY_TYPE } from '../services/hydra-admin';
+import { listClients, getClient, getClientTier, createClient, deleteClient, updateClientMetadata, API_KEY_TYPE } from '../services/hydra-admin';
 import { provisionGiteaForIdentities } from '../services/gitea';
+import { isReservedUsername, isValidUsername } from '../services/reserved-names';
 import { isTier, Tier } from '../services/tiers';
 import {
   renderAdminUsers, renderAdminUserDetail, renderAdminUserCreate,
@@ -78,7 +79,14 @@ router.post('/users', async (req: Request, res: Response) => {
   }
 
   const traits: Record<string, any> = { email };
-  if (preferred_username) traits.preferred_username = preferred_username;
+  if (preferred_username) {
+    if (!isValidUsername(preferred_username) || isReservedUsername(preferred_username)) {
+      const csrf = csrfHiddenField(req, res);
+      res.status(400).send(renderAdminUserCreate(session.email, csrf, `Username "${preferred_username}" is reserved or invalid.`, req.body));
+      return;
+    }
+    traits.preferred_username = preferred_username;
+  }
   if (first_name || last_name) {
     traits.name = {};
     if (first_name) traits.name.first = first_name;
@@ -146,7 +154,13 @@ router.post('/users/:id', async (req: Request, res: Response) => {
   }
 
   const traits: Record<string, any> = { email };
-  if (preferred_username) traits.preferred_username = preferred_username;
+  if (preferred_username) {
+    if (!isValidUsername(preferred_username) || isReservedUsername(preferred_username)) {
+      res.status(400).send(renderError('Invalid Input', `Username "${preferred_username}" is reserved or invalid.`));
+      return;
+    }
+    traits.preferred_username = preferred_username;
+  }
   if (first_name || last_name) {
     traits.name = {};
     if (first_name) traits.name.first = first_name;
@@ -228,6 +242,37 @@ router.get('/apps', async (req: Request, res: Response) => {
   }
 });
 
+// First-party SSO clients the consent auto-trust + MCP denylist depend on.
+// Deleting or re-tiering these silently changes the platform's security posture,
+// so the admin app routes refuse to touch them (same set as TRUSTED_CLIENT_IDS).
+const PROTECTED_CLIENT_IDS = new Set(
+  (process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea').split(',').map((s) => s.trim()).filter(Boolean),
+);
+
+// Ensure :appId refers to a manageable service client — not a user's API key
+// (managed only via the owner's /keys path) and not a protected SSO client. The
+// /admin/apps listing already filters these out; the mutating routes must too.
+// Returns the client on success, or null after sending an error response.
+async function loadManageableServiceClient(appId: string, res: Response) {
+  if (PROTECTED_CLIENT_IDS.has(appId)) {
+    res.status(403).send(renderError('Protected client', `"${appId}" is a protected platform client and cannot be modified here.`));
+    return null;
+  }
+  let client;
+  try {
+    client = await getClient(appId);
+  } catch {
+    res.status(404).send(renderError('Not Found', 'Service client not found.'));
+    return null;
+  }
+  const meta = (client.metadata as Record<string, any>) || {};
+  if (meta.type === API_KEY_TYPE) {
+    res.status(403).send(renderError('Not a service', 'That client is a user API key; manage it from the owner\'s key page.'));
+    return null;
+  }
+  return client;
+}
+
 router.post('/apps/:appId/tier', async (req: Request, res: Response) => {
   const tier = req.body?.tier;
   if (!tier || !isTier(tier)) {
@@ -237,6 +282,7 @@ router.post('/apps/:appId/tier', async (req: Request, res: Response) => {
 
   try {
     const { appId } = req.params;
+    if (!(await loadManageableServiceClient(appId, res))) return;
     await setServiceTier(appId, tier as Tier);
     await updateClientMetadata(appId, { tier });
     res.redirect('/admin/apps');
@@ -285,6 +331,7 @@ router.post('/apps/register', async (req: Request, res: Response) => {
 
 router.post('/apps/:appId/delete', async (req: Request, res: Response) => {
   try {
+    if (!(await loadManageableServiceClient(req.params.appId, res))) return;
     await deleteClient(req.params.appId);
     res.redirect('/admin/apps');
   } catch (err: any) {

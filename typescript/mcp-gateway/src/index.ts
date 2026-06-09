@@ -32,10 +32,49 @@ const HYDRA_PUBLIC_INTERNAL = process.env.HYDRA_PUBLIC_URL_INTERNAL || 'http://o
 // The suffix that identifies a project host; the label in front is the slug.
 const PROJECTS_DOMAIN = process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com';
 const PROJECT_MCP_PORT = Number(process.env.PROJECT_MCP_PORT || 80);
+// How often to re-introspect the token (and re-check ownership) on long-lived
+// proxied streams, so revocation is enforced mid-stream. Kept under typical
+// proxy idle timeouts (~60s).
+const STREAM_REVALIDATE_MS = Number(process.env.MCP_STREAM_REVALIDATE_MS || 15000);
 // First-party OIDC clients that must NOT be able to drive MCP (their tokens
 // carry the user's sub and skip consent). Same denylist as the portal MCP.
 const DENY_CLIENT_IDS = (process.env.MCP_DENY_CLIENT_IDS || process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea')
   .split(',').map((s) => s.trim()).filter(Boolean);
+
+// Allowlist of inbound headers safe to forward to a tenant-controlled MCP
+// container. Anything not here (Cookie, Authorization, all x-user-*/x-forwarded-*
+// identity headers, etc.) is dropped; trusted identity headers are re-added from
+// introspection in handleMcp. Lowercase — req.headers keys are already lowercased.
+const ALLOWED_FORWARD_HEADERS = new Set<string>([
+  'content-type',
+  'content-length',
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'user-agent',
+  'cache-control',
+  // MCP streamable-HTTP transport headers.
+  'mcp-session-id',
+  'mcp-protocol-version',
+  'last-event-id',
+]);
+
+// Allowlist of headers safe to copy from the tenant-controlled upstream response
+// back to the client. Everything else (Set-Cookie, Access-Control-Allow-*,
+// WWW-Authenticate, etc.) is dropped so the tenant can't set auth-relevant
+// headers on the shared `<slug>.projects.corpo-valley.com` origin.
+const ALLOWED_RESPONSE_HEADERS = new Set<string>([
+  'content-type',
+  'content-length',
+  'cache-control',
+  'content-encoding',
+  'content-disposition',
+  'date',
+  'etag',
+  'vary',
+  'mcp-session-id',
+  'mcp-protocol-version',
+]);
 
 const app = express();
 app.disable('x-powered-by');
@@ -63,7 +102,47 @@ function challenge(res: express.Response, host: string): void {
     .json({ error: 'missing_bearer', resource_metadata: resourceMetadataUrl(host) });
 }
 
-interface Introspection { active: boolean; sub?: string; client_id?: string; ext?: any; }
+interface Introspection { active: boolean; sub?: string; client_id?: string; aud?: string[]; ext?: any; }
+
+// RFC 8707 audience binding. By default the gateway requires the token's `aud`
+// to include this project's MCP resource (`https://<slug>.<PROJECTS_DOMAIN>/mcp`)
+// so a token minted for project A can't be replayed against project B's gateway.
+// Set MCP_ENFORCE_AUDIENCE=false only as a transitional escape hatch while
+// clients are migrated to send resource indicators.
+const ENFORCE_AUDIENCE = process.env.MCP_ENFORCE_AUDIENCE !== 'false';
+
+function resourceForSlug(slug: string): string {
+  return `https://${slug}.${PROJECTS_DOMAIN}/mcp`;
+}
+
+// Portal internal endpoint used to verify project ownership per request. This is
+// the authoritative authorization check: audience binding only stops cross-
+// project REPLAY (token for A used against B), but Hydra grants whatever resource
+// a client requests, so a user can mint a token whose aud names a project they
+// don't own. We therefore confirm the authenticated `sub` owns the host slug.
+const PORTAL_INTERNAL_URL = process.env.PORTAL_INTERNAL_URL || 'http://portal.cv-portal.svc.cluster.local:3000';
+const INTERNAL_WEBHOOK_SECRET = (process.env.INTERNAL_WEBHOOK_SECRET || '').trim();
+
+// Returns true iff `sub` owns the project for `slug`. Fails CLOSED (false) on any
+// error, missing secret, or non-200 — a verification failure must never grant
+// cross-tenant access.
+async function ownsProject(slug: string, sub: string): Promise<boolean> {
+  if (!INTERNAL_WEBHOOK_SECRET) {
+    console.error('[gateway] INTERNAL_WEBHOOK_SECRET not set — cannot verify project ownership (fail closed).');
+    return false;
+  }
+  try {
+    const r = await fetch(`${PORTAL_INTERNAL_URL}/internal/projects/${encodeURIComponent(slug)}/owner`, {
+      headers: { 'X-Internal-Secret': INTERNAL_WEBHOOK_SECRET },
+    });
+    if (!r.ok) return false;
+    const body = await r.json() as { owner_id?: string };
+    return typeof body.owner_id === 'string' && body.owner_id === sub;
+  } catch (e) {
+    console.error('[gateway] ownership check failed:', (e as Error).message);
+    return false;
+  }
+}
 
 async function introspect(token: string): Promise<Introspection> {
   try {
@@ -83,8 +162,14 @@ async function introspect(token: string): Promise<Introspection> {
 // ── OAuth discovery (served unauthenticated so clients can bootstrap) ──────────
 function protectedResource(req: express.Request, res: express.Response) {
   const host = req.headers.host || '';
+  // Validate the Host before reflecting it into the metadata. Without this an
+  // attacker-supplied Host (e.g. via a crafted request) would be echoed into
+  // the `resource` field served to clients. Only a valid `<slug>.<domain>` Host
+  // is honoured.
+  const slug = slugFromHost(host);
+  if (!slug) { res.status(400).json({ error: 'unknown project host' }); return; }
   res.set('Cache-Control', 'public, max-age=3600').json({
-    resource: `https://${host}/mcp`,
+    resource: resourceForSlug(slug),
     authorization_servers: [HYDRA_PUBLIC_URL],
     scopes_supported: ['openid', 'offline', 'offline_access'],
     bearer_methods_supported: ['header'],
@@ -126,29 +211,96 @@ async function handleMcp(req: express.Request, res: express.Response) {
 
   const intro = await introspect(m[1]);
   if (!intro.active || !intro.sub) { challenge(res, host); return; }
+  const sub = intro.sub;
   if (intro.client_id && DENY_CLIENT_IDS.includes(intro.client_id)) {
     res.status(403).json({ error: 'unauthorized_client' });
     return;
   }
+  // Audience binding: reject a token whose `aud` doesn't name THIS project's
+  // resource, so one project's token can't be replayed against another's MCP.
+  // Parity with the platform MCP (portal/src/routes/mcp.ts): a token that NAMES
+  // a different resource is rejected even when enforcement is toggled off — the
+  // MCP_ENFORCE_AUDIENCE escape hatch only relaxes the empty-aud legacy case and
+  // can never promote a foreign-resource token to this project's gateway.
+  {
+    const aud = Array.isArray(intro.aud) ? intro.aud : [];
+    const audMissingThis = !aud.includes(resourceForSlug(slug));
+    const audNamesOtherResource = aud.length > 0 && audMissingThis;
+    if ((ENFORCE_AUDIENCE && audMissingThis) || audNamesOtherResource) {
+      console.warn('[gateway] audience mismatch', { slug, aud, client_id: intro.client_id, enforce: ENFORCE_AUDIENCE });
+      res.status(403).json({ error: 'invalid_audience', resource_metadata: resourceMetadataUrl(host) });
+      return;
+    }
+  }
 
-  // Forward the entire request to the project's mcp container, stripping the
-  // bearer and injecting the resolved identity as trusted headers.
+  // Ownership check — the authoritative per-request authorization. Unlike the
+  // audience check this can't be disabled by a single flag, so even with
+  // MCP_ENFORCE_AUDIENCE=false an attacker can't reach a project they don't own.
+  if (!(await ownsProject(slug, sub))) {
+    console.warn('[gateway] ownership denied', { slug, sub, client_id: intro.client_id });
+    res.status(403).json({ error: 'forbidden_project' });
+    return;
+  }
+
+  // Forward the request to the project's mcp container. Build the outbound
+  // header set from a strict ALLOWLIST rather than cloning req.headers and
+  // deleting a few keys — clone-and-delete leaks the browser `Cookie` (incl.
+  // the Kratos session) and lets a client spoof identity headers (x-user-*,
+  // x-forwarded-user, …) straight through to the tenant-controlled container.
+  // Identity headers below are the ONLY ones we trust, and we set them from
+  // introspection — never from the inbound request.
   const target = `${slug}-mcp.${slug}.svc.cluster.local`;
-  const headers: http.OutgoingHttpHeaders = { ...req.headers };
-  delete headers['authorization'];
-  delete headers['host'];
-  headers['x-user-id'] = intro.sub;
+  const headers: http.OutgoingHttpHeaders = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (ALLOWED_FORWARD_HEADERS.has(k.toLowerCase())) headers[k] = v;
+  }
+  headers['x-user-id'] = sub;
   const email = intro.ext?.identity?.traits?.email;
   if (typeof email === 'string') headers['x-user-email'] = email;
 
   const preq = http.request({ host: target, port: PROJECT_MCP_PORT, method: req.method, path: req.url, headers }, (pres) => {
-    res.writeHead(pres.statusCode || 502, pres.headers);
+    // The upstream is a tenant-controlled container, so its response headers are
+    // hostile: blindly copying them lets the tenant set Set-Cookie (on the
+    // shared corpo-valley.com parent domain), CORS, or other auth-relevant
+    // headers on a response the gateway emits. Forward only a safe allowlist.
+    const safe: http.OutgoingHttpHeaders = {};
+    for (const [k, v] of Object.entries(pres.headers)) {
+      if (ALLOWED_RESPONSE_HEADERS.has(k.toLowerCase())) safe[k] = v;
+    }
+    res.writeHead(pres.statusCode || 502, safe);
     pres.pipe(res);
   });
   preq.on('error', (e) => {
     console.error(`[gateway] upstream ${target} error:`, e.message);
     if (!res.headersSent) res.status(502).json({ error: 'project mcp unavailable' });
   });
+
+  // Revocation enforcement on long-lived streams. The MCP streamable-HTTP
+  // transport keeps a GET /mcp channel open indefinitely; without this, a token
+  // revoked or expired AFTER connect would keep its proxied channel to the
+  // tenant container alive for the life of the stream. Re-introspect (and
+  // re-check ownership) on a tight cadence and tear the proxy down when the
+  // token goes inactive, its sub changes, or ownership no longer holds. Short
+  // request/response calls clear this on close before it ever fires.
+  const token = m[1];
+  const revalidate = setInterval(async () => {
+    try {
+      const re = await introspect(token);
+      const stillValid = re.active && re.sub === sub && await ownsProject(slug, sub);
+      if (!stillValid) {
+        console.warn('[gateway] tearing down stream: token/ownership no longer valid', { slug, sub });
+        clearInterval(revalidate);
+        try { preq.destroy(); } catch { /* already gone */ }
+        try { res.end(); } catch { /* already gone */ }
+      }
+    } catch (e) {
+      console.error('[gateway] revalidation error:', (e as Error).message);
+    }
+  }, STREAM_REVALIDATE_MS);
+  const stopRevalidate = () => clearInterval(revalidate);
+  res.on('close', stopRevalidate);
+  preq.on('close', stopRevalidate);
+
   req.pipe(preq);
 }
 app.all('/mcp', handleMcp);

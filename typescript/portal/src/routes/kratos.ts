@@ -32,6 +32,27 @@ const kratos = new FrontendApi(
   new Configuration({ basePath: kratosPublicUrl })
 );
 
+// Short-lived cookie carrying the intended post-login destination. We do NOT
+// forward return_to to Kratos (which would 303 the freshly-authenticated browser
+// straight to any *.projects.corpo-valley.com host — a tenant-controlled origin,
+// i.e. an open-redirect/phishing vector). Instead we stash a vetted destination
+// here and let the dashboard honour it ONLY if the logged-in subject owns that
+// project (see routes/dashboard.ts GET /).
+export const POST_LOGIN_COOKIE = 'cv_pld';
+
+function stashPostLoginDest(req: Request, res: Response, returnTo?: string): string {
+  if (returnTo && isSafeRedirect(returnTo)) {
+    res.cookie(POST_LOGIN_COOKIE, returnTo, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: req.secure,
+      maxAge: 5 * 60 * 1000,
+      path: '/',
+    });
+  }
+  return `${kratosBrowserUrl}/self-service/login/browser`;
+}
+
 // GET /login
 router.get('/login', async (req: Request, res: Response) => {
   const flowId = req.query.flow as string | undefined;
@@ -49,12 +70,9 @@ router.get('/login', async (req: Request, res: Response) => {
   }
 
   if (!flowId) {
-    // No flow ID: redirect to Kratos to create one, preserving return_to
-    const returnTo = req.query.return_to as string | undefined;
-    const kratosLoginUrl = returnTo && isSafeRedirect(returnTo)
-      ? `${kratosBrowserUrl}/self-service/login/browser?return_to=${encodeURIComponent(returnTo)}`
-      : `${kratosBrowserUrl}/self-service/login/browser`;
-    return res.redirect(kratosLoginUrl);
+    // No flow ID: redirect to Kratos to create one. Stash the (vetted) post-login
+    // destination in a cookie rather than handing it to Kratos as return_to.
+    return res.redirect(stashPostLoginDest(req, res, req.query.return_to as string | undefined));
   }
 
   try {
@@ -63,8 +81,13 @@ router.get('/login', async (req: Request, res: Response) => {
       cookie: req.headers.cookie,
     });
 
+    // Only propagate return_to into the registration link if it passes the same
+    // strict allowlist the other branches use — don't forward an unvalidated,
+    // attacker-supplied value (defense-in-depth, consistent with lines 54/84).
     const flowReturnTo = (flow as any).return_to as string | undefined;
-    const returnToParam = flowReturnTo ? `?return_to=${encodeURIComponent(flowReturnTo)}` : '';
+    const returnToParam = flowReturnTo && isSafeRedirect(flowReturnTo)
+      ? `?return_to=${encodeURIComponent(flowReturnTo)}`
+      : '';
     const footer = `<div class="links">
       <a href="${kratosBrowserUrl}/self-service/registration/browser${returnToParam}">Create an account</a>
       &nbsp;|&nbsp;
@@ -79,12 +102,8 @@ router.get('/login', async (req: Request, res: Response) => {
     ));
   } catch (err: any) {
     if (err?.response?.status === 410 || err?.response?.status === 403) {
-      // Flow expired, start a new one (preserve return_to from query)
-      const returnTo = req.query.return_to as string | undefined;
-      const kratosLoginUrl = returnTo && isSafeRedirect(returnTo)
-        ? `${kratosBrowserUrl}/self-service/login/browser?return_to=${encodeURIComponent(returnTo)}`
-        : `${kratosBrowserUrl}/self-service/login/browser`;
-      return res.redirect(kratosLoginUrl);
+      // Flow expired, start a new one (stash the vetted destination as above).
+      return res.redirect(stashPostLoginDest(req, res, req.query.return_to as string | undefined));
     }
     console.error('Login flow error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Login Error', 'Failed to load login flow.', err?.response?.data?.error?.message));

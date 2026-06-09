@@ -1,9 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { ensureBotForHuman } from '../services/kratos-admin';
+import { ensureBotForHuman, getIdentity } from '../services/kratos-admin';
 import { setUserTier } from '../services/keto';
-import { provisionGiteaForIdentities, getFile, upsertRepoFile, getBranchHead } from '../services/gitea';
+import { provisionGiteaForIdentities, getFile, upsertRepoFile, getBranchHead, getCommitStatus } from '../services/gitea';
 import { getProjectBySlug, getProjectByPinTokenHash } from '../services/projects';
 import { hashPinToken, pinTokenHashMatches } from '../services/pin-token';
+import { requireInternalSecret } from '../middleware/internalAuth';
+import { isReservedUsername } from '../services/reserved-names';
 
 const router = Router();
 
@@ -42,24 +44,51 @@ function requireInClusterCaller(req: Request, res: Response, next: NextFunction)
 // .bot identity. Idempotent — if the bot already exists or we can't derive
 // a username, the call is still a 200 OK.
 //
-// Auth: not protected today. The endpoint sits behind the internal cluster
-// network only (Kratos posts to portal.cv-portal.svc.cluster.local), and we
-// explicitly skip if metadata_public.type === 'bot' so a stray request can't
-// recursively spawn bots-of-bots. Add an HMAC or shared-secret header before
-// exposing the portal beyond the cluster.
-router.post('/internal/kratos/after-registration', requireInClusterCaller, async (req: Request, res: Response) => {
-  const identity = req.body?.identity;
-  if (!identity?.id) {
-    res.status(400).json({ error: 'identity required' });
+// Auth: requireInternalSecret (shared secret, fail-closed) is the real
+// authentication; requireInClusterCaller stays as defense-in-depth. We also
+// IGNORE the request body's identity content and re-fetch the canonical
+// identity from the Kratos admin API by id — so a forged body can't drive
+// provisioning with attacker-chosen traits/tier.
+router.post('/internal/kratos/after-registration', requireInternalSecret, requireInClusterCaller, async (req: Request, res: Response) => {
+  const identityId = req.body?.identity?.id;
+  if (!identityId || typeof identityId !== 'string') {
+    res.status(400).json({ error: 'identity.id required' });
     return;
   }
 
-  // Guard against bot-of-a-bot: if Kratos somehow runs the after-registration
-  // hook for a bot identity (it shouldn't, since we create those through the
-  // admin API which skips hooks), bail.
-  const meta = identity.metadata_public ?? {};
+  // Re-fetch from Kratos admin — never trust the body's traits/metadata. If the
+  // id doesn't resolve, there's nothing legitimate to provision.
+  let identity: Awaited<ReturnType<typeof getIdentity>>;
+  try {
+    identity = await getIdentity(identityId);
+  } catch (err: any) {
+    console.error('after-registration: identity lookup failed', identityId, err?.message);
+    res.status(200).json({ ok: false, reason: 'identity_not_found' });
+    return;
+  }
+
+  // Guard against bot-of-a-bot: bots are created via the admin API (which skips
+  // hooks), so a hook firing for a bot identity is anomalous — bail.
+  const meta = (identity.metadata_public ?? {}) as Record<string, any>;
   if (meta.type === 'bot') {
     res.json({ skipped: true, reason: 'is_bot' });
+    return;
+  }
+
+  // Refuse to provision for a reserved/admin username. Even though the Kratos
+  // identity already exists, declining to mint its Gitea account / grant a tier
+  // limits the blast radius of a squatted name (the mint backstop in
+  // services/gitea.ts is the load-bearing one). Check BOTH the preferred_username
+  // trait AND the email local-part: when preferred_username is absent the
+  // provisioned username is derived from the email (see deriveBotUsername), so a
+  // reserved local-part would otherwise slip past a trait-only check.
+  const traits = (identity.traits ?? {}) as Record<string, any>;
+  const emailLocalPart = typeof traits.email === 'string' && traits.email.includes('@')
+    ? traits.email.split('@')[0]
+    : undefined;
+  if (isReservedUsername(traits.preferred_username) || isReservedUsername(emailLocalPart)) {
+    console.warn('after-registration: refusing to provision reserved username', traits.preferred_username || emailLocalPart, identity.id);
+    res.json({ skipped: true, reason: 'reserved_username' });
     return;
   }
 
@@ -85,6 +114,33 @@ router.post('/internal/kratos/after-registration', requireInClusterCaller, async
     // Return 200 so Kratos doesn't retry forever — the human is already
     // registered and we don't want to block the user-facing flow.
     res.status(200).json({ ok: false, error: err?.message });
+  }
+});
+
+// GET /internal/projects/:slug/owner
+//
+// Lets the MCP gateway verify that the authenticated user actually OWNS the
+// project named by the request's host slug before it reverse-proxies into the
+// tenant container. The gateway's audience check alone is insufficient: Hydra
+// grants whatever resource indicator a client requests, so a user can legitimately
+// mint a token whose `aud` names a project they don't own. This endpoint is the
+// per-request ownership backstop. Authenticated with the shared internal secret.
+router.get('/internal/projects/:slug/owner', requireInternalSecret, requireInClusterCaller, async (req: Request, res: Response) => {
+  const slug = String(req.params.slug || '');
+  if (!/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(slug)) {
+    res.status(400).json({ error: 'invalid slug' });
+    return;
+  }
+  try {
+    const project = await getProjectBySlug(slug);
+    if (!project) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json({ owner_id: project.owner_id, slug: project.slug });
+  } catch (err: any) {
+    console.error('[internal/owner] error for', slug, err?.message);
+    res.status(500).json({ error: 'internal error' });
   }
 });
 
@@ -122,6 +178,13 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
   }
   if (!/^[0-9]{14}$/.test(tag)) {
     res.status(400).json({ error: 'tag must be YYYYMMDDHHMMSS' });
+    return;
+  }
+  // `sha` is REQUIRED: it's the anti-misfire guard (must equal current head of
+  // main). Making it optional let a caller skip the check entirely by omitting
+  // the field, enabling a stale workflow run to force a rollback. Demand it.
+  if (!/^[a-f0-9]{7,40}$/i.test(sha)) {
+    res.status(400).json({ error: 'sha is required and must be 7-40 hex chars (head of main)' });
     return;
   }
 
@@ -178,6 +241,27 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
       }
     }
 
+    // Deploy gate: optionally require that the required scan/CI status check
+    // passed for head-of-main before pinning. A tenant controls their own repo
+    // (and therefore their own CV_PIN_TOKEN), so without this they could pin an
+    // arbitrary, never-scanned image into their namespace, bypassing the scan
+    // gate that branch-protected merges enforce. Opt-in (default off) because
+    // the required check's context name is deploy-specific; when
+    // REQUIRED_PIN_STATUS_CONTEXT is set we demand that context be 'success'.
+    const requiredContext = (process.env.REQUIRED_PIN_STATUS_CONTEXT || '').trim();
+    if (requiredContext) {
+      const status = await getCommitStatus({ owner, repo, sha: head.sha });
+      const check = status?.checks.find((c) => c.context === requiredContext);
+      if (!check || check.state !== 'success') {
+        res.status(409).json({
+          error: `required status check "${requiredContext}" did not pass for head of main`,
+          head_sha: head.sha,
+          check_state: check?.state || 'missing',
+        });
+        return;
+      }
+    }
+
     const path = 'k8s/deployment.yaml';
     const file = await getFile({ owner, repo, path });
     if (!file) {
@@ -216,8 +300,10 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
 
     res.json({ ok: true, changed: true, tag, slug });
   } catch (err: any) {
+    // Keep raw upstream (Gitea) error detail in the server log only; don't
+    // reflect internal repo/branch state back to the caller.
     console.error('[internal/pin] error for', slug, err?.message);
-    res.status(500).json({ error: err?.message || 'internal error' });
+    res.status(500).json({ error: 'internal error' });
   }
 });
 

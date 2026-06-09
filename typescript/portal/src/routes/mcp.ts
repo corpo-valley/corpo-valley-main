@@ -140,14 +140,23 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
       .json({ error: 'unauthorized_client', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
     return null;
   }
-  // Optional stricter layer (opt-in): once MCP clients send a resource
-  // indicator and Hydra stamps `aud`, set MCP_ENFORCE_AUDIENCE=true to also
-  // require the resource in `aud`. Off by default (tokens carry empty aud today).
+  // Audience binding (RFC 8707). Per the MCP authorization spec, clients send a
+  // `resource` indicator so Hydra stamps the resource into `aud`; we require it
+  // here so a token minted for another resource (or with no audience) can't be
+  // replayed against this broad platform MCP surface. Enforced by default — set
+  // MCP_ENFORCE_AUDIENCE=false only as a transitional escape hatch.
   const requiredAud = process.env.MCP_RESOURCE_AUDIENCE || PUBLIC_MCP_URL;
-  const enforceAud = process.env.MCP_ENFORCE_AUDIENCE === 'true';
+  const enforceAud = process.env.MCP_ENFORCE_AUDIENCE !== 'false';
   const aud = Array.isArray(introspection.aud) ? introspection.aud : [];
-  if (enforceAud && !aud.includes(requiredAud)) {
-    console.warn('[mcp] rejected token: audience mismatch', { client_id: introspection.client_id, aud, required: requiredAud });
+  // Non-bypassable backstop: a token that NAMES some other resource (e.g. a
+  // per-project gateway `aud`) must never be accepted at the platform MCP, even
+  // when enforcement is toggled off. The escape hatch only relaxes the
+  // empty-aud legacy case — it can't promote a project-scoped token to platform
+  // authority. (The per-project gateway has its own ownsProject() backstop.)
+  const audMissingPlatform = !aud.includes(requiredAud);
+  const audNamesOtherResource = aud.length > 0 && audMissingPlatform;
+  if ((enforceAud && audMissingPlatform) || audNamesOtherResource) {
+    console.warn('[mcp] rejected token: audience mismatch', { client_id: introspection.client_id, aud, required: requiredAud, enforceAud });
     res.status(403)
       .set('WWW-Authenticate', `Bearer realm="${PUBLIC_MCP_URL}", error="invalid_token", error_description="token audience does not include this MCP resource"`)
       .json({ error: 'invalid_audience', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
@@ -159,16 +168,21 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   // doesn't abort: tools that need them will surface their own error.
   let email: string | undefined;
   let preferredUsername: string | undefined;
+  let emailVerified = false;
   try {
     const id = await getIdentity(introspection.sub);
     const t = id?.traits as Record<string, any> | undefined;
     email = t?.email;
     preferredUsername = t?.preferred_username;
+    const verifiable = id?.verifiable_addresses || [];
+    emailVerified = verifiable.some(
+      (v: any) => v.value?.toLowerCase() === (email || '').toLowerCase() && v.verified,
+    );
   } catch (err) {
     console.error('[mcp] kratos getIdentity failed:', (err as Error)?.message);
   }
 
-  return { userId: introspection.sub, email, preferredUsername };
+  return { userId: introspection.sub, email, preferredUsername, emailVerified };
 }
 
 // MCP JSON-RPC endpoint. POST a JSON-RPC 2.0 request, get a JSON-RPC
@@ -203,19 +217,59 @@ router.post('/mcp', async (req: Request, res: Response) => {
 //     mid-session has its channel closed within REINTROSPECT_MS.
 
 const MAX_SSE_PER_USER = 5;
-const REINTROSPECT_MS = 60_000;
+// Hard ceiling on total concurrent SSE channels PER REPLICA, protecting this
+// process's sockets/FDs regardless of how many distinct users connect. NOTE:
+// both this and MAX_SSE_PER_USER are per-replica in-process guards — a
+// horizontally-scaled Deployment multiplies the effective per-user cap by the
+// replica count. A hard cross-replica guarantee needs a shared limiter (e.g. a
+// Redis token bucket keyed on sub); these remain a soft local backstop.
+const MAX_SSE_TOTAL = Number(process.env.MAX_SSE_TOTAL || 500);
+// Re-introspect (and send a keepalive) on a tighter cadence than the proxy idle
+// timeout (~60s) so a revoked token's held-open stream is closed within this
+// window.
+const REINTROSPECT_MS = 15_000;
 const sseOpenPerUser = new Map<string, number>();
+let sseOpenTotal = 0;
+
+// Coalesce re-introspection across all channels sharing the same token, so N
+// open channels for one token cost ~1 Hydra-admin introspect per window instead
+// of N. Without this, a single tenant fanning out many channels drives
+// introspection load proportional to channel count.
+const REINTROSPECT_COALESCE_MS = 10_000;
+const tokenLiveness = new Map<string, { at: number; active: boolean; sub?: string }>();
+const TOKEN_LIVENESS_MAX = 5000;
+async function coalescedIntrospect(token: string): Promise<{ active: boolean; sub?: string }> {
+  const now = Date.now();
+  const cached = tokenLiveness.get(token);
+  if (cached && now - cached.at < REINTROSPECT_COALESCE_MS) {
+    return { active: cached.active, sub: cached.sub };
+  }
+  const r = await introspectToken(token);
+  // Bound the map (FIFO eviction) so a churn of distinct tokens can't grow it
+  // without limit.
+  if (tokenLiveness.size >= TOKEN_LIVENESS_MAX && !tokenLiveness.has(token)) {
+    const oldest = tokenLiveness.keys().next().value;
+    if (oldest !== undefined) tokenLiveness.delete(oldest);
+  }
+  tokenLiveness.set(token, { at: now, active: !!r.active, sub: r.sub });
+  return { active: !!r.active, sub: r.sub };
+}
 
 router.get('/mcp', async (req: Request, res: Response) => {
   const ctx = await authenticate(req, res);
   if (!ctx) return;
 
+  if (sseOpenTotal >= MAX_SSE_TOTAL) {
+    res.status(429).json({ error: 'too_many_sse_channels_total', limit: MAX_SSE_TOTAL });
+    return;
+  }
   const open = sseOpenPerUser.get(ctx.userId) || 0;
   if (open >= MAX_SSE_PER_USER) {
     res.status(429).json({ error: 'too_many_sse_channels', limit: MAX_SSE_PER_USER });
     return;
   }
   sseOpenPerUser.set(ctx.userId, open + 1);
+  sseOpenTotal++;
 
   res.set({
     'Content-Type': 'text/event-stream',
@@ -248,7 +302,7 @@ router.get('/mcp', async (req: Request, res: Response) => {
   const heartbeat = setInterval(async () => {
     try {
       if (token) {
-        const r = await introspectToken(token);
+        const r = await coalescedIntrospect(token);
         if (!r.active || !r.sub || r.sub !== ctx.userId) {
           // Token revoked or rebound — drop the stream.
           try { res.end(); } catch { /* already gone */ }
@@ -263,6 +317,7 @@ router.get('/mcp', async (req: Request, res: Response) => {
 
   req.on('close', () => {
     clearInterval(heartbeat);
+    if (sseOpenTotal > 0) sseOpenTotal--;
     const n = (sseOpenPerUser.get(ctx.userId) || 1) - 1;
     if (n <= 0) sseOpenPerUser.delete(ctx.userId);
     else sseOpenPerUser.set(ctx.userId, n);
