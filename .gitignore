@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.next/
+*.log
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.tsbuildinfo
+.DS_Store
