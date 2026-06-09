@@ -2,13 +2,13 @@ import { Router, Request, Response } from 'express';
 import { requireSession } from '../middleware/session';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { csrfHiddenField } from '../middleware/csrf';
-import { getUserTier, setUserTier, setServiceTier, grantEveryone } from '../services/keto';
+import { getUserTier, setUserTier, setServiceTier } from '../services/keto';
 import {
   listIdentities, getIdentity, createIdentity, updateIdentityTraits,
-  createRecoveryCodeForIdentity, ensureBotForHuman,
+  createRecoveryCodeForIdentity,
 } from '../services/kratos-admin';
 import { listClients, getClient, getClientTier, createClient, deleteClient, updateClientMetadata, API_KEY_TYPE } from '../services/hydra-admin';
-import { provisionGiteaForIdentities } from '../services/gitea';
+import { ensureProvisioned } from '../services/provisioning';
 import { isReservedUsername, isValidUsername } from '../services/reserved-names';
 import { isTier, Tier } from '../services/tiers';
 import {
@@ -95,30 +95,11 @@ router.post('/users', async (req: Request, res: Response) => {
 
   try {
     const identity = await createIdentity(traits as any);
-    // Grant the new human the EVERYONE base tier so they can reach
-    // EVERYONE-tier services immediately.
-    try {
-      await grantEveryone(identity.id);
-    } catch (tierErr: any) {
-      console.error('grantEveryone failed for', identity.id, tierErr?.message);
-    }
-    // Provision a paired .bot identity. Don't fail the human creation if
-    // the bot side errors — log and continue so the admin can still see
-    // the new user.
-    let bot: Awaited<ReturnType<typeof ensureBotForHuman>> = null;
-    try {
-      bot = await ensureBotForHuman(identity);
-      if (bot) await setUserTier(bot.id, 'BETA');
-    } catch (botErr: any) {
-      console.error('Bot provisioning failed for', identity.id, botErr?.message);
-    }
-    // Lazy-provision Gitea accounts for the human + bot. Best-effort: never
-    // fail the user creation flow on a Gitea error.
-    try {
-      await provisionGiteaForIdentities(identity, bot);
-    } catch (giteaErr: any) {
-      console.error('Gitea provisioning failed for', identity.id, giteaErr?.message);
-    }
+    // Provision EVERYONE grant + paired .bot identity + Gitea accounts. Shared,
+    // idempotent, best-effort — same path self-service registrants hit on first
+    // login (services/provisioning.ts). Awaited here so the admin sees a fully
+    // provisioned user on redirect.
+    await ensureProvisioned(identity);
     res.redirect(`/admin/users/${identity.id}`);
   } catch (err: any) {
     const detail = err?.response?.data?.error?.message
