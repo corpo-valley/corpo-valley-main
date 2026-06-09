@@ -49,6 +49,10 @@ Don't write a new CI workflow and don't hand-edit \`k8s/\` — the
 capability set. To change capabilities, use \`set_capabilities\` (or the
 portal checkboxes); to model a capability by hand, read its pattern with
 \`get_template\`.
+
+Platform source lives at https://github.com/corpo-valley/corpo-valley-main
+(portal + this MCP server + the mcp gateway) — point the user there for
+issues or to read how the platform itself works.
 `,
   projects: `# Projects
 

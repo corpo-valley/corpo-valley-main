@@ -197,6 +197,20 @@ async function authServerMetadata(_req: express.Request, res: express.Response) 
 app.get('/.well-known/oauth-authorization-server', authServerMetadata);
 app.get('/.well-known/openid-configuration', authServerMetadata);
 
+// Humans who paste an MCP URL into a browser land here — give them a
+// pointer instead of a bare 404. Agents never see this (they speak to /mcp).
+app.get('/', (_req, res) => {
+  res.type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Corpo Valley MCP</title></head>
+<body style="font-family:ui-monospace,Menlo,monospace;background:#2b2118;color:#f3ead9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="max-width:34rem;padding:2rem">
+<h1 style="color:#e8b94a">🌱 Corpo Valley MCP</h1>
+<p>This host serves a <a href="https://modelcontextprotocol.io" style="color:#84a25a">Model Context Protocol</a> endpoint at <code>/mcp</code> — it's meant for agents, not browsers.</p>
+<p>Connect: <code>claude mcp add &lt;name&gt; --transport http --url https://&lt;this-host&gt;/mcp</code></p>
+<p>Source &amp; issues: <a href="https://github.com/corpo-valley/corpo-valley-main" style="color:#84a25a">github.com/corpo-valley/corpo-valley-main</a></p>
+</div></body></html>`);
+});
+
 app.get('/healthz', (_req, res) => res.json({ ok: true, server: 'cv-mcp-gateway' }));
 app.get('/readyz', (_req, res) => res.json({ ok: true }));
 
