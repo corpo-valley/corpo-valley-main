@@ -17,6 +17,19 @@ import * as crypto from 'crypto';
 const app = express();
 const port = parseInt(process.env.PORT || '3000', 10);
 
+// Ory Kratos browser origin (e.g. https://auth.corpo-valley.com). The login /
+// recovery / verification / settings flows render in the portal but their forms
+// POST to Kratos's flow `action` on this origin, so the CSP `form-action` must
+// allow it — otherwise the browser blocks "Sign in" / "Email me a code" /
+// "Send recovery email" as cross-origin submissions.
+const KRATOS_BROWSER_ORIGIN = (() => {
+  try {
+    return new URL(process.env.KRATOS_BROWSER_URL || process.env.KRATOS_PUBLIC_URL || 'http://localhost:4433').origin;
+  } catch {
+    return '';
+  }
+})();
+
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
@@ -53,7 +66,9 @@ app.use((req, res, next) => {
       "connect-src 'self'",
       "object-src 'none'",
       "base-uri 'self'",
-      "form-action 'self'",
+      // 'self' for the portal's own POSTs (consent, logout, dashboard/admin) +
+      // the Kratos origin for the auth flow forms.
+      `form-action 'self'${KRATOS_BROWSER_ORIGIN ? ' ' + KRATOS_BROWSER_ORIGIN : ''}`,
       "frame-ancestors 'none'",
     ].join('; '),
   );
