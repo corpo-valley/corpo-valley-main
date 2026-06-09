@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { Configuration, FrontendApi } from '@ory/client';
+import { provisionOncePerProcess } from '../services/provisioning';
 
 const kratosPublicUrl = process.env.KRATOS_PUBLIC_URL || 'http://localhost:4433';
 const kratosBrowserUrl = process.env.KRATOS_BROWSER_URL || kratosPublicUrl;
@@ -54,6 +55,11 @@ export async function requireSession(
       preferredUsername: traits?.preferred_username || undefined,
       emailVerified,
     };
+    // First-authenticated-touch provisioning (replaces the Kratos after-registration
+    // web_hook). Uses the canonical session identity — no request input — and is
+    // guarded to run at most once per user per process, so this is an O(1) no-op
+    // on all but a user's first request. Fire-and-forget: never blocks the request.
+    provisionOncePerProcess(session.identity);
     next();
   } catch {
     res.redirect(`${kratosBrowserUrl}/self-service/login/browser`);

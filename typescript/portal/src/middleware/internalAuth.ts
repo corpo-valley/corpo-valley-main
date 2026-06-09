@@ -1,17 +1,17 @@
 import { Request, Response, NextFunction } from 'express';
 import * as crypto from 'crypto';
 
-// Shared-secret authentication for /internal/* webhook routes that are NOT
-// otherwise authenticated (i.e. the Kratos after-registration hook). Network
-// origin alone (requireInClusterCaller) is not authentication — any in-cluster
-// pod, including tenant-controlled Gitea Actions runners, can reach the portal
-// Service without forwarded-proxy headers and from an RFC1918 address.
+// Shared-secret authentication for in-cluster `/internal/*` callers that are NOT
+// otherwise authenticated — currently the mcp-gateway's project-ownership lookup
+// (`GET /internal/projects/:slug/owner`). Network origin alone
+// (requireInClusterCaller) is not authentication: any in-cluster pod, including
+// tenant-controlled Gitea Actions runners, can reach the portal Service without
+// forwarded-proxy headers and from an RFC1918 address.
 //
-// The caller (Kratos `web_hook` action config / deploy) must send the secret in
-// `Authorization: Bearer <secret>` or `X-Internal-Secret: <secret>`. The secret
-// lives in INTERNAL_WEBHOOK_SECRET, mirrored into the Kratos webhook config and
-// the chart. We fail CLOSED when it is unset so a misconfigured deploy can never
-// silently fall back to the network-origin heuristic.
+// The caller must send the secret in `Authorization: Bearer <secret>` or
+// `X-Internal-Secret: <secret>`. The secret lives in INTERNAL_WEBHOOK_SECRET,
+// shared with the gateway via the chart. We fail CLOSED when it is unset so a
+// misconfigured deploy can never silently fall back to the network-origin heuristic.
 
 const INTERNAL_WEBHOOK_SECRET = (process.env.INTERNAL_WEBHOOK_SECRET || '').trim();
 

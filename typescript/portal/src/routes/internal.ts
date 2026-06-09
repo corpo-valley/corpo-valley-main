@@ -1,11 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { ensureBotForHuman, getIdentity } from '../services/kratos-admin';
-import { setUserTier } from '../services/keto';
-import { provisionGiteaForIdentities, getFile, upsertRepoFile, getBranchHead, getCommitStatus } from '../services/gitea';
+import { getFile, upsertRepoFile, getBranchHead, getCommitStatus } from '../services/gitea';
 import { getProjectBySlug, getProjectByPinTokenHash } from '../services/projects';
 import { hashPinToken, pinTokenHashMatches } from '../services/pin-token';
 import { requireInternalSecret } from '../middleware/internalAuth';
-import { isReservedUsername } from '../services/reserved-names';
 
 const router = Router();
 
@@ -39,83 +36,12 @@ function requireInClusterCaller(req: Request, res: Response, next: NextFunction)
   next();
 }
 
-// Kratos calls this after a user completes the self-service registration
-// flow (form or OIDC). For each new human identity we provision a paired
-// .bot identity. Idempotent — if the bot already exists or we can't derive
-// a username, the call is still a 200 OK.
-//
-// Auth: requireInternalSecret (shared secret, fail-closed) is the real
-// authentication; requireInClusterCaller stays as defense-in-depth. We also
-// IGNORE the request body's identity content and re-fetch the canonical
-// identity from the Kratos admin API by id — so a forged body can't drive
-// provisioning with attacker-chosen traits/tier.
-router.post('/internal/kratos/after-registration', requireInternalSecret, requireInClusterCaller, async (req: Request, res: Response) => {
-  const identityId = req.body?.identity?.id;
-  if (!identityId || typeof identityId !== 'string') {
-    res.status(400).json({ error: 'identity.id required' });
-    return;
-  }
-
-  // Re-fetch from Kratos admin — never trust the body's traits/metadata. If the
-  // id doesn't resolve, there's nothing legitimate to provision.
-  let identity: Awaited<ReturnType<typeof getIdentity>>;
-  try {
-    identity = await getIdentity(identityId);
-  } catch (err: any) {
-    console.error('after-registration: identity lookup failed', identityId, err?.message);
-    res.status(200).json({ ok: false, reason: 'identity_not_found' });
-    return;
-  }
-
-  // Guard against bot-of-a-bot: bots are created via the admin API (which skips
-  // hooks), so a hook firing for a bot identity is anomalous — bail.
-  const meta = (identity.metadata_public ?? {}) as Record<string, any>;
-  if (meta.type === 'bot') {
-    res.json({ skipped: true, reason: 'is_bot' });
-    return;
-  }
-
-  // Refuse to provision for a reserved/admin username. Even though the Kratos
-  // identity already exists, declining to mint its Gitea account / grant a tier
-  // limits the blast radius of a squatted name (the mint backstop in
-  // services/gitea.ts is the load-bearing one). Check BOTH the preferred_username
-  // trait AND the email local-part: when preferred_username is absent the
-  // provisioned username is derived from the email (see deriveBotUsername), so a
-  // reserved local-part would otherwise slip past a trait-only check.
-  const traits = (identity.traits ?? {}) as Record<string, any>;
-  const emailLocalPart = typeof traits.email === 'string' && traits.email.includes('@')
-    ? traits.email.split('@')[0]
-    : undefined;
-  if (isReservedUsername(traits.preferred_username) || isReservedUsername(emailLocalPart)) {
-    console.warn('after-registration: refusing to provision reserved username', traits.preferred_username || emailLocalPart, identity.id);
-    res.json({ skipped: true, reason: 'reserved_username' });
-    return;
-  }
-
-  try {
-    const bot = await ensureBotForHuman(identity);
-    if (bot) {
-      await setUserTier(bot.id, 'BETA');
-    }
-    // Lazy-provision Gitea accounts for the human + bot. Best-effort: a Gitea
-    // error must not make Kratos retry the registration hook forever.
-    try {
-      await provisionGiteaForIdentities(identity, bot);
-    } catch (giteaErr: any) {
-      console.error('after-registration Gitea provisioning failed:', identity.id, giteaErr?.message);
-    }
-    if (bot) {
-      res.json({ ok: true, bot_id: bot.id });
-      return;
-    }
-    res.json({ ok: true, skipped: true, reason: 'no_username_derivable' });
-  } catch (err: any) {
-    console.error('after-registration bot provisioning failed:', identity.id, err?.message);
-    // Return 200 so Kratos doesn't retry forever — the human is already
-    // registered and we don't want to block the user-facing flow.
-    res.status(200).json({ ok: false, error: err?.message });
-  }
-});
+// NOTE: the Kratos after-registration web_hook used to live here. Provisioning a
+// new human's EVERYONE grant + `.bot` identity + Gitea accounts now happens
+// inside the portal itself — synchronously for admin-created users
+// (routes/admin.ts) and on first authenticated request for self-service
+// registrants (middleware/session.ts -> services/provisioning.ts). That removes
+// the need to deliver a shared secret into Kratos's hook config.
 
 // GET /internal/projects/:slug/owner
 //
