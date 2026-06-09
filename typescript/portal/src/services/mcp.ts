@@ -1104,7 +1104,7 @@ async function handleRpc(req: JsonRpcRequest, ctx: McpContext): Promise<JsonRpcR
           // tools/list — no editor restart needed.
           capabilities: { tools: { listChanged: true } },
           serverInfo: SERVER_INFO,
-          instructions: 'Call `how_corpo_valley_works` first to learn the platform. Use `list_projects` to see what the user has, `create_project` to plant a new one, and `get_gitea_credentials` to get a ready-to-use clone URL.',
+          instructions: 'Call `how_corpo_valley_works` first to learn the platform. Use `list_projects` to see what the user has, `create_project` to plant a new one, and `get_gitea_credentials` to get a ready-to-use clone URL. Platform source & issues: https://github.com/corpo-valley/corpo-valley-main',
         };
         return isNotification ? null : ok(req.id, result);
       }
