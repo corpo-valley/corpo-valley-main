@@ -1901,75 +1901,7 @@ export function renderLoginPage(
   return layout('Sign In', body);
 }
 
-export function renderRegistrationPage(
-  action: string,
-  nodes: UiNode[],
-  messages: UiMessage[] | undefined,
-  footerHtml: string,
-): string {
-  const csrf = extractCsrf(nodes);
-  const oidc = extractOidcProviders(nodes);
-  const email = extractField(getNode(nodes, 'traits.email'));
-  const firstName = extractField(getNode(nodes, 'traits.name.first'));
-  const lastName = extractField(getNode(nodes, 'traits.name.last'));
-  const username = extractField(getNode(nodes, 'traits.preferred_username'));
-  const passwordField = extractField(getNode(nodes, 'password'));
-  const hasProfile = nodes.some(n => n.group === 'profile' && n.attributes.type === 'submit');
-  const hasPassword = nodes.some(n => n.group === 'password' && n.attributes.type === 'password');
-
-  let body = `<h1>Create account</h1>${topMessagesHtml(messages)}`;
-
-  if (oidc.length > 0) {
-    body += `<form action="${escapeHtml(action)}" method="POST">
-      ${hiddenCsrf(csrf)}
-      ${oidc.map(oidcButtonHtml).join('')}
-    </form>`;
-    if (hasProfile || hasPassword) body += '<div class="divider">or</div>';
-  }
-
-  if (hasProfile || hasPassword) {
-    const submitMethod = hasProfile ? 'profile' : 'password';
-    const submitLabel = hasProfile ? 'Continue' : 'Create account';
-    body += `<form action="${escapeHtml(action)}" method="POST">
-      ${hiddenCsrf(csrf)}
-      ${hasProfile ? `
-        <div class="field">
-          <label for="email">Email</label>
-          <input type="email" name="traits.email" id="email" value="${escapeHtml(email.value)}" required autofocus>
-          ${fieldErrorHtml(email.error)}
-        </div>
-        <div class="field">
-          <label for="username">Username <span style="color:#8a7a5a;font-weight:400;">(optional)</span></label>
-          <input type="text" name="traits.preferred_username" id="username" value="${escapeHtml(username.value)}" pattern="[a-zA-Z0-9._-]{1,64}" title="Letters, digits, dot, underscore, hyphen.">
-          ${fieldErrorHtml(username.error)}
-        </div>
-        <div class="form-row">
-          <div class="field">
-            <label for="first">First name</label>
-            <input type="text" name="traits.name.first" id="first" value="${escapeHtml(firstName.value)}">
-            ${fieldErrorHtml(firstName.error)}
-          </div>
-          <div class="field">
-            <label for="last">Last name</label>
-            <input type="text" name="traits.name.last" id="last" value="${escapeHtml(lastName.value)}">
-            ${fieldErrorHtml(lastName.error)}
-          </div>
-        </div>
-      ` : ''}
-      ${hasPassword ? `
-        <div class="field">
-          <label for="password">Password</label>
-          <input type="password" name="password" id="password" required${hasProfile ? '' : ' autofocus'}>
-          ${fieldErrorHtml(passwordField.error)}
-        </div>
-      ` : ''}
-      <button type="submit" name="method" value="${submitMethod}">${submitLabel}</button>
-    </form>`;
-  }
-
-  body += footerHtml;
-  return layout('Create Account', body);
-}
+// renderRegistrationPage removed: self-service registration is disabled.
 
 export function renderRecoveryPage(
   action: string,

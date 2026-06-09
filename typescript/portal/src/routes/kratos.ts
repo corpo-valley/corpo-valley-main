@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Configuration, FrontendApi } from '@ory/client';
 import {
   renderFlow, renderError,
-  renderLoginPage, renderRegistrationPage, renderRecoveryPage, renderSettingsPage,
+  renderLoginPage, renderRecoveryPage, renderSettingsPage,
 } from '../templates';
 
 const router = Router();
@@ -81,16 +81,9 @@ router.get('/login', async (req: Request, res: Response) => {
       cookie: req.headers.cookie,
     });
 
-    // Only propagate return_to into the registration link if it passes the same
-    // strict allowlist the other branches use — don't forward an unvalidated,
-    // attacker-supplied value (defense-in-depth, consistent with lines 54/84).
-    const flowReturnTo = (flow as any).return_to as string | undefined;
-    const returnToParam = flowReturnTo && isSafeRedirect(flowReturnTo)
-      ? `?return_to=${encodeURIComponent(flowReturnTo)}`
-      : '';
+    // No "Create an account" link — self-service registration is disabled
+    // (accounts are provisioned by an admin). Only the recovery link remains.
     const footer = `<div class="links">
-      <a href="${kratosBrowserUrl}/self-service/registration/browser${returnToParam}">Create an account</a>
-      &nbsp;|&nbsp;
       <a href="${kratosBrowserUrl}/self-service/recovery/browser">Forgot password?</a>
     </div>`;
 
@@ -110,38 +103,9 @@ router.get('/login', async (req: Request, res: Response) => {
   }
 });
 
-// GET /registration
-router.get('/registration', async (req: Request, res: Response) => {
-  const flowId = req.query.flow as string | undefined;
-
-  if (!flowId) {
-    return res.redirect(`${kratosBrowserUrl}/self-service/registration/browser`);
-  }
-
-  try {
-    const { data: flow } = await kratos.getRegistrationFlow({
-      id: flowId,
-      cookie: req.headers.cookie,
-    });
-
-    const footer = `<div class="links">
-      <a href="${kratosBrowserUrl}/self-service/login/browser">Already have an account? Sign in</a>
-    </div>`;
-
-    res.send(renderRegistrationPage(
-      flow.ui.action,
-      flow.ui.nodes as any,
-      flow.ui.messages as any,
-      footer,
-    ));
-  } catch (err: any) {
-    if (err?.response?.status === 410 || err?.response?.status === 403) {
-      return res.redirect(`${kratosBrowserUrl}/self-service/registration/browser`);
-    }
-    console.error('Registration flow error:', err?.response?.data || err.message);
-    res.status(500).send(renderError('Registration Error', 'Failed to load registration flow.', err?.response?.data?.error?.message));
-  }
-});
+// Self-service registration is disabled platform-wide (Kratos
+// selfservice.flows.registration.enabled=false). There is no portal
+// /registration route — accounts are created by an admin via /admin/users.
 
 // GET /verification
 router.get('/verification', async (req: Request, res: Response) => {
