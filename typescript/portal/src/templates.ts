@@ -1954,16 +1954,16 @@ export function renderSettingsPage(
 ): string {
   const csrf = extractCsrf(nodes);
   const passwordField = extractField(getNode(nodes, 'password'));
-  const email = extractField(getNode(nodes, 'traits.email'));
-  const firstName = extractField(getNode(nodes, 'traits.name.first'));
-  const lastName = extractField(getNode(nodes, 'traits.name.last'));
-  const username = extractField(getNode(nodes, 'traits.preferred_username'));
 
   const hasPassword = nodes.some(n => n.group === 'password' && n.attributes.type === 'password');
-  const hasProfile = nodes.some(n => n.group === 'profile' && n.attributes.type === 'submit');
 
   let body = `<h1>Account settings</h1>${topMessagesHtml(messages)}`;
 
+  // Only the password form is offered. Profile fields (email / username / name)
+  // are intentionally NOT rendered — users may not edit their own traits; only
+  // an admin can, via /admin/users. The Kratos `profile` settings method is also
+  // disabled server-side (selfservice.methods.profile.enabled=false), so this is
+  // defense-in-depth, not the sole control.
   if (hasPassword) {
     body += `
       <h3 style="font-size:1rem;color:#fdf6e8;margin-top:1.5rem;margin-bottom:0.75rem;">Password</h3>
@@ -1979,36 +1979,7 @@ export function renderSettingsPage(
     `;
   }
 
-  if (hasProfile) {
-    body += `
-      <h3 style="font-size:1rem;color:#fdf6e8;margin-top:2rem;margin-bottom:0.75rem;">Profile</h3>
-      <form action="${escapeHtml(action)}" method="POST">
-        ${hiddenCsrf(csrf)}
-        <div class="field">
-          <label for="email">Email</label>
-          <input type="email" name="traits.email" id="email" value="${escapeHtml(email.value)}" required>
-          ${fieldErrorHtml(email.error)}
-        </div>
-        <div class="field">
-          <label for="username">Username <span style="color:#8a7a5a;font-weight:400;">(optional)</span></label>
-          <input type="text" name="traits.preferred_username" id="username" value="${escapeHtml(username.value)}" pattern="[a-zA-Z0-9._-]{1,64}">
-          ${fieldErrorHtml(username.error)}
-        </div>
-        <div class="form-row">
-          <div class="field">
-            <label for="first">First name</label>
-            <input type="text" name="traits.name.first" id="first" value="${escapeHtml(firstName.value)}">
-          </div>
-          <div class="field">
-            <label for="last">Last name</label>
-            <input type="text" name="traits.name.last" id="last" value="${escapeHtml(lastName.value)}">
-          </div>
-        </div>
-        <button type="submit" name="method" value="profile">Save profile</button>
-      </form>
-    `;
-  }
-
+  body += `<p class="help" style="margin-top:1.5rem;">Need to change your email, username, or name? Contact an administrator.</p>`;
   body += footerHtml;
   return layout('Account Settings', body);
 }
