@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { encryptSecret, decryptSecret, needsReencrypt, secretCryptoAvailable } from './secret-crypto';
 
 // Portal Postgres pool. Projects are registration records owned by Kratos
 // identities. No Gitea/ArgoCD provisioning yet — that lands in later MVPs.
@@ -46,9 +47,13 @@ export function isRepoAccess(value: string): value is RepoAccess {
   return REPO_ACCESS.includes(value as RepoAccess);
 }
 
-// Slugs are DNS-label friendly: lowercase alphanumerics + hyphens. They
-// become `{slug}.projects.corpo-valley.com` later, so keep them strict.
-const SLUG_RE = /^[a-z0-9-]+$/;
+// Slugs become `{slug}.projects.corpo-valley.com`, a Gitea repo name, and a
+// k8s namespace — so they must be a strict DNS-1123 label: lowercase
+// alphanumerics and hyphens, 1–63 chars, and NOT starting or ending with a
+// hyphen. A loose `^[a-z0-9-]+$` accepted `-foo`/`foo-`, which k8s, Gitea, and
+// the ingress host all reject — leaving a DB row whose downstream resources
+// can never be created (partial provisioning).
+const SLUG_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 
 // Names that collide with platform / system namespaces, well-known
 // service identities, or platform-prefixed identifiers. Squatting one of
@@ -104,6 +109,56 @@ export async function migrate(): Promise<void> {
   // projects keep working without quietly going dark.
   await pool.query(`UPDATE projects SET service_access='shared' WHERE service_access='open';`);
   await pool.query(`UPDATE projects SET repo_access='shared-edit' WHERE repo_access='open';`);
+
+  // Bring every stored postgres_password under the CURRENT encryption key:
+  // re-encrypts legacy cleartext AND ciphertext written under a now-retired key
+  // (key rotation). decryptSecret→encryptSecret preserves the exact password, so
+  // the per-project databases stay reachable. Skipped (with a warning) when the
+  // key isn't configured, so the portal still boots.
+  const isProd = process.env.NODE_ENV === 'production';
+  if (secretCryptoAvailable()) {
+    const { rows } = await pool.query<{ id: string; postgres_password: string }>(
+      'SELECT id, postgres_password FROM projects WHERE postgres_password IS NOT NULL'
+    );
+    let migrated = 0;
+    let stillUnprotected = 0;
+    for (const row of rows) {
+      if (!needsReencrypt(row.postgres_password)) continue;
+      try {
+        const plain = decryptSecret(row.postgres_password);
+        await pool.query('UPDATE projects SET postgres_password = $2 WHERE id = $1', [
+          row.id, encryptSecret(plain),
+        ]);
+        migrated++;
+      } catch (e: any) {
+        // Can't decrypt (e.g. retired key dropped before migration) — leaves the
+        // row unprotected/inaccessible. Surface loudly; fail closed in prod below.
+        stillUnprotected++;
+        console.error('[projects] could not re-encrypt postgres_password for', row.id, '-', e?.message);
+      }
+    }
+    if (migrated > 0) {
+      console.log(`Re-encrypted ${migrated} postgres_password value(s) under the current key`);
+    }
+    // Fail closed in production: a leftover cleartext/undecryptable row defeats
+    // the at-rest protection this module exists to provide.
+    if (isProd && stillUnprotected > 0) {
+      throw new Error(`${stillUnprotected} postgres_password row(s) remain unprotected after migration — refusing to start in production. Ensure PORTAL_SECRET_KEY (and PORTAL_SECRET_KEY_OLD for rotation) are set.`);
+    }
+  } else if (isProd) {
+    // Mirror the sealing subsystem's production fail-closed for key material.
+    throw new Error('PORTAL_SECRET_KEY is not set — refusing to start in production (per-project Postgres passwords would be stored in cleartext).');
+  } else {
+    console.warn('[projects] PORTAL_SECRET_KEY not set — postgres_password values remain in cleartext. Set the key to enable encryption at rest.');
+  }
+}
+
+// Decrypt a project's stored postgres_password to its plaintext, or null if the
+// project has none. All read sites should go through this rather than reading
+// the raw column.
+export function decodePostgresPassword(project: Pick<Project, 'postgres_password'>): string | null {
+  if (!project.postgres_password) return null;
+  return decryptSecret(project.postgres_password);
 }
 
 export async function listProjectsByOwner(ownerId: string): Promise<Project[]> {
@@ -175,7 +230,7 @@ export async function setGiteaRepo(id: string, fullName: string): Promise<void> 
 }
 
 export async function setPostgresPassword(id: string, password: string): Promise<void> {
-  await pool.query('UPDATE projects SET postgres_password = $2 WHERE id = $1', [id, password]);
+  await pool.query('UPDATE projects SET postgres_password = $2 WHERE id = $1', [id, encryptSecret(password)]);
 }
 
 // Atomically claim the project's postgres password, or read it back if
@@ -187,20 +242,21 @@ export async function setPostgresPassword(id: string, password: string): Promise
 // every other caller reads back the winner's value, so the sealed secret
 // they each (idempotently) write carries the same password.
 export async function claimOrGetPostgresPassword(id: string, candidate: string): Promise<{ password: string; claimed: boolean }> {
-  // Try to claim. The UPDATE returns the row only when it actually
-  // flipped a NULL postgres_password to the candidate.
+  // The candidate is stored encrypted; we hand back the plaintext to callers
+  // (who seal it into the project's SealedSecret). Try to claim — the UPDATE
+  // returns the row only when it actually flipped a NULL → ciphertext.
   const claim = await pool.query<{ postgres_password: string }>(
     `UPDATE projects
      SET postgres_password = $1
      WHERE id = $2 AND postgres_password IS NULL
      RETURNING postgres_password`,
-    [candidate, id]
+    [encryptSecret(candidate), id]
   );
   if (claim.rows.length > 0) {
-    return { password: claim.rows[0].postgres_password, claimed: true };
+    return { password: candidate, claimed: true };
   }
   // Lost the race (or password was already set from a prior cycle).
-  // Read the live value.
+  // Read the live value and decrypt it.
   const { rows } = await pool.query<{ postgres_password: string | null }>(
     'SELECT postgres_password FROM projects WHERE id = $1',
     [id]
@@ -209,7 +265,7 @@ export async function claimOrGetPostgresPassword(id: string, candidate: string):
   if (!existing) {
     throw new Error(`project ${id} not found or has no postgres_password`);
   }
-  return { password: existing, claimed: false };
+  return { password: decryptSecret(existing), claimed: false };
 }
 
 export async function clearPostgresPassword(id: string): Promise<void> {

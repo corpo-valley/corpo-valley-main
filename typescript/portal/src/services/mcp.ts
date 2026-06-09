@@ -16,7 +16,7 @@ import {
   createProject, getProjectById, listProjectsByOwner, deleteProject,
   slugExists, isValidSlug, SERVICE_ACCESS, REPO_ACCESS,
   setGiteaRepo, setPostgresPassword, clearPostgresPassword,
-  claimOrGetPostgresPassword,
+  claimOrGetPostgresPassword, decodePostgresPassword,
   setPinTokenHash,
   type Project,
 } from './projects';
@@ -45,7 +45,7 @@ import { generatePinToken, hashPinToken } from './pin-token';
 import {
   createArgoApplication, k8sEnabled, k8sGetNamespaced, k8sListNamespaced, k8sPodLogs,
   getArgoApplication, triggerArgoSync, k8sDeletePodsByLabel,
-  applyMcpGateway, removeMcpGateway,
+  applyMcpGateway, removeMcpGateway, namespaceExists,
 } from './k8s';
 import { purgeProjectResources } from './project-purge';
 import { buildSealedSecretYaml } from './seal';
@@ -68,6 +68,16 @@ export interface McpContext {
   email?: string;
   // Preferred username, for Gitea credential minting.
   preferredUsername?: string;
+  // Whether the identity's email is verified — gates provisioning tools so an
+  // unverified self-registered user can't spin up compute / mint credentials.
+  emailVerified: boolean;
+}
+
+// Throw from a provisioning tool when the caller's email isn't verified.
+function requireVerified(ctx: McpContext): void {
+  if (!ctx.emailVerified) {
+    throw new ToolError('email verification required: verify your Corpo Valley email before provisioning resources.');
+  }
 }
 
 // ── JSON-RPC types ─────────────────────────────────────────────────────────
@@ -171,6 +181,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const name = String(args.name || '').trim();
       if (!name) throw new ToolError('name is required');
       const visibility = (args.visibility && ['private', 'internal'].includes(args.visibility)) ? args.visibility : 'private';
@@ -184,6 +195,11 @@ const tools: Record<string, ToolDef> = {
       const slug = (typeof args.slug === 'string' && args.slug.trim()) ? args.slug.trim() : sluggify(name);
       if (!isValidSlug(slug)) throw new ToolError(`slug "${slug}" is invalid; must be lowercase letters, digits, and hyphens (max 63 chars).`);
       if (await slugExists(slug)) throw new ToolError(`slug "${slug}" is already taken.`);
+      // Slug availability is NOT just the DB row: a prior project's namespace can
+      // outlive its DB row (best-effort teardown / keep_namespace). Refuse to
+      // claim a slug whose namespace still exists, or the new owner would
+      // inherit the previous tenant's live namespace + secrets.
+      if (await namespaceExists(slug)) throw new ToolError(`slug "${slug}" is not available (its namespace still exists).`);
 
       const project = await createProject({
         slug, name, ownerId: ctx.userId,
@@ -219,6 +235,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (args.confirm_slug !== p.slug) throw new ToolError('confirm_slug must equal the project slug exactly.');
@@ -244,6 +261,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
@@ -251,8 +269,9 @@ const tools: Record<string, ToolDef> = {
       // Atomic claim: concurrent calls don't desync the DB password
       // from the password that ends up sealed in the repo. See
       // services/projects.ts:claimOrGetPostgresPassword.
-      const { password } = p.postgres_password
-        ? { password: p.postgres_password }
+      const existingPw = decodePostgresPassword(p);
+      const { password } = existingPw
+        ? { password: existingPw }
         : await claimOrGetPostgresPassword(p.id, generatePostgresPassword());
       const { secret_name, env_var } = await enablePostgres({ owner, repo, slug: p.slug, password });
       return {
@@ -277,6 +296,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
@@ -315,6 +335,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
@@ -333,8 +354,9 @@ const tools: Record<string, ToolDef> = {
       // manifest, so the secret exists before the database container appears.
       let postgresEnabledNow = current.database;
       if (next.database && !current.database) {
-        const { password } = p.postgres_password
-          ? { password: p.postgres_password }
+        const existingPw = decodePostgresPassword(p);
+        const { password } = existingPw
+          ? { password: existingPw }
           : await claimOrGetPostgresPassword(p.id, generatePostgresPassword());
         await enablePostgres({ owner, repo, slug: p.slug, password });
         postgresEnabledNow = true;
@@ -390,7 +412,7 @@ const tools: Record<string, ToolDef> = {
   },
 
   get_gitea_credentials: {
-    description: 'Mint a fresh Gitea personal access token on the caller\'s Gitea account so the agent can `git clone` and `git push` over HTTPS. Returns the bare token and a ready-to-use `clone_url_with_creds`. The token is user-wide (not repo-scoped) and stays valid until revoked in Gitea\'s UI.',
+    description: 'Mint a fresh Gitea personal access token on the caller\'s Gitea account so the agent can `git clone` and `git push` over HTTPS. Returns the bare `token` and the plain `clone_url`. Supply the token via a git credential helper (e.g. `git -c credential.helper=...` or `GIT_ASKPASS`) rather than embedding it in the remote URL — a creds-in-URL remote leaks the secret into `.git/config`, shell history, and logs. The token is user-wide (not repo-scoped) and stays valid until revoked in Gitea\'s UI.',
     inputSchema: {
       type: 'object',
       required: ['project_id_or_slug'],
@@ -398,22 +420,32 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!ctx.preferredUsername) throw new ToolError('your Corpo Valley account has no Gitea username paired with it.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
+      // Mint only for the account that owns this repo (see the dashboard
+      // cli-token route for the rationale). A user-wide PAT for a username that
+      // no longer owns the repo would be both over-broad and useless here.
+      const repoOwner = p.gitea_repo.split('/')[0];
+      if (repoOwner !== ctx.preferredUsername) {
+        throw new ToolError('this project repo is owned by a different Gitea account than your current username; ask an admin to reconcile.');
+      }
       const suffix = crypto.randomBytes(3).toString('hex');
       const tokenName = `cv-mcp-${suffix}`;
       const { token } = await mintUserCliToken({
         username: ctx.preferredUsername, tokenName, scopes: ['write:repository'],
       });
-      const cloneUrl = `https://${encodeURIComponent(ctx.preferredUsername)}:${encodeURIComponent(token)}@gitea.corpo-valley.com/${p.gitea_repo}.git`;
+      // Deliberately NOT returning a creds-embedded clone URL — that
+      // secret-in-URL form leaks into .git/config / shell history / logs. The
+      // caller supplies `token` via a credential helper instead.
       return {
         username: ctx.preferredUsername,
         token,
         token_name: tokenName,
         clone_url: `https://gitea.corpo-valley.com/${p.gitea_repo}.git`,
-        clone_url_with_creds: cloneUrl,
+        usage: 'git clone with a credential helper, e.g.: git -c credential.helper=\'!f(){ echo "username=' + ctx.preferredUsername + '"; echo "password=$CV_TOKEN"; };f\' clone <clone_url>  (export CV_TOKEN=<token>)',
       };
     },
   },
@@ -436,6 +468,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
@@ -473,6 +506,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
@@ -723,6 +757,7 @@ const tools: Record<string, ToolDef> = {
       const degraded = app.resources.filter((r) => (r.health?.status && r.health.status !== 'Healthy') || (r.status && r.status !== 'Synced'));
       let syncTriggered = false;
       if (args.also_sync) {
+        requireVerified(ctx);
         try {
           await triggerArgoSync({ name: p.slug, namespace: CV_PROJECTS_ARGOCD_NAMESPACE });
           syncTriggered = true;
@@ -768,6 +803,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx);
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       let labelSelector: string | undefined;

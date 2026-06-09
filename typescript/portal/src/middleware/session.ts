@@ -15,6 +15,10 @@ export interface PortalSession {
   // Kratos `preferred_username` trait — used as the Gitea login. May be
   // absent if the identity never set one.
   preferredUsername?: string;
+  // Whether the identity's primary email is verified in Kratos. Provisioning
+  // routes (project create, key/token minting) require this so an unverified
+  // self-registered user can't immediately spin up real compute / repos.
+  emailVerified: boolean;
 }
 
 declare global {
@@ -36,16 +40,40 @@ export async function requireSession(
     });
 
     const traits = session.identity?.traits as Record<string, any> | undefined;
+    const email = traits?.email || '';
+    const verifiable = session.identity?.verifiable_addresses || [];
+    const emailVerified = verifiable.some(
+      (v: any) => v.value?.toLowerCase() === email.toLowerCase() && v.verified,
+    );
     req.portalSession = {
       id: session.identity?.id || '',
-      email: traits?.email || '',
+      email,
       name: traits?.name?.first
         ? `${traits.name.first} ${traits.name.last || ''}`.trim()
         : undefined,
       preferredUsername: traits?.preferred_username || undefined,
+      emailVerified,
     };
     next();
   } catch {
     res.redirect(`${kratosBrowserUrl}/self-service/login/browser`);
   }
+}
+
+// Gate for provisioning/credential-minting routes: requires a verified email on
+// top of an active session. Mount AFTER requireSession. Returns 403 (rather than
+// silently provisioning) so an unverified self-registered user can't create
+// projects, mint Gitea/CLI tokens, or issue API keys until they verify.
+export function requireVerifiedEmail(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!req.portalSession?.emailVerified) {
+    res.status(403).send(
+      'Email verification required. Please verify your email address before provisioning resources.',
+    );
+    return;
+  }
+  next();
 }

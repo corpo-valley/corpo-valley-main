@@ -29,12 +29,18 @@ const CONTROLLER_URL =
 const CERT_TTL_MS = 60 * 60 * 1000; // 1 hour
 let cachedCert: { pem: string; fetchedAt: number; sha256: string } | null = null;
 
-// SHA-256 fingerprint pin. If set in the portal's env, every fetched
-// cert must hash to this exact value or we refuse it — protects against
-// an in-cluster MITM swapping the controller's public key for the
-// attacker's. Rotation requires the operator to update the env (and the
-// portal pod restart). Unset = pin-on-first-use only (see below).
+// SHA-256 fingerprint pin over the cert's SubjectPublicKeyInfo (NOT the PEM
+// text — see fingerprint()). Every fetched cert must hash to this value or we
+// refuse it, defeating an in-cluster MITM that swaps the controller's public
+// key. Rotation = operator updates this env + restarts the pod.
 const EXPECTED_CERT_SHA256 = (process.env.SEALED_SECRETS_CERT_SHA256 || '').trim().toLowerCase();
+
+// Pinning is MANDATORY by default. Trust-on-first-use (remember the first cert
+// seen this process) is a real downgrade — an attacker present before the first
+// fetch transparently wins — so it's only allowed when the operator explicitly
+// opts in via SEALED_SECRETS_ALLOW_TOFU=true. With neither the pin nor the TOFU
+// flag set, we refuse to seal rather than trust an unauthenticated key.
+const ALLOW_TOFU = process.env.SEALED_SECRETS_ALLOW_TOFU === 'true';
 
 export class SealError extends Error {
   constructor(message: string, public cause?: unknown) {
@@ -59,8 +65,14 @@ async function fetchCert(): Promise<string> {
   return pem;
 }
 
+// Fingerprint the cert's SubjectPublicKeyInfo (the DER-encoded public key),
+// NOT the PEM text. The PEM bytes change under benign re-encoding (line wrap,
+// trailing newline, base64 chunking) even when the key is identical, which
+// would make a text-hash pin spuriously fail. Hashing the SPKI makes the pin a
+// property of the key itself — and matches `openssl x509 -pubkey -noout | ...`.
 function fingerprint(pem: string): string {
-  return crypto.createHash('sha256').update(pem, 'utf8').digest('hex');
+  const spki = new crypto.X509Certificate(pem).publicKey.export({ format: 'der', type: 'spki' });
+  return crypto.createHash('sha256').update(spki).digest('hex');
 }
 
 export async function getCert(force = false): Promise<string> {
@@ -68,6 +80,27 @@ export async function getCert(force = false): Promise<string> {
   if (!force && cachedCert && now - cachedCert.fetchedAt < CERT_TTL_MS) {
     return cachedCert.pem;
   }
+
+  // Fail closed: without an explicit pin, refuse to seal unless TOFU is opted in.
+  // TOFU trusts the first cert seen over a plaintext in-cluster HTTP channel, so
+  // it is a dev-only convenience — never honour it in production. Production must
+  // set an explicit SPKI pin.
+  if (!EXPECTED_CERT_SHA256) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new SealError(
+        'sealed-secrets cert is not pinned and trust-on-first-use is not permitted in production: ' +
+        'set SEALED_SECRETS_CERT_SHA256 to the expected SPKI sha256.'
+      );
+    }
+    if (!ALLOW_TOFU) {
+      throw new SealError(
+        'sealed-secrets cert is not pinned: set SEALED_SECRETS_CERT_SHA256 to the ' +
+        'expected SPKI sha256, or set SEALED_SECRETS_ALLOW_TOFU=true (non-production only) ' +
+        'to explicitly accept trust-on-first-use. Refusing to seal against an unauthenticated key.'
+      );
+    }
+  }
+
   const pem = await fetchCert();
   const sha = fingerprint(pem);
 
@@ -98,8 +131,8 @@ export async function getCert(force = false): Promise<string> {
   cachedCert = { pem, fetchedAt: now, sha256: sha };
   if (!EXPECTED_CERT_SHA256) {
     console.warn(
-      `[seal] sealed-secrets cert fingerprint=${sha} (pin-on-first-use). ` +
-      `Set SEALED_SECRETS_CERT_SHA256 in the portal env for explicit pinning across restarts.`
+      `[seal] SEALED_SECRETS_ALLOW_TOFU is set — trusting sealed-secrets cert on first use (SPKI sha256=${sha}). ` +
+      `Set SEALED_SECRETS_CERT_SHA256=${sha} for explicit pinning across restarts and remove the TOFU flag.`
     );
   }
   return pem;

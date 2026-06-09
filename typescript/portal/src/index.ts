@@ -11,11 +11,55 @@ import docsRouter from './routes/docs';
 import { validateCsrf } from './middleware/csrf';
 import { migrate } from './services/projects';
 import { backfillPinTokens } from './services/pin-token-backfill';
+import { runWithNonce } from './lib/csp-nonce';
+import * as crypto from 'crypto';
 
 const app = express();
 const port = parseInt(process.env.PORT || '3000', 10);
 
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+// Baseline security response headers on every route, mounted before routers.
+//   - frame-ancestors 'none' + X-Frame-Options: DENY — clickjacking defense.
+//   - nosniff — stop MIME-type sniffing of our HTML/JSON responses.
+//   - Referrer-Policy — don't leak full URLs (which can carry flow ids) cross-origin.
+// The CSP locks down framing, base-uri, form-action, object-src, and external
+// origins. script-src does NOT allow 'unsafe-inline': every inline <script> the
+// templates emit carries the per-response nonce below, and inline event handlers
+// have been replaced with delegated handlers (see the dashboard bootstrap
+// script). style-src keeps 'unsafe-inline' (inline styles are pervasive and far
+// lower risk than inline script). The nonce is exposed to templates via
+// AsyncLocalStorage so the header and the <script> tags always agree.
+app.use((req, res, next) => {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // HSTS on HTTPS requests (the ingress/CDN terminates TLS and sets
+  // X-Forwarded-Proto; with `trust proxy`, req.secure reflects it). Harmless if
+  // the ingress also sets it.
+  if (req.secure) {
+    res.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+  }
+  res.set(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      `script-src 'self' 'nonce-${nonce}'`,
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data:",
+      "font-src 'self'",
+      "connect-src 'self'",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+    ].join('; '),
+  );
+  runWithNonce(nonce, next);
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());

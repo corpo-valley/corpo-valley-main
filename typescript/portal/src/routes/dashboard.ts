@@ -1,14 +1,15 @@
 import { Router, Request, Response } from 'express';
-import { requireSession } from '../middleware/session';
+import { requireSession, requireVerifiedEmail } from '../middleware/session';
+import { POST_LOGIN_COOKIE } from './kratos';
 import { csrfHiddenField } from '../middleware/csrf';
 import { getUserTier } from '../services/keto';
 import { createApiKey, listUserApiKeys, isKeyOwnedBy, deleteClient } from '../services/hydra-admin';
 import {
-  listProjectsByOwner, getProjectById, createProject, updateProjectAccess,
+  listProjectsByOwner, getProjectById, getProjectBySlug, createProject, updateProjectAccess,
   deleteProject, slugExists, isValidSlug, isServiceAccess, isRepoAccess,
   setGiteaRepo,
   setPostgresPassword, clearPostgresPassword,
-  claimOrGetPostgresPassword,
+  claimOrGetPostgresPassword, decodePostgresPassword,
   setPinTokenHash,
   SERVICE_ACCESS, REPO_ACCESS,
 } from '../services/projects';
@@ -32,7 +33,7 @@ import {
   listRepoFiles, upsertRepoFile, deleteRepoFile,
   mintUserCliToken, setActionsSecret,
 } from '../services/gitea';
-import { createArgoApplication, k8sEnabled } from '../services/k8s';
+import { createArgoApplication, k8sEnabled, namespaceExists } from '../services/k8s';
 import { purgeProjectResources } from '../services/project-purge';
 import { buildSealedSecretYaml } from '../services/seal';
 import {
@@ -44,6 +45,32 @@ import {
 import * as crypto from 'crypto';
 
 const router = Router();
+
+const PROJECTS_DOMAIN = process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com';
+
+// A stashed post-login destination must be an https project host.
+function isSafePostLoginDest(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' && u.hostname.endsWith('.' + PROJECTS_DOMAIN);
+  } catch {
+    return false;
+  }
+}
+
+// Extract the project slug from a `https://<slug>.<PROJECTS_DOMAIN>/...` URL.
+function projectSlugFromHost(url: string): string | null {
+  try {
+    const u = new URL(url);
+    const suffix = '.' + PROJECTS_DOMAIN;
+    if (!u.hostname.endsWith(suffix)) return null;
+    const slug = u.hostname.slice(0, -suffix.length);
+    if (!/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(slug)) return null;
+    return slug;
+  } catch {
+    return null;
+  }
+}
 
 // Token endpoint shown to users for API keys. Defaults to the public Hydra
 // OAuth2 issuer (oauth.corpo-valley.com), falling back to localhost for dev.
@@ -71,6 +98,25 @@ function toProjectRow(p: {
 // GET / — list MY projects
 router.get('/', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
+
+  // Honour a stashed post-login destination (set by /login) ONLY if it is a
+  // valid project host AND the logged-in subject owns that project. This closes
+  // the open-redirect-to-tenant-subdomain phishing vector: an attacker's project
+  // host won't be owned by the victim, so we fall through to the dashboard.
+  const pld = req.cookies?.[POST_LOGIN_COOKIE];
+  if (pld) {
+    res.clearCookie(POST_LOGIN_COOKIE, { path: '/' });
+    if (isSafePostLoginDest(pld)) {
+      const slug = projectSlugFromHost(pld);
+      if (slug) {
+        const project = await getProjectBySlug(slug).catch(() => null);
+        if (project && project.owner_id === session.id) {
+          return res.redirect(pld);
+        }
+      }
+    }
+  }
+
   try {
     const tier = await getUserTier(session.id);
     const projects = await listProjectsByOwner(session.id);
@@ -105,7 +151,7 @@ router.get('/projects/new', requireSession, async (req: Request, res: Response) 
 // New form sends `name` + `visibility`; legacy `slug` / `service_access` /
 // `repo_access` are still accepted (advanced override). Slug derives from
 // name when not provided.
-router.post('/projects', requireSession, async (req: Request, res: Response) => {
+router.post('/projects', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const { slug: rawSlug, name, service_access, repo_access, visibility } = req.body || {};
 
@@ -167,6 +213,13 @@ router.post('/projects', requireSession, async (req: Request, res: Response) => 
   try {
     if (await slugExists(slug)) {
       return fail(`Slug "${slug}" is already taken.`, 409);
+    }
+    // The DB row isn't the only authority for slug availability: a prior
+    // project's namespace can outlive its DB row (best-effort teardown /
+    // keep_namespace). Refuse a slug whose namespace still exists so the new
+    // owner can't inherit the previous tenant's namespace + secrets.
+    if (await namespaceExists(slug)) {
+      return fail(`Slug "${slug}" is not available (its namespace still exists).`, 409);
     }
     const project = await createProject({
       slug,
@@ -239,7 +292,7 @@ async function listProjectSecretNames(project: { gitea_repo: string | null; }): 
 // POST /projects/:id/cli-token — mint a fresh Gitea PAT on the owner's
 // account so they can `git clone` over HTTPS without manually creating one
 // in Gitea's UI. Renders the secret once with a pre-filled clone command.
-router.post('/projects/:id/cli-token', requireSession, async (req: Request, res: Response) => {
+router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const project = await getProjectById(req.params.id);
@@ -252,6 +305,19 @@ router.post('/projects/:id/cli-token', requireSession, async (req: Request, res:
       res.status(400).send(renderError(
         'No Gitea account',
         'Your Corpo Valley account has no preferred_username, so no Gitea account is paired with it. Ask an admin to investigate.'
+      ));
+      return;
+    }
+    // Only mint for the account that actually owns this project's repo. If the
+    // owner's username has since changed, the repo (`<owner>/<slug>`) still
+    // points at the old account, and minting a PAT for the new username would
+    // be a user-wide token that doesn't even grant access to this repo. Refuse
+    // rather than hand out a confusing/over-broad credential.
+    const repoOwner = project.gitea_repo ? project.gitea_repo.split('/')[0] : null;
+    if (repoOwner && repoOwner !== username) {
+      res.status(409).send(renderError(
+        'Account mismatch',
+        'This project repo is owned by a different Gitea account than your current username. Ask an admin to reconcile your account before minting a token.'
       ));
       return;
     }
@@ -269,14 +335,16 @@ router.post('/projects/:id/cli-token', requireSession, async (req: Request, res:
       session.email, tier === 'ADMIN', toProjectRow(project), username, token, tokenName
     ));
   } catch (err: any) {
+    // Don't reflect raw upstream (Gitea) error bodies to the tenant — keep the
+    // detail in the server log only.
     console.error('CLI token mint error:', err?.message);
-    res.status(500).send(renderError('Error', `Failed to mint CLI token: ${err?.message || 'unknown error'}`));
+    res.status(500).send(renderError('Error', 'Failed to mint CLI token. Contact support if this persists.'));
   }
 });
 
 // POST /projects/:id/secrets — seal KEY=VALUE pairs and commit
 // k8s/secrets/<name>.sealed.yaml to the user's repo (owner only).
-router.post('/projects/:id/secrets', requireSession, async (req: Request, res: Response) => {
+router.post('/projects/:id/secrets', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const fail = async (msg: string, status = 400) => {
     const tier = await getUserTier(session.id).catch(() => 'EVERYONE');
@@ -344,8 +412,9 @@ router.post('/projects/:id/secrets', requireSession, async (req: Request, res: R
 
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
+    // Keep raw upstream error detail in the log only, not in the user response.
     console.error('Project secret create error:', err?.message);
-    fail(`Failed to seal secret: ${err?.message || 'unknown error'}`, 500);
+    fail('Failed to seal secret. Contact support if this persists.', 500);
   }
 });
 
@@ -393,7 +462,7 @@ router.post('/projects/:id/secrets/:name/delete', requireSession, async (req: Re
 // namespace within ~a minute. The password lives in the projects row so a
 // later disable/enable cycle keeps the same credentials and the existing
 // PVC's data is still readable.
-router.post('/projects/:id/postgres/enable', requireSession, async (req: Request, res: Response) => {
+router.post('/projects/:id/postgres/enable', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const project = await getProjectById(req.params.id);
@@ -409,8 +478,9 @@ router.post('/projects/:id/postgres/enable', requireSession, async (req: Request
     // Atomic claim: concurrent calls don't desync the DB password from
     // the password that ends up sealed in the repo. See
     // services/projects.ts:claimOrGetPostgresPassword.
-    const { password } = project.postgres_password
-      ? { password: project.postgres_password }
+    const existingPw = decodePostgresPassword(project);
+    const { password } = existingPw
+      ? { password: existingPw }
       : await claimOrGetPostgresPassword(project.id, generatePostgresPassword());
     await enableProjectPostgres({ owner, repo, slug: project.slug, password });
     res.redirect(`/projects/${project.id}`);
@@ -531,7 +601,7 @@ router.get('/keys', requireSession, async (req: Request, res: Response) => {
 });
 
 // POST /keys — create a new API key
-router.post('/keys', requireSession, async (req: Request, res: Response) => {
+router.post('/keys', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const tier = await getUserTier(session.id);

@@ -91,6 +91,15 @@ async function findIdentityByEmail(email: string): Promise<Identity | null> {
 // Returns the bot identity (existing or newly created), or null if we can't
 // derive a username (e.g., the human has neither preferred_username nor a
 // usable email). The bot has no credentials — it can't sign in via password.
+// Only adopt an existing identity as this human's bot if it is actually tagged
+// as a bot owned by this human. Otherwise (e.g. someone self-registered the
+// `<victim>.bot` username/email to squat the mapping) refuse — we must never
+// hand bot tier / provisioning to an identity we didn't create for this human.
+function isBotOwnedBy(identity: Identity, humanId: string): boolean {
+  const meta = (identity.metadata_public ?? {}) as Record<string, any>;
+  return meta.type === 'bot' && meta.human_id === humanId;
+}
+
 export async function ensureBotForHuman(human: Identity): Promise<Identity | null> {
   const botUsername = deriveBotUsername(human);
   if (!botUsername) return null;
@@ -98,7 +107,11 @@ export async function ensureBotForHuman(human: Identity): Promise<Identity | nul
   const botEmail = `${botUsername}@${BOT_EMAIL_DOMAIN}`;
 
   const existing = await findIdentityByEmail(botEmail);
-  if (existing) return existing;
+  if (existing) {
+    if (isBotOwnedBy(existing, human.id)) return existing;
+    console.error('[kratos-admin] bot collision: an identity already holds', botEmail, 'but it is not this human\'s bot — refusing to adopt.');
+    return null;
+  }
 
   const humanTraits = (human.traits ?? {}) as any;
   const traits: IdentityTraits = {
@@ -119,9 +132,13 @@ export async function ensureBotForHuman(human: Identity): Promise<Identity | nul
     });
     return data;
   } catch (err: any) {
-    // Race: another caller created it between findIdentityByEmail and now.
+    // Race or squat: another identity already holds this username/email. Only
+    // return it if it is genuinely this human's bot; otherwise refuse.
     if (err?.response?.status === 409) {
-      return await findIdentityByEmail(botEmail);
+      const found = await findIdentityByEmail(botEmail);
+      if (found && isBotOwnedBy(found, human.id)) return found;
+      console.error('[kratos-admin] bot username/email', botUsername, 'is taken by a non-bot identity — refusing to adopt.');
+      return null;
     }
     throw err;
   }

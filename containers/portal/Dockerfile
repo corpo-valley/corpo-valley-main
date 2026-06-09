@@ -1,8 +1,16 @@
 # TypeScript/Node.js Application Dockerfile
 # Built for: portal (Corpo Valley self-service portal)
 # Build context: typescript/portal/
+#
+# Multi-stage: a full node:slim builder compiles TypeScript, then a distroless
+# runtime carries only the production node_modules + dist. The runtime image has
+# no shell, no package manager, and runs as a non-root user — shrinking the
+# attack surface if the app is ever compromised.
 
-FROM node:20-slim
+# Pin the builder to an immutable patch tag. For supply-chain hardening, append
+# a digest at build time (`node:20.18.1-slim@sha256:<digest>`) and bump
+# intentionally rather than tracking the floating `node:20-slim` tag.
+FROM node:20.18.1-slim AS builder
 
 WORKDIR /app
 
@@ -11,26 +19,29 @@ ARG NPM_REGISTRY=""
 RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi
 
 # Copy package files first for better caching. npm ci needs the lockfile.
+# --ignore-scripts blocks dependency lifecycle scripts (a common supply-chain
+# execution vector); this project's deps are pure-JS and need none.
 COPY package*.json ./
+RUN npm ci --ignore-scripts
 
-# Install ALL dependencies (incl. dev) so we can run the TypeScript build.
-RUN npm ci
-
-# Copy application source
+# Compile TypeScript -> dist/, then drop devDependencies for the runtime copy.
 COPY . .
-
-# Compile TypeScript -> dist/
 RUN npm run build
-
-# Drop devDependencies to slim the runtime image.
 RUN npm prune --omit=dev
 
-# Create non-root user and hand over the app dir
-RUN groupadd -r app && useradd -r -g app app
-RUN chown -R app:app /app
-USER app
+# ── Runtime: distroless, non-root, no shell ───────────────────────────────────
+FROM gcr.io/distroless/nodejs20-debian12:nonroot
 
+WORKDIR /app
+ENV NODE_ENV=production
 ENV PORT=3000
+
+# Only the compiled output + pruned production deps land in the final image.
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/package.json ./package.json
+
 EXPOSE 3000
 
-CMD ["node", "dist/index.js"]
+# The distroless nodejs image's entrypoint is `node`; CMD provides the script.
+CMD ["dist/index.js"]

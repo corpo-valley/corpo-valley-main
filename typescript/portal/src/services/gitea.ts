@@ -15,6 +15,8 @@
 // All operations are best-effort: callers wrap these in try/catch so that a
 // Gitea outage never blocks user or project creation in the portal.
 
+import { isReservedUsername, isValidUsername } from './reserved-names';
+
 const giteaUrl = (process.env.GITEA_URL || 'http://localhost:3001').replace(/\/+$/, '');
 const giteaAdminUser = process.env.GITEA_ADMIN_USER || 'cvportal';
 const giteaAdminToken = process.env.GITEA_ADMIN_TOKEN || '';
@@ -561,6 +563,15 @@ export async function mintUserCliToken(opts: {
 }): Promise<{ name: string; token: string }> {
   if (!giteaEnabled()) {
     throw new GiteaApiError(0, { message: 'Gitea integration disabled' });
+  }
+  // Hard backstop against username-squatting privilege escalation: this call
+  // uses the cvportal *site-admin* Basic-auth, and Gitea's
+  // /users/<name>/tokens endpoint mints the token on whatever <name> we pass.
+  // If `username` were ever a reserved/admin name (e.g. a tenant who squatted
+  // `preferred_username=cvportal`), this would hand the caller a site-admin
+  // token. Refuse regardless of who reached here. See services/reserved-names.
+  if (isReservedUsername(opts.username) || !isValidUsername(opts.username)) {
+    throw new GiteaApiError(0, { message: `refusing to mint token for reserved or invalid username "${opts.username}"` });
   }
   // Gitea exposes user-token creation at /users/{name}/tokens (NOT under
   // /admin/...). When the caller is a site-admin (cvportal is), basic auth

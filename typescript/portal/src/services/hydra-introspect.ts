@@ -5,10 +5,14 @@
 const hydraAdminUrl = process.env.HYDRA_ADMIN_URL || 'http://localhost:4445';
 
 // Cap the cache window so a revoked token isn't accepted longer than this
-// after consent revocation. 5 min was too lax; 60 s is the sweet spot
-// between revocation latency and introspection load. Long-lived SSE
-// channels re-introspect periodically on top of this (see routes/mcp.ts).
-const CACHE_TTL_MS = 60 * 1000;
+// after consent revocation. Hydra admin is in-cluster and cheap to hit, so we
+// keep this very short: the cache exists only to collapse bursts of tool calls
+// on the same token, not to meaningfully extend a token's life past revocation.
+const CACHE_TTL_MS = 5 * 1000;
+
+// Hard cap on cached entries so a flood of distinct tokens can't grow the Map
+// unbounded. On overflow we evict the oldest insertion (Map preserves order).
+const CACHE_MAX_ENTRIES = 5000;
 
 export interface IntrospectionResult {
   active: boolean;
@@ -48,7 +52,14 @@ export async function introspectToken(token: string): Promise<IntrospectionResul
       return { active: false };
     }
     const json = await res.json() as IntrospectionResult;
-    if (json.active) cache.set(token, { result: json, cachedAt: now });
+    if (json.active) {
+      // Bound the cache: evict the oldest entry once over the cap.
+      if (cache.size >= CACHE_MAX_ENTRIES && !cache.has(token)) {
+        const oldest = cache.keys().next().value;
+        if (oldest !== undefined) cache.delete(oldest);
+      }
+      cache.set(token, { result: json, cachedAt: now });
+    }
     return json;
   } catch (err) {
     console.error('[mcp] hydra introspect failed:', (err as Error)?.message);
