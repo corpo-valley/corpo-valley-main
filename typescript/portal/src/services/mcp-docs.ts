@@ -103,11 +103,22 @@ Call \`get_gitea_credentials\` with the project id or slug. The portal
 mints a fresh PAT on the user's Gitea account scoped to
 \`write:repository\` and returns:
 - \`username\` (the Gitea login)
-- \`token\` (the PAT — shown once on Gitea's side; treat as a secret)
-- \`clone_url_with_creds\` (a ready-to-use \`https://<user>:<token>@…\`
-  URL)
+- \`token\` (the PAT — treat as a secret)
+- \`clone_url\` (the plain \`https://gitea.corpo-valley.com/<owner>/<slug>.git\`
+  URL, with NO credentials in it)
 - \`token_name\` (Gitea-side name; you can delete it via Gitea's UI
   later)
+- \`usage\` (a ready-to-run git credential-helper invocation)
+
+Supply the token via a git credential helper / \`GIT_ASKPASS\`, NOT by
+embedding it in the remote URL. A \`https://<user>:<token>@…\` remote
+leaks the secret into \`.git/config\`, shell history, and CI logs. Use the
+returned \`usage\` string, e.g.:
+
+\`\`\`sh
+export CV_TOKEN=<token>
+git -c credential.helper='!f(){ echo "username=<username>"; echo "password=$CV_TOKEN"; };f' clone <clone_url>
+\`\`\`
 
 The token is user-wide, not repo-scoped (Gitea limitation). Mint a fresh
 one per project to keep the names tidy.

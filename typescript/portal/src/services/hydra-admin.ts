@@ -12,11 +12,42 @@ const hydra = new OAuth2Api(
 // + `owner_id === <kratos-id>`.
 export const API_KEY_TYPE = 'api-key';
 
+// Parse the cursor for the next page out of Hydra's RFC 5988 `Link` header.
+// Hydra paginates clients with a cursor it returns as `page_token` in a
+// `Link: <…?page_token=…>; rel="next"` entry; the entry is absent on the last
+// page. Returns the token, or undefined when there is no next page.
+function nextPageToken(linkHeader: unknown): string | undefined {
+  if (typeof linkHeader !== 'string' || !linkHeader) return undefined;
+  for (const part of linkHeader.split(',')) {
+    const m = part.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
+    if (!m) continue;
+    try {
+      // Base URL only matters for parsing relative hrefs; the query is what we want.
+      const tok = new URL(m[1], 'http://x').searchParams.get('page_token');
+      if (tok) return tok;
+    } catch { /* malformed Link entry — skip */ }
+  }
+  return undefined;
+}
+
+// List ALL OAuth2 clients, following Hydra's cursor pagination to completion.
+// listUserApiKeys filters this set client-side, so a single 250-client page
+// would silently hide a user's keys (and their revoke buttons) once the
+// platform-wide client population grows past one page. Iterate until there is
+// no `rel="next"`, with a hard cap as an anti-runaway backstop.
 export async function listClients(): Promise<OAuth2Client[]> {
-  const { data } = await hydra.listOAuth2Clients({
-    pageSize: 250,
-  });
-  return data;
+  const PAGE_SIZE = 250;
+  const MAX_PAGES = 1000; // backstop: 250k clients before we stop following links
+  const all: OAuth2Client[] = [];
+  let pageToken: string | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const resp = await hydra.listOAuth2Clients({ pageSize: PAGE_SIZE, pageToken });
+    all.push(...resp.data);
+    const next = nextPageToken((resp.headers as Record<string, unknown> | undefined)?.link);
+    if (!next) break;
+    pageToken = next;
+  }
+  return all;
 }
 
 export async function getClient(id: string): Promise<OAuth2Client> {

