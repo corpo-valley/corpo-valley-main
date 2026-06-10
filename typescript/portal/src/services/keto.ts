@@ -72,13 +72,27 @@ export async function removeUserFromAllTiers(userId: string): Promise<void> {
 }
 
 export async function setUserTier(userId: string, tier: Tier): Promise<void> {
-  await removeUserFromAllTiers(userId);
+  // Add the target tier FIRST, then strip the others. The reverse order
+  // (remove-all then add) leaves the user in NO tier if the process dies or the
+  // add fails between the two calls — silently dropping ADMIN or the EVERYONE
+  // base grant (getUserTier then defaults to EVERYONE). Add-before-remove fails
+  // safe: a crash mid-change leaves the user with at most an extra tier, never
+  // de-privileged below the target.
   await createRelation({
     namespace: 'groups',
     object: tier,
     relation: 'members',
     subject_id: userId,
   });
+  for (const t of TIERS) {
+    if (t === tier) continue;
+    await deleteRelation({
+      namespace: 'groups',
+      object: t,
+      relation: 'members',
+      subject_id: userId,
+    });
+  }
 }
 
 // Grant the EVERYONE base tier without first wiping the user's other tiers.

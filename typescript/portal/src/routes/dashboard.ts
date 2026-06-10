@@ -8,7 +8,7 @@ import {
   listProjectsByOwner, getProjectById, getProjectBySlug, createProject, updateProjectAccess,
   deleteProject, slugExists, isValidSlug, isServiceAccess, isRepoAccess,
   setGiteaRepo,
-  setPostgresPassword, clearPostgresPassword,
+  clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
   setPinTokenHash,
   SERVICE_ACCESS, REPO_ACCESS,
@@ -420,7 +420,7 @@ router.post('/projects/:id/secrets', requireSession, requireVerifiedEmail, async
 
 // POST /projects/:id/secrets/:name/delete — remove the sealed secret file
 // from the user's repo (owner only).
-router.post('/projects/:id/secrets/:name/delete', requireSession, async (req: Request, res: Response) => {
+router.post('/projects/:id/secrets/:name/delete', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const project = await getProjectById(req.params.id);
@@ -494,7 +494,7 @@ router.post('/projects/:id/postgres/enable', requireSession, requireVerifiedEmai
 // secret (ArgoCD prunes the StatefulSet/Service). If the form carries
 // destroy_data=true the portal also deletes the PVC and clears the stored
 // password so the next enable starts fresh.
-router.post('/projects/:id/postgres/disable', requireSession, async (req: Request, res: Response) => {
+router.post('/projects/:id/postgres/disable', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const destroyData = req.body?.destroy_data === 'true' || req.body?.destroy_data === 'on';
   try {
@@ -527,7 +527,7 @@ router.post('/projects/:id/postgres/disable', requireSession, async (req: Reques
 });
 
 // POST /projects/:id — update access settings (owner only)
-router.post('/projects/:id', requireSession, async (req: Request, res: Response) => {
+router.post('/projects/:id', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const { service_access, repo_access } = req.body || {};
   try {
@@ -556,7 +556,7 @@ router.post('/projects/:id', requireSession, async (req: Request, res: Response)
 // otherwise a one-step Gitea outage leaves the project undeleteable from
 // the user's project list. Every step is 404-tolerant, so a retry safely
 // picks up any straggler resources.
-router.post('/projects/:id/delete', requireSession, async (req: Request, res: Response) => {
+router.post('/projects/:id/delete', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const project = await getProjectById(req.params.id);

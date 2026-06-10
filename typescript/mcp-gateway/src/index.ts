@@ -102,7 +102,7 @@ function challenge(res: express.Response, host: string): void {
     .json({ error: 'missing_bearer', resource_metadata: resourceMetadataUrl(host) });
 }
 
-interface Introspection { active: boolean; sub?: string; client_id?: string; aud?: string[]; ext?: any; }
+interface Introspection { active: boolean; sub?: string; client_id?: string; aud?: string[]; token_use?: string; ext?: any; }
 
 // RFC 8707 audience binding. By default the gateway requires the token's `aud`
 // to include this project's MCP resource (`https://<slug>.<PROJECTS_DOMAIN>/mcp`)
@@ -149,7 +149,9 @@ async function introspect(token: string): Promise<Introspection> {
     const r = await fetch(`${HYDRA_ADMIN_URL}/admin/oauth2/introspect`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token }).toString(),
+      // Hint Hydra we expect an access token; the response's `token_use`
+      // discriminator lets us reject a refresh token presented as a bearer.
+      body: new URLSearchParams({ token, token_type_hint: 'access_token' }).toString(),
     });
     if (!r.ok) return { active: false };
     return await r.json() as Introspection;
@@ -225,6 +227,14 @@ async function handleMcp(req: express.Request, res: express.Response) {
 
   const intro = await introspect(m[1]);
   if (!intro.active || !intro.sub) { challenge(res, host); return; }
+  // Reject non-access tokens (e.g. a refresh token) presented as a bearer.
+  // Hydra reports `token_use` for OAuth2 tokens; when present it must say
+  // access_token. Absent (older Hydra) → fall through, as before.
+  if (intro.token_use && intro.token_use !== 'access_token') {
+    console.warn('[gateway] rejecting non-access token', { slug, token_use: intro.token_use, client_id: intro.client_id });
+    challenge(res, host);
+    return;
+  }
   const sub = intro.sub;
   if (intro.client_id && DENY_CLIENT_IDS.includes(intro.client_id)) {
     res.status(403).json({ error: 'unauthorized_client' });
@@ -314,6 +324,15 @@ async function handleMcp(req: express.Request, res: express.Response) {
   const stopRevalidate = () => clearInterval(revalidate);
   res.on('close', stopRevalidate);
   preq.on('close', stopRevalidate);
+
+  // Handle errors on the inbound request stream (client abort / reset mid-body).
+  // Without a listener an 'error' on req would surface as an unhandled exception;
+  // tear down the upstream and timer instead.
+  req.on('error', (e) => {
+    console.error('[gateway] inbound request stream error:', e.message);
+    stopRevalidate();
+    try { preq.destroy(); } catch { /* already gone */ }
+  });
 
   req.pipe(preq);
 }

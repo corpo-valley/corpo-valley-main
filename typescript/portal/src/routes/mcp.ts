@@ -115,6 +115,16 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
       .json({ error: 'invalid_token', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
     return null;
   }
+  // Reject a non-access token (e.g. a refresh token) presented as a bearer.
+  // Hydra reports `token_use`; when present it must say access_token. Absent
+  // (older Hydra) → fall through, preserving existing behaviour.
+  if (introspection.token_use && introspection.token_use !== 'access_token') {
+    console.warn('[mcp] rejected non-access token', { token_use: introspection.token_use, client_id: introspection.client_id });
+    res.status(401)
+      .set('WWW-Authenticate', `Bearer realm="${PUBLIC_MCP_URL}", error="invalid_token"`)
+      .json({ error: 'invalid_token', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
+    return null;
+  }
 
   // Confused-deputy defence. A valid Hydra token for the user is NOT enough —
   // it must come from a client meant to drive MCP. Otherwise a token issued to
@@ -271,25 +281,50 @@ router.get('/mcp', async (req: Request, res: Response) => {
   sseOpenPerUser.set(ctx.userId, open + 1);
   sseOpenTotal++;
 
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-store',
-    Connection: 'keep-alive',
-    // Disable nginx/proxy response buffering — SSE needs each chunk to
-    // reach the client immediately, not after the proxy decides it has
-    // accumulated enough.
-    'X-Accel-Buffering': 'no',
-  });
-  res.flushHeaders();
+  // Register the slot-release BEFORE any flushHeaders/write that can throw.
+  // Otherwise a header-flush/write failure (e.g. client already gone) would
+  // skip the close handler and leak a per-user + total slot for the life of the
+  // process, eventually wedging the cap. `release` is idempotent and also clears
+  // the heartbeat (armed below).
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    if (heartbeat) clearInterval(heartbeat);
+    if (sseOpenTotal > 0) sseOpenTotal--;
+    const n = (sseOpenPerUser.get(ctx.userId) || 1) - 1;
+    if (n <= 0) sseOpenPerUser.delete(ctx.userId);
+    else sseOpenPerUser.set(ctx.userId, n);
+  };
+  req.on('close', release);
 
-  // Push a list_changed notification right away. Cheap: any tool added
-  // since the client last looked will get picked up on the very next
-  // tools/list call.
-  const notification = JSON.stringify({
-    jsonrpc: '2.0',
-    method: 'notifications/tools/list_changed',
-  });
-  res.write(`data: ${notification}\n\n`);
+  try {
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-store',
+      Connection: 'keep-alive',
+      // Disable nginx/proxy response buffering — SSE needs each chunk to
+      // reach the client immediately, not after the proxy decides it has
+      // accumulated enough.
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders();
+
+    // Push a list_changed notification right away. Cheap: any tool added
+    // since the client last looked will get picked up on the very next
+    // tools/list call.
+    const notification = JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/tools/list_changed',
+    });
+    res.write(`data: ${notification}\n\n`);
+  } catch (err) {
+    console.error('[mcp] SSE channel setup failed:', (err as Error)?.message);
+    release();
+    try { res.end(); } catch { /* already gone */ }
+    return;
+  }
 
   // Re-extract the bearer once so the reintrospection loop doesn't have
   // to walk express's req.headers every tick.
@@ -299,7 +334,7 @@ router.get('/mcp', async (req: Request, res: Response) => {
   // Proxies (nginx, Cloudflare) drop idle streams after ~60s. Send a
   // comment heartbeat well within that window. While we're here, re-
   // introspect the token so a revoked session is closed mid-channel.
-  const heartbeat = setInterval(async () => {
+  heartbeat = setInterval(async () => {
     try {
       if (token) {
         const r = await coalescedIntrospect(token);
@@ -314,14 +349,6 @@ router.get('/mcp', async (req: Request, res: Response) => {
       try { res.end(); } catch { /* already gone */ }
     }
   }, REINTROSPECT_MS);
-
-  req.on('close', () => {
-    clearInterval(heartbeat);
-    if (sseOpenTotal > 0) sseOpenTotal--;
-    const n = (sseOpenPerUser.get(ctx.userId) || 1) - 1;
-    if (n <= 0) sseOpenPerUser.delete(ctx.userId);
-    else sseOpenPerUser.set(ctx.userId, n);
-  });
 });
 
 export default router;

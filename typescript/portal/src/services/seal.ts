@@ -54,7 +54,11 @@ export function sealEnabled(): boolean {
 }
 
 async function fetchCert(): Promise<string> {
-  const res = await fetch(`${CONTROLLER_URL}/v1/cert.pem`);
+  // Bounded timeout: a hung/black-holed controller must fail fast rather than
+  // stall every seal operation (and the request handlers awaiting them)
+  // indefinitely — global fetch (undici) has no default timeout.
+  const res = await fetch(`${CONTROLLER_URL}/v1/cert.pem`, { signal: AbortSignal.timeout(5000) })
+    .catch((err) => { throw new SealError('sealed-secrets controller cert fetch failed or timed out', err); });
   if (!res.ok) {
     throw new SealError(`sealed-secrets controller returned ${res.status} fetching cert`);
   }

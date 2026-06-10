@@ -17,9 +17,11 @@
 import { Pool } from 'pg';
 import { setActionsSecret, upsertRepoFile, getFile } from './gitea';
 import { generatePinToken, hashPinToken } from './pin-token';
+import { resolveDatabaseUrl } from './projects';
 
-const databaseUrl = process.env.DATABASE_URL || 'postgres://portal:portal@localhost:5432/portal';
-const pool = new Pool({ connectionString: databaseUrl });
+// Fail closed in production if DATABASE_URL is unset rather than using the
+// built-in portal:portal default — see resolveDatabaseUrl in projects.ts.
+const pool = new Pool({ connectionString: resolveDatabaseUrl() });
 
 const CANONICAL_BUILD_WORKFLOW = `# Corpo Valley — pre-baked container build + manifest pin.
 #

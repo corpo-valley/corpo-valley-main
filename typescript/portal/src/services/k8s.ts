@@ -590,13 +590,20 @@ export async function applyMcpGateway(slug: string): Promise<void> {
 // disabled. Idempotent (404 = already gone).
 export async function removeMcpGateway(slug: string): Promise<void> {
   if (!k8sEnabled()) return;
+  // Delete both objects INDEPENDENTLY: if the Ingress delete fails with a
+  // transient (non-404) error, we must still attempt the Service delete, and
+  // vice versa. Aborting after the first failure could leave the unauthenticated
+  // /mcp Ingress in place after the capability is "disabled". Collect errors and
+  // re-throw an aggregate so a reconciler/caller still sees the failure.
+  const errors: unknown[] = [];
   for (const path of [
     `/apis/networking.k8s.io/v1/namespaces/${encodeURIComponent(slug)}/ingresses/${slug}-mcp`,
     `/api/v1/namespaces/${encodeURIComponent(slug)}/services/${MCP_GATEWAY_SVC}`,
   ]) {
     try { await call({ method: 'DELETE', path }); }
-    catch (err) { if (!(err instanceof K8sApiError && err.status === 404)) throw err; }
+    catch (err) { if (!(err instanceof K8sApiError && err.status === 404)) errors.push(err); }
   }
+  if (errors.length) throw errors[0];
 }
 
 // Stamp the platform-owned containment baseline onto a project namespace,

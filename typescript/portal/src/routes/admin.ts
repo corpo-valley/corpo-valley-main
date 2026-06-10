@@ -301,7 +301,17 @@ router.post('/apps/register', async (req: Request, res: Response) => {
       metadata: { tier },
     });
 
-    await setServiceTier(appName, tier as Tier);
+    try {
+      await setServiceTier(appName, tier as Tier);
+    } catch (tierErr: any) {
+      // Compensate: the Hydra client now exists (with a secret the admin never
+      // saw) but has no tier relation. Roll it back so a retry with the same
+      // appName doesn't fail with a duplicate-client error and wedge the admin.
+      console.error('Register app: setServiceTier failed, rolling back client', appName, tierErr?.message);
+      await deleteClient(appName).catch((delErr: any) =>
+        console.error('Register app: rollback deleteClient failed', appName, delErr?.message));
+      throw tierErr;
+    }
 
     res.send(renderAdminRegisterResult(client.client_id || appName, secret, tier, session.email));
   } catch (err: any) {

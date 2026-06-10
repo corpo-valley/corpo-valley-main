@@ -15,7 +15,7 @@ import * as crypto from 'crypto';
 import {
   createProject, getProjectById, listProjectsByOwner, deleteProject,
   slugExists, isValidSlug, SERVICE_ACCESS, REPO_ACCESS,
-  setGiteaRepo, setPostgresPassword, clearPostgresPassword,
+  setGiteaRepo, clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
   setPinTokenHash,
   type Project,
@@ -57,7 +57,6 @@ const SERVER_INFO = {
   version: '0.1.0',
 };
 
-const GITEA_INTERNAL_URL = process.env.GITEA_INTERNAL_URL || 'http://gitea.cv-gitea.svc.cluster.local';
 const CV_PROJECTS_ARGOCD_NAMESPACE = process.env.CV_PROJECTS_ARGOCD_NAMESPACE || 'cv-projects-argocd';
 const CV_PROJECTS_APPPROJECT = process.env.CV_PROJECTS_APPPROJECT || 'projects';
 
@@ -608,6 +607,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx); // merging a PR drives a build/deploy — same gate as every other mutating tool
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
@@ -638,6 +638,7 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
+      requireVerified(ctx); // merging a PR drives a build/deploy — same gate as every other mutating tool
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
@@ -1137,7 +1138,18 @@ async function handleRpc(req: JsonRpcRequest, ctx: McpContext): Promise<JsonRpcR
             structuredContent: result,
           });
         } catch (e: any) {
-          const msg = e instanceof ToolError ? e.message : (e?.message || 'tool failed');
+          // ToolError messages are intentionally user-facing. Any OTHER exception
+          // (e.g. GiteaApiError / k8s errors that embed raw upstream response
+          // bodies) is logged server-side and returned to the caller as a
+          // generic message, so platform-internal detail isn't reflected to a
+          // tenant for reconnaissance.
+          let msg: string;
+          if (e instanceof ToolError) {
+            msg = e.message;
+          } else {
+            console.error(`[mcp] tool ${params.name} failed:`, e?.message || e);
+            msg = 'internal error running tool';
+          }
           return ok(req.id, {
             content: [{ type: 'text', text: msg }],
             isError: true,
