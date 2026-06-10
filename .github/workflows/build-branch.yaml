@@ -1,0 +1,191 @@
+# Manually build + publish EVERY Corpo Valley container image from a chosen
+# branch (or any git ref), not just main.
+#
+# This is distinct from build-images.yaml (auto-builds only the apps that
+# changed on a push to main) and release-images.yaml (operator-stamped
+# immutable version tags). This workflow is operator-triggered, takes an
+# arbitrary `ref`, and builds ALL containers found on it — the thing you want
+# when validating a feature branch end-to-end or producing throwaway images to
+# point a preview deploy at.
+#
+# Images publish to ghcr.io/corpo-valley/corpo-valley-<app> tagged with the
+# sanitized branch name and `<branch>-YYYYMMDD-<sha>`. It deliberately does NOT
+# move `:latest` — that belongs to main via build-images.yaml — so a branch
+# build can never clobber the rolling dev tag a deploy may track.
+#
+# As with the other build workflows, this repo does NOT bump deployment
+# manifests; the corpo-valley-chart consumer owns image.tags.<component>.
+
+name: Build Branch Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch (or tag/SHA) to build all containers from'
+        required: true
+        type: string
+      mark_latest:
+        description: 'Also tag the images :latest (use with care — main owns latest)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  GHCR_NAMESPACE: corpo-valley
+  IMAGE_PREFIX: corpo-valley-
+
+# Don't let two builds of the same ref race each other.
+concurrency:
+  group: build-branch-${{ github.event.inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.discover.outputs.apps }}
+      ref_slug: ${{ steps.validate.outputs.ref_slug }}
+    steps:
+      - name: Validate ref
+        id: validate
+        # Bind the dispatch input to an env var rather than interpolating
+        # ${{ github.event.inputs.ref }} into the shell — GitHub expands ${{ }}
+        # into the script source BEFORE bash parses it, so a crafted ref would
+        # otherwise run as code on a runner holding packages:write to
+        # ghcr.io/corpo-valley/* (supply-chain image poisoning). Mirrors the
+        # hardening in build-images.yaml / release-images.yaml.
+        env:
+          REF_INPUT: ${{ github.event.inputs.ref }}
+        run: |
+          set -euo pipefail
+          # git-ref-safe subset: letters, digits, and . _ / - only; no leading
+          # dash, no '..' path traversal, length-bounded.
+          if ! printf '%s' "$REF_INPUT" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$'; then
+            echo "::error::invalid ref '$REF_INPUT' (expected a git ref like 'my/branch', no leading '-')"
+            exit 1
+          fi
+          if printf '%s' "$REF_INPUT" | grep -q '\.\.'; then
+            echo "::error::ref '$REF_INPUT' must not contain '..'"
+            exit 1
+          fi
+          # Sanitize to a docker-tag-safe slug for use as an image tag.
+          REF_SLUG=$(printf '%s' "$REF_INPUT" | tr '/' '-' | tr -cd 'A-Za-z0-9._-')
+          echo "ref_slug=$REF_SLUG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Discover containers on the ref
+        id: discover
+        run: |
+          set -euo pipefail
+          # Every app is a containers/<app>/ directory that has a Dockerfile.
+          APPS=$(find containers -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' \
+            | sed 's#^containers/##' \
+            | sort -u \
+            | jq -R . | jq -s -c 'map(select(length > 0))')
+          if [ "$APPS" = "[]" ] || [ -z "$APPS" ]; then
+            echo "::error::no containers/*/Dockerfile found on this ref"
+            exit 1
+          fi
+          echo "apps=$APPS" >> "$GITHUB_OUTPUT"
+          echo "Building all containers: $APPS"
+
+  build:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one bad app shouldn't sink the rest of the branch build
+      matrix:
+        app: ${{ fromJson(needs.discover.outputs.apps) }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Determine source directory
+        id: source
+        run: |
+          set -euo pipefail
+          CONTEXT_FILE="containers/${{ matrix.app }}/context.txt"
+          if [ -f "$CONTEXT_FILE" ]; then
+            echo "dir=$(tr -d '\n' < "$CONTEXT_FILE")" >> "$GITHUB_OUTPUT"
+          elif [ -d "frontend/${{ matrix.app }}" ] && [ -d "typescript/${{ matrix.app }}" ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          elif [ -d "typescript/${{ matrix.app }}" ]; then
+            echo "dir=typescript/${{ matrix.app }}" >> "$GITHUB_OUTPUT"
+          elif [ -d "python/${{ matrix.app }}" ]; then
+            echo "dir=python/${{ matrix.app }}" >> "$GITHUB_OUTPUT"
+          elif [ -d "static/${{ matrix.app }}" ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::no source directory for ${{ matrix.app }}"
+            exit 1
+          fi
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Version tag
+        id: version
+        run: echo "tag=${{ needs.discover.outputs.ref_slug }}-$(date +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.app }}
+          tags: |
+            type=raw,value=${{ needs.discover.outputs.ref_slug }}
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=raw,value=latest,enable=${{ github.event.inputs.mark_latest }}
+
+      - name: Build platforms
+        id: platforms
+        run: |
+          PLATFORM_FILE="containers/${{ matrix.app }}/platforms.txt"
+          if [ -f "$PLATFORM_FILE" ]; then
+            echo "platforms=$(tr '\n' ',' < "$PLATFORM_FILE" | sed 's/,$//')" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: ${{ steps.source.outputs.dir }}
+          file: containers/${{ matrix.app }}/Dockerfile
+          platforms: ${{ steps.platforms.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Corpo Valley ${{ matrix.app }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image summary
+        run: |
+          {
+            echo "### Built ${{ matrix.app }} from \`${{ github.event.inputs.ref }}\`"
+            echo ""
+            echo "**Image:** \`${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.app }}\`"
+            echo ""
+            echo "**Tags:**"
+            echo "${{ steps.meta.outputs.tags }}" | while read -r tag; do
+              echo "- \`$tag\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
