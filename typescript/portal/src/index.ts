@@ -30,6 +30,23 @@ const KRATOS_BROWSER_ORIGIN = (() => {
   }
 })();
 
+// Ory Hydra browser origin (e.g. https://oauth.corpo-valley.com). When a user
+// without an existing session connects MCP, the OAuth login_challenge renders
+// the interactive Kratos login form; on success Kratos 303s the form submission
+// to Hydra's login-accept URL on THIS origin to continue the flow. Chromium
+// enforces `form-action` across the whole redirect chain of a submission, so the
+// Hydra origin must be allowed too — otherwise the login POST's redirect is
+// blocked and the MCP connect dead-ends on the login page. (Users with an
+// existing session skip the form via a GET redirect, which form-action ignores,
+// which is why this only bites first-time / no-session connects.)
+const HYDRA_BROWSER_ORIGIN = (() => {
+  try {
+    return new URL(process.env.HYDRA_PUBLIC_URL || 'http://localhost:4444').origin;
+  } catch {
+    return '';
+  }
+})();
+
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
@@ -66,9 +83,11 @@ app.use((req, res, next) => {
       "connect-src 'self'",
       "object-src 'none'",
       "base-uri 'self'",
-      // 'self' for the portal's own POSTs (consent, logout, dashboard/admin) +
-      // the Kratos origin for the auth flow forms.
-      `form-action 'self'${KRATOS_BROWSER_ORIGIN ? ' ' + KRATOS_BROWSER_ORIGIN : ''}`,
+      // 'self' for the portal's own POSTs (consent, logout, dashboard/admin),
+      // the Kratos origin for the auth-flow forms, and the Hydra origin for the
+      // login-form 303 that continues an OAuth login_challenge (see
+      // KRATOS_BROWSER_ORIGIN / HYDRA_BROWSER_ORIGIN above).
+      `form-action 'self'${[KRATOS_BROWSER_ORIGIN, HYDRA_BROWSER_ORIGIN].filter(Boolean).map((o) => ' ' + o).join('')}`,
       "frame-ancestors 'none'",
     ].join('; '),
   );
