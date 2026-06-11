@@ -106,7 +106,9 @@ function sendFormRedirect(res: Response, url: string): void {
     res.status(500).send(renderError('Redirect Error', 'Unexpected redirect target.'));
     return;
   }
-  res.send(renderFormRedirect(url));
+  // The page embeds a one-time OAuth continuation URL (consent/logout
+  // verifier) — keep it out of shared caches and bfcache/history stores.
+  res.set('Cache-Control', 'no-store').send(renderFormRedirect(url));
 }
 
 // Known first-party clients that can skip the consent screen. Gitea will use

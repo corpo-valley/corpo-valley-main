@@ -125,18 +125,28 @@ function sanitizeDcrResponse(body: unknown): unknown {
 }
 
 // DCR is driven by third-party MCP clients, some browser-based — same
-// cross-origin posture as the discovery docs above.
-function dcrCors(res: Response): void {
+// cross-origin posture as the discovery docs above. Router-level so every
+// route on the subtree (including preflight) inherits it.
+router.use('/oauth2/register', (_req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'POST, GET, PUT, DELETE, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-}
+  next();
+});
 
 async function proxyRegister(req: Request, res: Response): Promise<void> {
-  dcrCors(res);
   const id = req.params.id;
   if (id !== undefined && !/^[A-Za-z0-9._~-]{1,128}$/.test(id)) {
     res.status(400).json({ error: 'invalid_client_id' });
+    return;
+  }
+  const hasBody = req.method === 'POST' || req.method === 'PUT';
+  // RFC 7591/7592 require application/json requests. Reject other
+  // Content-Types instead of silently re-serializing whatever the global
+  // body parsers produced (express.urlencoded would turn a form POST into an
+  // object we'd forward as JSON — accepting requests raw Hydra rejects).
+  if (hasBody && !req.is('application/json')) {
+    res.status(400).json({ error: 'invalid_request', error_description: 'Content-Type must be application/json' });
     return;
   }
   const url = `${HYDRA_PUBLIC_URL_INTERNAL}/oauth2/register${id ? `/${encodeURIComponent(id)}` : ''}`;
@@ -145,7 +155,6 @@ async function proxyRegister(req: Request, res: Response): Promise<void> {
   // verbatim; Hydra is the one that validates it.
   const auth = req.header('authorization');
   if (auth) headers['Authorization'] = auth;
-  const hasBody = req.method === 'POST' || req.method === 'PUT';
   if (hasBody) headers['Content-Type'] = 'application/json';
   try {
     const upstream = await fetch(url, {
@@ -178,10 +187,7 @@ async function proxyRegister(req: Request, res: Response): Promise<void> {
   }
 }
 
-router.options(['/oauth2/register', '/oauth2/register/:id'], (_req, res) => {
-  dcrCors(res);
-  res.status(204).end();
-});
+router.options(['/oauth2/register', '/oauth2/register/:id'], (_req, res) => res.status(204).end());
 router.post('/oauth2/register', proxyRegister);
 router.get('/oauth2/register/:id', proxyRegister);
 router.put('/oauth2/register/:id', proxyRegister);
