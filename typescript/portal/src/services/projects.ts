@@ -1,11 +1,30 @@
 import { Pool } from 'pg';
 import { encryptSecret, decryptSecret, needsReencrypt, secretCryptoAvailable } from './secret-crypto';
 
-// Portal Postgres pool. Projects are registration records owned by Kratos
-// identities. No Gitea/ArgoCD provisioning yet — that lands in later MVPs.
-const databaseUrl = process.env.DATABASE_URL || 'postgres://portal:portal@localhost:5432/portal';
+// Resolve the portal's Postgres connection string. In production DATABASE_URL
+// MUST be set: silently falling back to the well-known `portal:portal@localhost`
+// default would connect to an unintended/insecure DB (this DB holds every
+// project's encrypted password, pin-token hashes, and owner mappings) rather
+// than failing closed like PORTAL_SECRET_KEY and the seal cert already do. The
+// baked default remains only for local dev. Shared with pin-token-backfill.ts.
+export function resolveDatabaseUrl(): string {
+  const url = process.env.DATABASE_URL;
+  if (url) return url;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('DATABASE_URL is not set — refusing to start in production with the built-in portal:portal default credential.');
+  }
+  return 'postgres://portal:portal@localhost:5432/portal';
+}
 
-const pool = new Pool({ connectionString: databaseUrl });
+// Portal Postgres pool. Projects are registration records owned by Kratos
+// identities.
+const pool = new Pool({ connectionString: resolveDatabaseUrl() });
+
+// A row id is a Postgres uuid; a non-UUID :id makes Postgres throw an
+// invalid-input-syntax error (surfacing as a 500). Pre-validate so callers can
+// treat "malformed id" the same as "not found" (404) and avoid leaking the
+// distinction to scanners.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Corpo Valley does not publish projects publicly. The legacy `open` value
 // (unauthenticated repo + service) has been removed; existing rows carrying
@@ -170,6 +189,7 @@ export async function listProjectsByOwner(ownerId: string): Promise<Project[]> {
 }
 
 export async function getProjectById(id: string): Promise<Project | null> {
+  if (!UUID_RE.test(id)) return null; // malformed id → treat as not found
   const { rows } = await pool.query<Project>(
     'SELECT * FROM projects WHERE id = $1',
     [id]
@@ -229,13 +249,9 @@ export async function setGiteaRepo(id: string, fullName: string): Promise<void> 
   await pool.query('UPDATE projects SET gitea_repo = $2 WHERE id = $1', [id, fullName]);
 }
 
-export async function setPostgresPassword(id: string, password: string): Promise<void> {
-  await pool.query('UPDATE projects SET postgres_password = $2 WHERE id = $1', [id, encryptSecret(password)]);
-}
-
 // Atomically claim the project's postgres password, or read it back if
 // another caller already claimed. Two concurrent `enable_postgres` calls
-// would otherwise race: both generate a candidate, both `setPostgresPassword`
+// would otherwise race: both generate a candidate, both write the password
 // (last write wins), then both `upsertRepoFile` the sealed secret — and
 // the DB password may not match the one that got sealed. With this
 // helper, only one caller's UPDATE flips the NULL → claimed transition;

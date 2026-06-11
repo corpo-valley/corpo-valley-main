@@ -50,7 +50,11 @@ function containerBlock(opts: {
                  `                  name: ${e.secret.name}\n` +
                  `                  key: ${e.secret.key}`;
         }
-        return `            - name: ${e.name}\n              value: "${e.value}"`;
+        // JSON.stringify produces a valid YAML double-quoted scalar with quotes,
+        // backslashes, and newlines escaped — so a value can never break out of
+        // the string and inject arbitrary Deployment YAML, even if a future
+        // caller passes a user-influenced env value (today they're all constants).
+        return `            - name: ${e.name}\n              value: ${JSON.stringify(e.value ?? '')}`;
       }))
     : [];
   return [

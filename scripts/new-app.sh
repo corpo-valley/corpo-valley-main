@@ -51,6 +51,15 @@ validate_name() {
     return 0
 }
 
+validate_port() {
+    local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo -e "${RED}Error: port must be an integer between 1 and 65535${NC}"
+        return 1
+    fi
+    return 0
+}
+
 prompt_if_empty() {
     local varname="$1" prompt="$2" default="${3:-}"
     if [[ -z "${!varname}" ]]; then
@@ -59,7 +68,9 @@ prompt_if_empty() {
         else
             read -p "$prompt: " value
         fi
-        eval "$varname=\"$value\""
+        # printf -v assigns without eval, so a value containing quotes/shell
+        # metacharacters can't execute (eval "$varname=\"$value\"" would).
+        printf -v "$varname" '%s' "$value"
     fi
 }
 
@@ -121,6 +132,11 @@ if [[ -z "$PORT" ]]; then
     esac
     prompt_if_empty PORT "Port" "$DEFAULT_PORT"
 fi
+
+# Validate PORT (from --port or the prompt) before it flows into sed and the
+# generated k8s manifest — an unvalidated value could corrupt the substitution
+# or inject manifest content.
+validate_port "$PORT" || exit 1
 
 echo ""
 echo -e "${YELLOW}Creating app:${NC}"

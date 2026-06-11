@@ -3,6 +3,7 @@ import { Configuration, OAuth2Api } from '@ory/client';
 import { renderError, renderInfo, renderConsentPage, renderLogoutConfirm } from '../templates';
 import { getIdentity } from '../services/kratos-admin';
 import { getProjectBySlug } from '../services/projects';
+import { userCanAccessService } from '../services/keto';
 import { requireSession } from '../middleware/session';
 import { validateCsrf, csrfHiddenField } from '../middleware/csrf';
 
@@ -104,6 +105,28 @@ function isTrustedClient(clientId: string | undefined): boolean {
   return TRUSTED_CLIENTS.has(clientId);
 }
 
+// Enforce the per-service tier gate for admin-registered service clients. The
+// platform's Admin → Apps UI assigns each registered service a required tier
+// (EVERYONE/BETA/ALPHA/ADMIN), but nothing consulted it at request time, so the
+// gating was decorative — any authenticated user could complete consent for any
+// service regardless of its tier. We close that here, at the point Hydra issues
+// the service a token. Trusted first-party clients (argocd/gitea) and
+// dynamically-registered clients (the MCP OAuth flow, which carry no tier) are
+// unaffected: userCanAccessService returns true when no tier tuple exists.
+// Returns true if allowed; otherwise sends a 403 and returns false. Any Keto
+// error propagates (caught by the route's try/catch → 500), i.e. fail closed.
+async function ensureServiceTierAccess(
+  res: Response,
+  clientId: string | undefined,
+  subject: string,
+): Promise<boolean> {
+  if (!clientId) return true;
+  if (await userCanAccessService(subject, clientId)) return true;
+  console.warn('[consent] tier gate denied: subject lacks required tier for service', { clientId, subject });
+  res.status(403).send(renderError('Access Denied', 'Your account tier does not have access to this application.'));
+  return false;
+}
+
 // Verify the active Kratos session owns the consent challenge. Without this,
 // an attacker who lures a logged-in victim (or forges a cross-site POST) could
 // have Hydra mint tokens carrying the VICTIM's subject for an attacker-
@@ -159,6 +182,10 @@ router.get('/consent', requireSession, async (req: Request, res: Response) => {
       return res.redirect(completedRequest.redirect_to);
     }
 
+    // Tier gate: deny before showing consent if the subject's tier is below the
+    // service's required tier. (Trusted clients above are exempt by design.)
+    if (!(await ensureServiceTierAccess(res, clientId, consentRequest.subject || ''))) return;
+
     // For unknown/external clients, show consent page (with a CSRF token).
     res.send(renderConsentPage(
       clientName,
@@ -184,6 +211,10 @@ router.post('/consent/accept', requireSession, validateCsrf, async (req: Request
   try {
     const consentRequest = await loadConsentForSession(req, res, consentChallenge);
     if (!consentRequest) return;
+
+    // Re-check the service tier gate at the point of issuance (defense in depth
+    // against a direct POST that skips the GET render).
+    if (!(await ensureServiceTierAccess(res, consentRequest.client?.client_id, consentRequest.subject || ''))) return;
 
     const idTokenClaims = await buildIdTokenClaims(consentRequest.subject || '');
     const { data: completedRequest } = await hydra.acceptOAuth2ConsentRequest({

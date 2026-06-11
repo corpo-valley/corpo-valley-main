@@ -217,10 +217,14 @@ router.get('/error', async (req: Request, res: Response) => {
   try {
     const { data } = await kratos.getFlowError({ id: errorId });
     const errorBody = data.error as Record<string, any> | undefined;
+    // Render only the whitelisted message/reason strings. Never JSON.stringify
+    // the whole upstream error object — Kratos flow-error bodies can carry
+    // internal flow state and identifiers not meant for an arbitrary viewer of
+    // this unauthenticated endpoint.
     res.send(renderError(
       'Authentication Error',
-      errorBody?.message || 'An error occurred during authentication.',
-      errorBody?.reason || JSON.stringify(errorBody, null, 2),
+      (typeof errorBody?.message === 'string' && errorBody.message) || 'An error occurred during authentication.',
+      typeof errorBody?.reason === 'string' ? errorBody.reason : undefined,
     ));
   } catch (err: any) {
     console.error('Error flow error:', err?.response?.data || err.message);

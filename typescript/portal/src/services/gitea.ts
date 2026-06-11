@@ -17,6 +17,16 @@
 
 import { isReservedUsername, isValidUsername } from './reserved-names';
 
+// Encode a repo-relative path for a Contents API URL: split on '/' and
+// encodeURIComponent each segment, preserving real separators while ensuring a
+// '?'/'#'/space inside a segment can't smuggle query params or otherwise alter
+// the request. Mirrors the encoding already applied to owner/repo/ref so the
+// helpers stay safe regardless of caller. (All current callers pass fixed or
+// validated paths; this closes the latent asymmetry.)
+function encodeRepoPath(path: string): string {
+  return path.split('/').map(encodeURIComponent).join('/');
+}
+
 const giteaUrl = (process.env.GITEA_URL || 'http://localhost:3001').replace(/\/+$/, '');
 const giteaAdminUser = process.env.GITEA_ADMIN_USER || 'cvportal';
 const giteaAdminToken = process.env.GITEA_ADMIN_TOKEN || '';
@@ -600,7 +610,7 @@ export async function listRepoFiles(opts: {
   const ref = opts.ref || 'main';
   try {
     const res = await call<Array<{ name: string; path: string; sha: string; type: string }>>(
-      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${opts.dir}?ref=${encodeURIComponent(ref)}`
+      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${encodeRepoPath(opts.dir)}?ref=${encodeURIComponent(ref)}`
     );
     return Array.isArray(res) ? res.filter((e) => e.type === 'file') : [];
   } catch (err) {
@@ -618,7 +628,7 @@ export async function upsertRepoFile(opts: {
   if (!giteaEnabled()) return;
   const method = opts.sha ? 'PUT' : 'POST';
   await call(
-    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${opts.path}`,
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${encodeRepoPath(opts.path)}`,
     {
       method,
       body: JSON.stringify({
@@ -640,7 +650,7 @@ export async function deleteRepoFile(opts: {
 }): Promise<void> {
   if (!giteaEnabled()) return;
   await call(
-    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${opts.path}`,
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${encodeRepoPath(opts.path)}`,
     {
       method: 'DELETE',
       body: JSON.stringify({
@@ -726,7 +736,7 @@ export async function getFile(opts: {
   const ref = opts.ref || 'main';
   try {
     const res = await call<{ content: string; encoding: string; sha: string }>(
-      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${opts.path}?ref=${encodeURIComponent(ref)}`
+      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/contents/${encodeRepoPath(opts.path)}?ref=${encodeURIComponent(ref)}`
     );
     const content = res.encoding === 'base64'
       ? Buffer.from(res.content, 'base64').toString('utf8')

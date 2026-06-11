@@ -73,18 +73,40 @@ function deriveBotUsername(human: Identity): string | null {
   return null;
 }
 
-// Look up an existing identity by email. Kratos has no direct email lookup,
-// so we list identities and filter. Cheap enough at this scale.
+// Parse the next-page cursor out of Kratos's RFC 5988 `Link` header
+// (`<…?page_token=…>; rel="next"`). Absent on the last page → undefined.
+function nextIdentitiesPageToken(linkHeader: unknown): string | undefined {
+  if (typeof linkHeader !== 'string' || !linkHeader) return undefined;
+  for (const part of linkHeader.split(',')) {
+    const m = part.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
+    if (!m) continue;
+    try {
+      const tok = new URL(m[1], 'http://x').searchParams.get('page_token');
+      if (tok) return tok;
+    } catch { /* malformed Link entry — skip */ }
+  }
+  return undefined;
+}
+
+// Look up an existing identity by email. Kratos has no direct email lookup, so
+// we page through identities and filter. Follow the cursor to completion so a
+// match beyond the first page — e.g. a squatter on `<victim>.bot@…` sorted past
+// the first 250 identities — is still found (the bot-ownership backstop in
+// ensureBotForHuman relies on this pre-check seeing the collision).
 async function findIdentityByEmail(email: string): Promise<Identity | null> {
-  // listIdentities returns 250 max per page; for now we just pull the first
-  // page since we have < 100 users. Paginate if this grows.
-  const { data } = await identityApi.listIdentities({ pageSize: 250 });
-  return (
-    data.find(
-      (i) =>
-        ((i.traits as any) ?? {}).email?.toLowerCase() === email.toLowerCase(),
-    ) ?? null
-  );
+  const target = email.toLowerCase();
+  let pageToken: string | undefined;
+  for (let page = 0; page < 1000; page++) {
+    const resp = await identityApi.listIdentities({ pageSize: 250, pageToken });
+    const hit = resp.data.find(
+      (i) => ((i.traits as any) ?? {}).email?.toLowerCase() === target,
+    );
+    if (hit) return hit;
+    const next = nextIdentitiesPageToken((resp.headers as Record<string, unknown> | undefined)?.link);
+    if (!next) break;
+    pageToken = next;
+  }
+  return null;
 }
 
 // Idempotently provision a `<username>.bot` companion identity for a human.

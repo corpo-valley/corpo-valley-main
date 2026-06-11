@@ -1,4 +1,4 @@
-import { Tier, TIERS, highestTier } from './tiers';
+import { Tier, TIERS, highestTier, hasAccess } from './tiers';
 
 const ketoReadUrl = process.env.KETO_READ_URL || 'http://localhost:4466';
 const ketoWriteUrl = process.env.KETO_WRITE_URL || 'http://localhost:4467';
@@ -72,13 +72,27 @@ export async function removeUserFromAllTiers(userId: string): Promise<void> {
 }
 
 export async function setUserTier(userId: string, tier: Tier): Promise<void> {
-  await removeUserFromAllTiers(userId);
+  // Add the target tier FIRST, then strip the others. The reverse order
+  // (remove-all then add) leaves the user in NO tier if the process dies or the
+  // add fails between the two calls — silently dropping ADMIN or the EVERYONE
+  // base grant (getUserTier then defaults to EVERYONE). Add-before-remove fails
+  // safe: a crash mid-change leaves the user with at most an extra tier, never
+  // de-privileged below the target.
   await createRelation({
     namespace: 'groups',
     object: tier,
     relation: 'members',
     subject_id: userId,
   });
+  for (const t of TIERS) {
+    if (t === tier) continue;
+    await deleteRelation({
+      namespace: 'groups',
+      object: t,
+      relation: 'members',
+      subject_id: userId,
+    });
+  }
 }
 
 // Grant the EVERYONE base tier without first wiping the user's other tiers.
@@ -149,18 +163,19 @@ export async function listAllServices(): Promise<{ name: string; tier: Tier }[]>
   return services;
 }
 
-export async function checkAccess(userId: string, appName: string): Promise<boolean> {
-  const res = await fetch(`${ketoReadUrl}/relation-tuples/check`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      namespace: 'services',
-      object: appName,
-      relation: 'access',
-      subject_id: userId,
-    }),
-  });
-  if (!res.ok) return false;
-  const data = await res.json() as { allowed?: boolean };
-  return data.allowed === true;
+// Authoritative per-service access decision. Gates OAuth consent for
+// admin-registered service clients (see routes/hydra.ts): a service's required
+// tier is the `services/<app>/access -> groups:<tier>#members` tuple written by
+// setServiceTier. Tiers are HIERARCHICAL (ADMIN > ALPHA > BETA > EVERYONE), so
+// we compare the user's effective tier RANK against the service's required tier
+// rather than testing literal Keto group membership — a Keto subject_id check
+// would deny an ADMIN user a BETA-gated service because the user is only a
+// literal member of their own tier group plus EVERYONE, not of every lower
+// group. A service with no tier tuple is open to EVERYONE. Throws on a Keto
+// error so callers fail closed (no token issued) rather than guessing.
+export async function userCanAccessService(userId: string, appName: string): Promise<boolean> {
+  const required = await getServiceTier(appName);
+  if (!required) return true; // no tier configured → open to everyone
+  const userTier = await getUserTier(userId);
+  return hasAccess(userTier, required);
 }

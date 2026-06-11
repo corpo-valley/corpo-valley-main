@@ -154,17 +154,17 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
       res.status(409).json({ error: 'main branch not found' });
       return;
     }
-    // Accept either full or short sha (>=7 hex chars). Compare by prefix
-    // from the live head — head.sha is always full-length from Gitea.
-    if (sha) {
-      if (sha.length < 7 || !/^[a-f0-9]+$/i.test(sha) || !head.sha.startsWith(sha.toLowerCase())) {
-        res.status(409).json({
-          error: 'sha mismatch: not the head of main',
-          head_sha: head.sha,
-          provided_sha: sha,
-        });
-        return;
-      }
+    // Accept either full or short sha (>=7 hex chars). Compare by prefix from
+    // the live head — head.sha is always full-length from Gitea. `sha` is
+    // already validated as 7-40 hex above, so the only effective check here is
+    // the head-of-main prefix match.
+    if (!head.sha.startsWith(sha.toLowerCase())) {
+      res.status(409).json({
+        error: 'sha mismatch: not the head of main',
+        head_sha: head.sha,
+        provided_sha: sha,
+      });
+      return;
     }
 
     // Deploy gate: optionally require that the required scan/CI status check

@@ -55,8 +55,19 @@ export async function requireSession(
       emailVerified,
     };
     next();
-  } catch {
-    res.redirect(`${kratosBrowserUrl}/self-service/login/browser`);
+  } catch (err: any) {
+    // Distinguish "no/expired session" from "Kratos is down". A 401/403 is the
+    // expected unauthenticated case → bounce to login. A network error or 5xx
+    // means the identity service itself is unreachable: redirecting there would
+    // mask the outage as a logout (and can loop, since the login page can't load
+    // either). Fail visibly with a 503 instead.
+    const status = err?.response?.status;
+    if (status === 401 || status === 403) {
+      res.redirect(`${kratosBrowserUrl}/self-service/login/browser`);
+      return;
+    }
+    console.error('[session] Kratos toSession failed:', err?.message || err);
+    res.status(503).send('Authentication service temporarily unavailable. Please try again shortly.');
   }
 }
 
