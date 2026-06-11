@@ -140,7 +140,10 @@ jobs:
 
       - name: Version tag
         id: version
-        run: echo "tag=${{ needs.discover.outputs.ref_slug }}-$(date +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        # Stamp the sha of the CHECKED-OUT ref being built. On workflow_dispatch
+        # GITHUB_SHA is the sha of the dispatching ref (usually main), which
+        # would mislabel an image built from another branch.
+        run: echo "tag=${{ needs.discover.outputs.ref_slug }}-$(date +%Y%m%d)-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Image metadata
         id: meta
