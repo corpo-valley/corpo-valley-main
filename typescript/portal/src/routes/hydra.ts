@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { Configuration, OAuth2Api } from '@ory/client';
-import { renderError, renderInfo, renderConsentPage, renderLogoutConfirm } from '../templates';
+import { renderError, renderInfo, renderConsentPage, renderLogoutConfirm, renderFormRedirect } from '../templates';
 import { getIdentity } from '../services/kratos-admin';
 import { getProjectBySlug } from '../services/projects';
 import { userCanAccessService } from '../services/keto';
@@ -94,6 +94,21 @@ async function buildIdTokenClaims(subject: string): Promise<Record<string, any>>
   return claims;
 }
 
+// Finish a form POST with a same-origin page that navigates client-side.
+// Chromium enforces CSP `form-action` on the redirect chain of a form
+// submission, so a 302 from /consent/* or /logout/accept to the Hydra origin
+// (and onward to the OAuth client's arbitrary redirect_uri — localhost,
+// claude.ai, vscode://…) is silently cancelled and the page looks like the
+// button did nothing. redirect_to always comes from Hydra, but the scheme
+// check costs nothing.
+function sendFormRedirect(res: Response, url: string): void {
+  if (!/^https?:\/\//i.test(url)) {
+    res.status(500).send(renderError('Redirect Error', 'Unexpected redirect target.'));
+    return;
+  }
+  res.send(renderFormRedirect(url));
+}
+
 // Known first-party clients that can skip the consent screen. Gitea will use
 // this once it's onboarded as an OIDC client of Hydra.
 const TRUSTED_CLIENTS = new Set(
@@ -179,6 +194,8 @@ router.get('/consent', requireSession, async (req: Request, res: Response) => {
           session: { id_token: idTokenClaims },
         },
       });
+      // Plain GET navigation (no form submission), so a 302 is not subject to
+      // the form-action enforcement that sendFormRedirect works around.
       return res.redirect(completedRequest.redirect_to);
     }
 
@@ -228,7 +245,7 @@ router.post('/consent/accept', requireSession, validateCsrf, async (req: Request
       },
     });
 
-    return res.redirect(completedRequest.redirect_to);
+    return sendFormRedirect(res, completedRequest.redirect_to);
   } catch (err: any) {
     console.error('Consent accept error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Consent Error', 'Failed to accept consent.'));
@@ -255,7 +272,7 @@ router.post('/consent/deny', requireSession, validateCsrf, async (req: Request, 
       },
     });
 
-    return res.redirect(completedRequest.redirect_to);
+    return sendFormRedirect(res, completedRequest.redirect_to);
   } catch (err: any) {
     console.error('Consent deny error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Consent Error', 'Failed to deny consent.'));
@@ -320,7 +337,7 @@ router.post('/logout/accept', requireSession, validateCsrf, async (req: Request,
       return res.status(403).send(renderError('Logout Error', 'This logout request does not belong to your session.'));
     }
     const { data: completedRequest } = await hydra.acceptOAuth2LogoutRequest({ logoutChallenge });
-    return res.redirect(completedRequest.redirect_to);
+    return sendFormRedirect(res, completedRequest.redirect_to);
   } catch (err: any) {
     console.error('Hydra logout accept error:', err?.response?.data || err.message);
     return res.send(renderInfo('Logged Out', 'You have been logged out.'));
