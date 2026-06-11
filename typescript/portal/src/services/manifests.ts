@@ -13,8 +13,11 @@
 
 import { getFile, upsertRepoFile } from './gitea';
 import type { Capabilities } from './templates';
+import {
+  CV_REGISTRY, PORTAL_PUBLIC_URL, KRATOS_CLUSTER_URL, PROJECTS_DOMAIN,
+} from './platform-config';
 
-const REGISTRY = process.env.CV_REGISTRY || 'registry.cv-registry.svc.cluster.local:5000';
+const REGISTRY = CV_REGISTRY;
 // Placeholder tag before the first Build runs; the pin endpoint rewrites it.
 const BOOTSTRAP_TAG = 'bootstrap';
 
@@ -222,13 +225,13 @@ metadata:
   namespace: ${opts.slug}
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
-    nginx.ingress.kubernetes.io/auth-url: "http://ory-kratos-public.cv-ory.svc.cluster.local:4433/sessions/whoami"
-    nginx.ingress.kubernetes.io/auth-signin: "https://portal.corpo-valley.com/login"
+    nginx.ingress.kubernetes.io/auth-url: "${KRATOS_CLUSTER_URL}/sessions/whoami"
+    nginx.ingress.kubernetes.io/auth-signin: "${PORTAL_PUBLIC_URL}/login"
     nginx.ingress.kubernetes.io/auth-signin-redirect-param: "return_to"
 spec:
   ingressClassName: nginx
   rules:
-    - host: ${opts.slug}.projects.corpo-valley.com
+    - host: ${opts.slug}.${PROJECTS_DOMAIN}
       http:
         paths:
 ${paths.join('\n')}

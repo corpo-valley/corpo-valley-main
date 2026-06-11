@@ -1,0 +1,18 @@
+{
+  "name": "corpo-valley-project",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A Corpo Valley project. One Node app, composed of the capability modules you enabled (static-site, database, mcp).",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start:site": "node static-site/server.js",
+    "start:api": "node database/server.js",
+    "start:mcp": "node mcp/server.js"
+  },
+  "dependencies": {
+    "express": "5.1.0",
+    "pg": "8.13.1"
+  }
+}

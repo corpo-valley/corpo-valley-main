@@ -14,9 +14,13 @@ import { isTier, Tier } from '../services/tiers';
 import {
   renderAdminUsers, renderAdminUserDetail, renderAdminUserCreate,
   renderAdminRecoveryResult, renderAdminApps,
-  renderAdminRegisterForm, renderAdminRegisterResult, renderError,
+  renderAdminRegisterForm, renderAdminRegisterResult, renderAdminTemplate,
+  renderError,
   UserRow, AppRow,
 } from '../templates';
+import {
+  seedCommunityCenterTemplate, communityCenterTemplateStatus,
+} from '../services/template-seed';
 
 const router = Router();
 
@@ -328,6 +332,37 @@ router.post('/apps/:appId/delete', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Delete app error:');
     res.status(500).send(renderError('Error', 'Failed to delete service.'));
+  }
+});
+
+// ── Community Center template ──────────────────────────────
+//
+// The Gitea template repo is admin-owned after the first seed; this page
+// shows its state and offers the one destructive platform action on it:
+// resetting it back to the baseline baked into the portal image.
+
+router.get('/template', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const status = await communityCenterTemplateStatus();
+    res.send(renderAdminTemplate(status, null, session.email, csrfHiddenField(req, res)));
+  } catch (err: any) {
+    console.error('Admin template status error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load template status.'));
+  }
+});
+
+router.post('/template/reset', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const result = await seedCommunityCenterTemplate({ force: true });
+    console.log(`[template-seed] admin reset by ${session.email}: ${result.action}` +
+      (result.written !== undefined ? ` (${result.written} written, ${result.deleted} deleted)` : ''));
+    const status = await communityCenterTemplateStatus();
+    res.send(renderAdminTemplate(status, result, session.email, csrfHiddenField(req, res)));
+  } catch (err: any) {
+    console.error('Admin template reset error:', err?.message);
+    res.status(500).send(renderError('Error', 'Template reset failed — see portal logs.'));
   }
 });
 

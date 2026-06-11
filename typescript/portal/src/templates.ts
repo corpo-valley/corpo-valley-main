@@ -635,6 +635,7 @@ function dashboardLayout(
       <div class="nav-section">Admin</div>
       <a href="/admin/users"${activeNav === 'users' ? ' class="active"' : ''}>Users</a>
       <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>Services</a>
+      <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
     `;
   }
 
@@ -1742,6 +1743,65 @@ export function renderAdminApps(
   body += '</tbody></table></div>';
 
   return dashboardLayout('Services', body, email, true, 'apps');
+}
+
+export interface TemplateStatusView {
+  giteaEnabled: boolean;
+  baselineOnDisk: boolean;
+  repo: string;
+  repoExists: boolean;
+  isTemplate: boolean;
+  fileCount: number;
+}
+
+export interface TemplateResetView {
+  action: string;
+  reason?: string;
+  written?: number;
+  deleted?: number;
+}
+
+export function renderAdminTemplate(
+  status: TemplateStatusView,
+  result: TemplateResetView | null,
+  email: string,
+  csrf: string = ''
+): string {
+  const yes = '✓';
+  const no = '✗';
+  let body = '';
+
+  if (result) {
+    const summary = result.action === 'reset' || result.action === 'seeded'
+      ? `${escapeHtml(result.action)} — ${result.written ?? 0} file(s) written, ${result.deleted ?? 0} deleted`
+      : `${escapeHtml(result.action)}${result.reason ? ` — ${escapeHtml(result.reason)}` : ''}`;
+    body += `<div style="margin-bottom:1rem; padding:0.75rem 1rem; border:1px solid #4a90d9; border-radius:4px; background:rgba(74,144,217,0.1);">Reset result: ${summary}</div>`;
+  }
+
+  body += `<p>New projects are generated from the <code>${escapeHtml(status.repo)}</code>
+    repo in Gitea. Platform admins own its contents: edit it in Gitea to change what
+    new projects start with. Resetting overwrites it with this portal build's baseline —
+    admin additions are <strong>deleted</strong>.</p>`;
+
+  body += `<div class="table-wrap"><table class="table">
+    <tbody>
+      <tr><th>Gitea integration</th><td>${status.giteaEnabled ? yes : no}</td></tr>
+      <tr><th>Baseline in portal image</th><td>${status.baselineOnDisk ? yes : no}</td></tr>
+      <tr><th>Template repo exists</th><td>${status.repoExists ? yes : no}</td></tr>
+      <tr><th>Marked as template</th><td>${status.isTemplate ? yes : no}</td></tr>
+      <tr><th>Files in template</th><td>${status.fileCount}</td></tr>
+    </tbody></table></div>`;
+
+  if (status.giteaEnabled && status.baselineOnDisk) {
+    body += `
+    <form method="POST" action="/admin/template/reset" style="margin-top:1rem;"
+          data-confirm="Reset ${escapeHtml(status.repo)} to the baseline? Admin edits and additions will be lost.">
+      ${csrf}
+      <button type="submit" class="btn btn-danger">Reset template to baseline</button>
+    </form>`;
+  }
+
+  return dashboardLayout('Project Template', body, email, true, 'template');
 }
 
 export function renderAdminRegisterForm(email: string, csrf: string = ''): string {
