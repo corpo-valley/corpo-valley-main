@@ -20,6 +20,9 @@ on:
       - 'containers/**'
       - 'static/**'
       - 'frontend/**'
+      # Baked into the portal image (the project-template baseline the portal
+      # seeds into Gitea) — template changes must rebuild portal.
+      - 'community-center/**'
   workflow_dispatch:
     inputs:
       app_name:
@@ -69,6 +72,11 @@ jobs:
             APPS=$(echo "$CHANGED_FILES" | grep -E '^(typescript|python|containers|static|frontend)/' | \
               sed -E 's#^(typescript|python|containers|static|frontend)/([^/]+).*#\2#' | \
               sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            # community-center/ isn't an app dir, but it's baked into the
+            # portal image — a template change must rebuild portal.
+            if echo "$CHANGED_FILES" | grep -q '^community-center/'; then
+              APPS=$(echo "$APPS" | jq -c '. + ["portal"] | unique')
+            fi
             if [ "$APPS" = "[]" ] || [ -z "$APPS" ]; then
               echo "has_changes=false" >> "$GITHUB_OUTPUT"
               echo "apps=[]" >> "$GITHUB_OUTPUT"

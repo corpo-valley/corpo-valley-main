@@ -1,6 +1,8 @@
 # TypeScript/Node.js Application Dockerfile
 # Built for: portal (Corpo Valley self-service portal)
-# Build context: typescript/portal/
+# Build context: repo root (containers/portal/context.txt) — the image carries
+# both typescript/portal/ and community-center/, the project-template baseline
+# the portal seeds into Gitea on first startup (services/template-seed.ts).
 #
 # Multi-stage: a full node:slim builder compiles TypeScript, then a distroless
 # runtime carries only the production node_modules + dist. The runtime image has
@@ -21,11 +23,11 @@ RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi
 # Copy package files first for better caching. npm ci needs the lockfile.
 # --ignore-scripts blocks dependency lifecycle scripts (a common supply-chain
 # execution vector); this project's deps are pure-JS and need none.
-COPY package*.json ./
+COPY typescript/portal/package*.json ./
 RUN npm ci --ignore-scripts
 
 # Compile TypeScript -> dist/, then drop devDependencies for the runtime copy.
-COPY . .
+COPY typescript/portal/ ./
 RUN npm run build
 RUN npm prune --omit=dev
 
@@ -40,6 +42,12 @@ ENV PORT=3000
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/package.json ./package.json
+
+# The Community Center baseline: the factory-default project template the
+# portal seeds into Gitea (and resets to on /admin/template/reset). Lives at
+# /app/community-center — dist/services/template-seed.js resolves it two
+# levels up from itself.
+COPY community-center/ ./community-center/
 
 EXPOSE 3000
 

@@ -1,0 +1,75 @@
+# Corpo Valley — pre-baked container build + manifest pin.
+#
+# Every push to `main` produces an immutable image tag YYYYMMDDHHMMSS
+# (the build timestamp). The workflow pushes that tag plus the short
+# commit SHA to the in-cluster registry, then calls the Corpo Valley
+# portal (its in-cluster URL) to pin k8s/deployment.yaml to the new
+# timestamp. The portal performs the git commit as the platform user,
+# so the workflow doesn't need any push credentials or repo write
+# access.
+#
+# The env values below are deployment-specific; the portal renders them
+# from placeholders when it seeds the template into Gitea.
+#
+# You shouldn't need to edit this — it's the platform's standard
+# pipeline.
+name: Build
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: {{CV_REGISTRY}}
+  PORTAL_PIN_URL: {{CV_PORTAL_PIN_URL}}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Skip the platform's image-pin bump (which carries `[skip ci]`).
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute tag
+        id: tag
+        run: |
+          TAG=$(date -u +%Y%m%d%H%M%S)
+          SHA=$(git rev-parse --short HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+          IMAGE="$REGISTRY/${{ github.repository }}"
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"           >> "$GITHUB_OUTPUT"
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE"       >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        run: |
+          IMAGE="${{ steps.tag.outputs.image }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          SHA="${{ steps.tag.outputs.sha }}"
+          docker build -t "$IMAGE:$TAG" -t "$IMAGE:$SHA" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:$SHA"
+          echo "Pushed $IMAGE:$TAG and $IMAGE:$SHA"
+
+      - name: Ask portal to pin the Deployment
+        # The portal writes the bump commit as the platform user, so the
+        # workflow itself doesn't need git push credentials. CV_PIN_TOKEN
+        # is a per-project secret minted by the platform at project
+        # create time; it authenticates this specific project's workflow
+        # to the portal's pin endpoint (which would otherwise be
+        # cross-project-reachable from any runner). The portal also
+        # cross-checks the supplied SHA against the current head of
+        # main, refusing if they don't match.
+        env:
+          CV_PIN_TOKEN: ${{ secrets.CV_PIN_TOKEN }}
+        run: |
+          SLUG="${{ github.event.repository.name }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          SHA="${{ steps.tag.outputs.full_sha }}"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $CV_PIN_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"tag\":\"$TAG\",\"sha\":\"$SHA\"}" \
+            "$PORTAL_PIN_URL/$SLUG/pin"

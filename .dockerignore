@@ -1,0 +1,10 @@
+# Applies to images built from the repo root (containers/<app>/context.txt
+# containing "."). Currently: portal, which needs typescript/portal/ plus the
+# community-center/ template baseline it bakes in and seeds into Gitea.
+.git
+.github
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+**/*.log

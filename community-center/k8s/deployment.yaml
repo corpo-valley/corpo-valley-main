@@ -1,0 +1,164 @@
+# Templated + generated: {{OWNER}}, {{REPO}}, {{SLUG}} are substituted by the
+# Corpo Valley portal. The portal REGENERATES this file from your enabled
+# capabilities — one container per capability, all from the same image. Don't
+# hand-edit the container list; toggle capabilities in the portal (or via the
+# `set_capabilities` MCP tool) and the platform rewrites this file.
+#
+# The image tag is immutable: every push to `main` runs the Build workflow,
+# which timestamps a new tag (YYYYMMDDHHMMSS), pushes one image to the
+# in-cluster registry, and asks the portal to pin every container below to
+# that tag. `bootstrap` is the placeholder before the first build runs.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{SLUG}}
+  namespace: {{SLUG}}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{SLUG}}
+  template:
+    metadata:
+      labels:
+        app: {{SLUG}}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: static-site
+          image: {{CV_REGISTRY}}/{{OWNER}}/{{REPO}}:bootstrap
+          imagePullPolicy: IfNotPresent
+          command: ["node", "static-site/server.js"]
+          ports:
+            - name: http-site
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+              subPath: static-site
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-site
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-site
+            initialDelaySeconds: 15
+            periodSeconds: 30
+        - name: database
+          image: {{CV_REGISTRY}}/{{OWNER}}/{{REPO}}:bootstrap
+          imagePullPolicy: IfNotPresent
+          command: ["node", "database/server.js"]
+          ports:
+            - name: http-api
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            # Per-user isolation by default. The portal sets this to "true"
+            # when the project's "data is shared across users" box is ticked.
+            - name: CV_SHARED
+              value: "false"
+            # Only DATABASE_URL is projected — keeps POSTGRES_PASSWORD out of
+            # every child process's environ and crash dumps.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+              subPath: database
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-api
+            initialDelaySeconds: 15
+            periodSeconds: 30
+        - name: mcp
+          image: {{CV_REGISTRY}}/{{OWNER}}/{{REPO}}:bootstrap
+          imagePullPolicy: IfNotPresent
+          command: ["node", "mcp/server.js"]
+          ports:
+            - name: http-mcp
+              containerPort: 9000
+          env:
+            - name: PORT
+              value: "9000"
+            - name: CV_SHARED
+              value: "false"
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+              subPath: mcp
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-mcp
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-mcp
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: tmp
+          emptyDir: {}

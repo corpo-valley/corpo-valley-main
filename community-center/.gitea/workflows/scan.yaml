@@ -1,0 +1,66 @@
+# Corpo Valley — pre-baked security scans.
+# Semgrep (static analysis) and osv-scanner (dependency vulns) run on every
+# pull request to `main` and on every push to `main`. Findings fail the job;
+# branch protection (set by the portal on project creation) prevents PRs from
+# merging until both checks pass.
+#
+# Tools are installed natively in the runner image rather than via `docker run`
+# because the dind sidecar can't see the act_runner's workspace mount, so bind
+# mounts like `-v "$PWD:/src"` resolve to an empty path. pip / curl from the
+# runner-images container Just Works.
+#
+# You shouldn't need to edit this — it's the platform's standard pipeline.
+name: Scan
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    # The Build workflow commits image-pin bumps with [skip ci]; those
+    # only touch k8s/ which semgrep already excludes — no point re-running.
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install semgrep
+        # --user lands the entry point in ~/.local/bin; we put that on PATH
+        # for the next step because semgrep's `osemgrep` shells out to a
+        # sibling `pysemgrep` binary that has to be PATH-resolvable.
+        run: |
+          pip install --quiet --user semgrep
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Static analysis
+        # `--config=auto` picks rulesets based on detected languages; it
+        # scales as you add real code. `--error` exits non-zero on findings.
+        # Platform-managed dirs (k8s/, .gitea/) are excluded — the platform
+        # owns those manifests; scanning them just noises up the user's
+        # first push.
+        run: semgrep --config=auto --error --quiet --exclude k8s --exclude .gitea
+
+  osv-scanner:
+    runs-on: ubuntu-latest
+    env:
+      OSV_VERSION: 1.9.2
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install osv-scanner
+        # Retries because the runner has hit transient github.com timeouts.
+        run: |
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o /tmp/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+          chmod +x /tmp/osv-scanner
+
+      - name: Dependency vulns
+        # osv-scanner reads any package manifests it finds (package.json,
+        # requirements.txt, go.mod, etc.) and queries OSV.dev. Exits non-zero
+        # if any vuln is reported. -r walks subdirectories.
+        run: /tmp/osv-scanner -r .

@@ -220,6 +220,106 @@ export async function generateFromTemplate(opts: {
   }
 }
 
+// ── Template-repo provisioning (template-seed.ts) ────────────────────────
+
+// Fetch a repo's metadata, or null if it doesn't exist.
+export async function getRepo(opts: {
+  owner: string; repo: string;
+}): Promise<{ full_name: string; template: boolean; default_branch: string } | null> {
+  if (!giteaEnabled()) return null;
+  try {
+    return await call<{ full_name: string; template: boolean; default_branch: string }>(
+      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}`
+    );
+  } catch (err) {
+    if (err instanceof GiteaApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// Idempotently ensure an organization exists. Created orgs are public so
+// tenants can browse the platform's template repo (AGENTS.md points them at
+// it); the org is owned by the cvportal admin account.
+export async function ensureOrg(org: string): Promise<void> {
+  if (!giteaEnabled()) return;
+  try {
+    await call(`/orgs/${encodeURIComponent(org)}`);
+    return;
+  } catch (err) {
+    if (!(err instanceof GiteaApiError && err.status === 404)) throw err;
+  }
+  try {
+    await call('/orgs', {
+      method: 'POST',
+      body: JSON.stringify({ username: org, visibility: 'public' }),
+    });
+  } catch (err) {
+    if (err instanceof GiteaApiError && (err.status === 409 || alreadyExists(err))) return;
+    throw err;
+  }
+}
+
+// Create a public template repo under an org. auto_init gives it a `main`
+// branch immediately so the Contents API can sync files without special
+// empty-repo handling. Idempotent: 409 / already-exists is success.
+export async function createOrgRepo(opts: {
+  org: string; name: string; description?: string;
+}): Promise<void> {
+  if (!giteaEnabled()) return;
+  try {
+    await call(`/orgs/${encodeURIComponent(opts.org)}/repos`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: opts.name,
+        private: false,
+        auto_init: true,
+        default_branch: 'main',
+        template: true,
+        description: opts.description ?? '',
+      }),
+    });
+  } catch (err) {
+    if (err instanceof GiteaApiError && (err.status === 409 || alreadyExists(err))) return;
+    throw err;
+  }
+}
+
+// Ensure a repo carries the template flag (generate-from-template refuses
+// non-template sources). Idempotent PATCH.
+export async function setRepoTemplate(opts: { owner: string; repo: string }): Promise<void> {
+  if (!giteaEnabled()) return;
+  await call(
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}`,
+    { method: 'PATCH', body: JSON.stringify({ template: true }) }
+  );
+}
+
+// All blobs in a repo at `ref` (default `main`), recursively. Returns [] for
+// a missing ref / empty repo. Pages through Gitea's 1000-entry tree limit.
+export async function getTreeFiles(opts: {
+  owner: string; repo: string; ref?: string;
+}): Promise<Array<{ path: string; sha: string }>> {
+  if (!giteaEnabled()) return [];
+  const ref = opts.ref || 'main';
+  const out: Array<{ path: string; sha: string }> = [];
+  for (let page = 1; page <= 10; page++) {
+    let res: { tree?: Array<{ path: string; sha: string; type: string }>; truncated?: boolean };
+    try {
+      res = await call(
+        `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/git/trees/${encodeURIComponent(ref)}?recursive=true&page=${page}`
+      );
+    } catch (err) {
+      if (err instanceof GiteaApiError && err.status === 404) return out;
+      throw err;
+    }
+    for (const e of res.tree || []) {
+      if (e.type === 'blob') out.push({ path: e.path, sha: e.sha });
+    }
+    if (!res.truncated) break;
+  }
+  return out;
+}
+
 // Fetch the head commit of a branch. Returns null if the branch doesn't
 // exist (404). Used as the lookup step for `getCommitStatus(branch)`.
 export async function getBranchHead(opts: {

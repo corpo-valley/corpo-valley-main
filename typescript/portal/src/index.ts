@@ -11,6 +11,7 @@ import docsRouter from './routes/docs';
 import { validateCsrf } from './middleware/csrf';
 import { migrate } from './services/projects';
 import { backfillPinTokens } from './services/pin-token-backfill';
+import { seedCommunityCenterTemplate } from './services/template-seed';
 import { runWithNonce } from './lib/csp-nonce';
 import * as crypto from 'crypto';
 
@@ -146,6 +147,19 @@ async function start() {
     await backfillPinTokens();
   } catch (err: any) {
     console.error('Pin-token backfill failed:', err?.message);
+  }
+
+  // Seed the Community Center template repo in Gitea from the baked-in
+  // baseline — only when the repo is missing or empty. Once seeded, Gitea is
+  // the source of truth and admins own the template; this never overwrites
+  // their edits (an explicit /admin/template/reset does that). Best-effort:
+  // a Gitea hiccup here must not block the portal from serving traffic.
+  try {
+    const seeded = await seedCommunityCenterTemplate();
+    console.log(`[template-seed] ${seeded.action}${seeded.reason ? `: ${seeded.reason}` : ''}` +
+      (seeded.written !== undefined ? ` (${seeded.written} written, ${seeded.deleted} deleted)` : ''));
+  } catch (err: any) {
+    console.error('Community Center template seed failed:', err?.message);
   }
 
   app.listen(port, '0.0.0.0', () => {

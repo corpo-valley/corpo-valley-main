@@ -10,92 +10,21 @@
 //      projects' next push 401s at the pin endpoint and the Deployment
 //      never advances.
 //
-// Step 3's canonical content lives below as a string constant — it's a
-// verbatim copy of community-center/.gitea/workflows/build.yaml. Keep
-// the two in sync when you change either.
+// Step 3's content comes from the baked-in community-center baseline
+// (rendered with this deployment's registry/portal URLs by
+// template-seed.ts) — the same canonical source the template seed
+// pushes to Gitea, so the two can't drift.
 
 import { Pool } from 'pg';
 import { setActionsSecret, upsertRepoFile, getFile } from './gitea';
 import { generatePinToken, hashPinToken } from './pin-token';
 import { resolveDatabaseUrl } from './projects';
+import { renderedBaselineFile } from './template-seed';
 
 // Fail closed in production if DATABASE_URL is unset rather than using the
 // built-in portal:portal default — see resolveDatabaseUrl in projects.ts.
 const pool = new Pool({ connectionString: resolveDatabaseUrl() });
 
-const CANONICAL_BUILD_WORKFLOW = `# Corpo Valley — pre-baked container build + manifest pin.
-#
-# Every push to \`main\` produces an immutable image tag YYYYMMDDHHMMSS
-# (the build timestamp). The workflow pushes that tag plus the short
-# commit SHA to the in-cluster registry, then calls the Corpo Valley
-# portal (in-cluster URL: portal.cv-portal.svc.cluster.local) to pin
-# k8s/deployment.yaml to the new timestamp. The portal performs the
-# git commit as the platform user, so the workflow doesn't need any
-# push credentials or repo write access.
-#
-# You shouldn't need to edit this — it's the platform's standard
-# pipeline.
-name: Build
-on:
-  push:
-    branches: [main]
-
-env:
-  REGISTRY: registry.cv-registry.svc.cluster.local:5000
-  PORTAL_PIN_URL: http://portal.cv-portal.svc.cluster.local/internal/projects
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    # Skip the platform's image-pin bump (which carries \`[skip ci]\`).
-    if: \${{ !contains(github.event.head_commit.message, '[skip ci]') }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Compute tag
-        id: tag
-        run: |
-          TAG=$(date -u +%Y%m%d%H%M%S)
-          SHA=$(git rev-parse --short HEAD)
-          FULL_SHA=$(git rev-parse HEAD)
-          IMAGE="$REGISTRY/\${{ github.repository }}"
-          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA"           >> "$GITHUB_OUTPUT"
-          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
-          echo "image=$IMAGE"       >> "$GITHUB_OUTPUT"
-
-      - name: Build and push image
-        run: |
-          IMAGE="\${{ steps.tag.outputs.image }}"
-          TAG="\${{ steps.tag.outputs.tag }}"
-          SHA="\${{ steps.tag.outputs.sha }}"
-          docker build -t "$IMAGE:$TAG" -t "$IMAGE:$SHA" .
-          docker push "$IMAGE:$TAG"
-          docker push "$IMAGE:$SHA"
-          echo "Pushed $IMAGE:$TAG and $IMAGE:$SHA"
-
-      - name: Ask portal to pin the Deployment
-        # The portal writes the bump commit as the platform user, so the
-        # workflow itself doesn't need git push credentials. CV_PIN_TOKEN
-        # is a per-project secret minted by the platform at project
-        # create time; it authenticates this specific project's workflow
-        # to the portal's pin endpoint (which would otherwise be
-        # cross-project-reachable from any runner). The portal also
-        # cross-checks the supplied SHA against the current head of
-        # main, refusing if they don't match.
-        env:
-          CV_PIN_TOKEN: \${{ secrets.CV_PIN_TOKEN }}
-        run: |
-          SLUG="\${{ github.event.repository.name }}"
-          TAG="\${{ steps.tag.outputs.tag }}"
-          SHA="\${{ steps.tag.outputs.full_sha }}"
-          curl -fsS -X POST \\
-            -H "Authorization: Bearer $CV_PIN_TOKEN" \\
-            -H 'Content-Type: application/json' \\
-            -d "{\\"tag\\":\\"$TAG\\",\\"sha\\":\\"$SHA\\"}" \\
-            "$PORTAL_PIN_URL/$SLUG/pin"
-`;
 
 export async function backfillPinTokens(): Promise<void> {
   const { rows } = await pool.query<{
@@ -123,13 +52,18 @@ export async function backfillPinTokens(): Promise<void> {
       if (existing && existing.content.includes('CV_PIN_TOKEN')) {
         console.log(`[pin-token] ${row.slug}: workflow already references CV_PIN_TOKEN, skipping file write`);
       } else {
-        await upsertRepoFile({
-          owner, repo,
-          path: '.gitea/workflows/build.yaml',
-          content: CANONICAL_BUILD_WORKFLOW,
-          sha: existing?.sha,
-          message: 'platform: enable CV_PIN_TOKEN auth on pin endpoint',
-        });
+        const workflow = renderedBaselineFile('.gitea/workflows/build.yaml');
+        if (!workflow) {
+          console.error(`[pin-token] ${row.slug}: baseline build.yaml not found on disk — token set, workflow NOT refreshed`);
+        } else {
+          await upsertRepoFile({
+            owner, repo,
+            path: '.gitea/workflows/build.yaml',
+            content: workflow,
+            sha: existing?.sha,
+            message: 'platform: enable CV_PIN_TOKEN auth on pin endpoint',
+          });
+        }
       }
       console.log(`[pin-token] backfilled ${row.slug}`);
     } catch (err: any) {
