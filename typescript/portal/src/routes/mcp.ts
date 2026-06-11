@@ -98,6 +98,101 @@ async function serveAuthServerMetadata(_req: Request, res: Response) {
 router.get('/.well-known/oauth-authorization-server', serveAuthServerMetadata);
 router.get('/.well-known/openid-configuration', serveAuthServerMetadata);
 
+// ── Dynamic Client Registration proxy (RFC 7591/7592) ─────────────────────────
+// The chart's `portal-oauth-dcr-shim` Ingress routes the oauth host's
+// /oauth2/register* to the portal (path overrides beat the Hydra catch-all),
+// the same way it already routes the two discovery docs above. So the
+// `registration_endpoint` we advertise — `${HYDRA_PUBLIC_URL}/oauth2/register`
+// — lands here, not on raw Hydra.
+//
+// Why: Hydra (≤ v2.3) serializes ABSENT optional client metadata in DCR
+// responses as `""`/`null` (`client_uri: ""`, `contacts: null`, …). RFC 7591
+// says optional fields should simply be omitted, and strict MCP clients
+// (Claude Code / the MCP TypeScript SDK's Zod schema) hard-fail on those
+// values — local `claude mcp add` dies with "client_uri — Invalid URL" while
+// lenient clients (claude.ai web) succeed. Hydra has no setting to suppress
+// the fields, so we forward to Hydra and strip top-level `""`/`null` members
+// from successful responses. `0`/`false` are kept (`client_secret_expires_at:
+// 0` means "never expires"). The /:id management routes (RFC 7592) get the
+// same treatment — Hydra's `registration_client_uri` points back at this same
+// public path, and its GET/PUT responses carry the same empty fields.
+
+const DCR_PROXY_TIMEOUT_MS = 10_000;
+
+function sanitizeDcrResponse(body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  return Object.fromEntries(Object.entries(body).filter(([, v]) => v !== '' && v !== null));
+}
+
+// DCR is driven by third-party MCP clients, some browser-based — same
+// cross-origin posture as the discovery docs above. Router-level so every
+// route on the subtree (including preflight) inherits it.
+router.use('/oauth2/register', (_req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, GET, PUT, DELETE, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  next();
+});
+
+async function proxyRegister(req: Request, res: Response): Promise<void> {
+  const id = req.params.id;
+  if (id !== undefined && !/^[A-Za-z0-9._~-]{1,128}$/.test(id)) {
+    res.status(400).json({ error: 'invalid_client_id' });
+    return;
+  }
+  const hasBody = req.method === 'POST' || req.method === 'PUT';
+  // RFC 7591/7592 require application/json requests. Reject other
+  // Content-Types instead of silently re-serializing whatever the global
+  // body parsers produced (express.urlencoded would turn a form POST into an
+  // object we'd forward as JSON — accepting requests raw Hydra rejects).
+  if (hasBody && !req.is('application/json')) {
+    res.status(400).json({ error: 'invalid_request', error_description: 'Content-Type must be application/json' });
+    return;
+  }
+  const url = `${HYDRA_PUBLIC_URL_INTERNAL}/oauth2/register${id ? `/${encodeURIComponent(id)}` : ''}`;
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  // RFC 7592 management auth (Bearer registration_access_token) — forwarded
+  // verbatim; Hydra is the one that validates it.
+  const auth = req.header('authorization');
+  if (auth) headers['Authorization'] = auth;
+  if (hasBody) headers['Content-Type'] = 'application/json';
+  try {
+    const upstream = await fetch(url, {
+      method: req.method,
+      headers,
+      body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+      signal: AbortSignal.timeout(DCR_PROXY_TIMEOUT_MS),
+    });
+    // Registration responses carry secrets (client_secret,
+    // registration_access_token) — never cacheable.
+    res.status(upstream.status).set('Cache-Control', 'no-store').set('Pragma', 'no-cache');
+    const text = await upstream.text();
+    if (!text) {
+      res.end(); // e.g. 204 from DELETE
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      res.type(upstream.headers.get('content-type') || 'application/json').send(text);
+      return;
+    }
+    // Error bodies pass through untouched so clients see Hydra's
+    // error/error_description verbatim.
+    res.json(upstream.ok ? sanitizeDcrResponse(parsed) : parsed);
+  } catch (err) {
+    console.error('[mcp] DCR proxy failed:', (err as Error)?.message);
+    res.status(502).json({ error: 'registration_unavailable' });
+  }
+}
+
+router.options(['/oauth2/register', '/oauth2/register/:id'], (_req, res) => res.status(204).end());
+router.post('/oauth2/register', proxyRegister);
+router.get('/oauth2/register/:id', proxyRegister);
+router.put('/oauth2/register/:id', proxyRegister);
+router.delete('/oauth2/register/:id', proxyRegister);
+
 // Bearer token extraction + introspection → McpContext or 401.
 async function authenticate(req: Request, res: Response): Promise<McpContext | null> {
   const auth = req.header('authorization') || '';

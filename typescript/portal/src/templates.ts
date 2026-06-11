@@ -537,6 +537,26 @@ export function renderError(title: string, error: string, details?: string): str
   return layout(title, body);
 }
 
+// Same-origin interstitial that finishes a form POST with a CLIENT-side
+// navigation instead of a 302. Chromium enforces CSP `form-action` on the
+// redirect chain of a form submission, so a /consent/accept or /logout/accept
+// 302 to the Hydra origin (and onward to an arbitrary OAuth client redirect_uri
+// — localhost, claude.ai, vscode://…) is silently cancelled and the page
+// appears to "do nothing". Meta-refresh and script navigations are not subject
+// to form-action, and the client redirect targets can't be allowlisted (DCR
+// clients register arbitrary redirect_uris), so this is the durable fix.
+export function renderFormRedirect(url: string): string {
+  const jsUrl = JSON.stringify(url).replace(/</g, '\\u003c');
+  const body = `
+    <meta http-equiv="refresh" content="0;url=${escapeHtml(url)}">
+    <h1>Redirecting&hellip;</h1>
+    <p style="color:#c4b698;margin-bottom:1rem;">Returning you to the application.</p>
+    <script nonce="${cspNonce()}">window.location.replace(${jsUrl});</script>
+    <div class="links"><a href="${escapeHtml(url)}">Continue</a></div>
+  `;
+  return layout('Redirecting', body);
+}
+
 export function renderConsentPage(
   clientName: string,
   scopes: string[],
