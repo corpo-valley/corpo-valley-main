@@ -18,7 +18,7 @@ router.get('/docs/mcp.txt', (_req: Request, res: Response) => {
 See https://portal.corpo-valley.com/docs/mcp for the full walkthrough.
 
 Quick start:
-  claude mcp add corpo-valley --transport http --url https://mcp.corpo-valley.com/mcp
+  claude mcp add --transport http corpo-valley https://mcp.corpo-valley.com/mcp
 
 OAuth is automatic on first use: your editor opens a browser to
 oauth.corpo-valley.com, you sign in, and tokens land back in the editor.

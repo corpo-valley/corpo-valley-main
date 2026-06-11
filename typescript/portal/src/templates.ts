@@ -1042,7 +1042,7 @@ claude`
   // ── Get Started card: two paths — the agent-driven MCP flow
   // (recommended) and the manual clone+claude path. Tabbed so a fresh
   // user picks one without paralysis.
-  const mcpAddCmd = `claude mcp add corpo-valley --transport http --url ${MCP_URL}`;
+  const mcpAddCmd = `claude mcp add --transport http corpo-valley ${MCP_URL}`;
   const mcpFirstPrompt = `Use Corpo Valley. Open the ${project.slug} project and add a homepage with our name and a sign-up form.`;
   const getStartedCard = project.giteaRepo ? `
     <div class="app-card" style="margin-top:1.25rem;">
@@ -1247,7 +1247,7 @@ const MCP_URL = (process.env.PUBLIC_MCP_URL || 'https://mcp.corpo-valley.com').r
 // metadata at MCP_URL/.well-known/oauth-protected-resource points the
 // editor at oauth.corpo-valley.com.
 function editorConfigSnippets(): string {
-  const claudeAdd = `claude mcp add corpo-valley --transport http --url ${MCP_URL}`;
+  const claudeAdd = `claude mcp add --transport http corpo-valley ${MCP_URL}`;
   const claudeJson = `{
   "mcpServers": {
     "corpo-valley": {
@@ -1417,7 +1417,7 @@ export function renderMcpDocs(): string {
 
       <h2 style="font-size:1.1rem;color:#fdf6e8;margin-top:1.5rem;">Claude Code</h2>
       <p class="help">From a terminal:</p>
-      <div class="snippet">claude mcp add corpo-valley --transport http --url ${MCP_URL}</div>
+      <div class="snippet">claude mcp add --transport http corpo-valley ${MCP_URL}</div>
       <p class="help" style="margin-top:0.5rem;">Or, in <code>~/.claude.json</code>:</p>
       <div class="snippet">{
   "mcpServers": {
