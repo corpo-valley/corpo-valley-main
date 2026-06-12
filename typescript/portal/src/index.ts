@@ -51,6 +51,12 @@ const HYDRA_BROWSER_ORIGIN = (() => {
   }
 })();
 
+// Google OIDC: the Kratos login/registration form POST 303s to
+// accounts.google.com; Chromium enforces form-action across the redirect
+// chain (same mechanism as HYDRA_BROWSER_ORIGIN above).
+const GOOGLE_FORM_ACTION_ORIGIN =
+  process.env.GOOGLE_LOGIN_ENABLED === 'true' ? 'https://accounts.google.com' : '';
+
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
@@ -88,10 +94,11 @@ app.use((req, res, next) => {
       "object-src 'none'",
       "base-uri 'self'",
       // 'self' for the portal's own POSTs (consent, logout, dashboard/admin),
-      // the Kratos origin for the auth-flow forms, and the Hydra origin for the
-      // login-form 303 that continues an OAuth login_challenge (see
-      // KRATOS_BROWSER_ORIGIN / HYDRA_BROWSER_ORIGIN above).
-      `form-action 'self'${[KRATOS_BROWSER_ORIGIN, HYDRA_BROWSER_ORIGIN].filter(Boolean).map((o) => ' ' + o).join('')}`,
+      // the Kratos origin for the auth-flow forms, the Hydra origin for the
+      // login-form 303 that continues an OAuth login_challenge, and (when Google
+      // login is on) accounts.google.com for the OIDC 303 (see
+      // KRATOS_BROWSER_ORIGIN / HYDRA_BROWSER_ORIGIN / GOOGLE_FORM_ACTION_ORIGIN above).
+      `form-action 'self'${[KRATOS_BROWSER_ORIGIN, HYDRA_BROWSER_ORIGIN, GOOGLE_FORM_ACTION_ORIGIN].filter(Boolean).map((o) => ' ' + o).join('')}`,
       "frame-ancestors 'none'",
     ].join('; '),
   );
