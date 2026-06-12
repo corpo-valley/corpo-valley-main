@@ -37,7 +37,7 @@ function requireInClusterCaller(req: Request, res: Response, next: NextFunction)
 }
 
 // NOTE: the Kratos after-registration web_hook used to live here. Provisioning a
-// new human's EVERYONE grant + `.bot` identity + Gitea accounts now happens
+// new human's `.bot` identity + Gitea accounts now happens
 // inside the portal itself — synchronously for admin-created users
 // (routes/admin.ts) and on first authenticated request for self-service
 // registrants (middleware/session.ts -> services/provisioning.ts). That removes

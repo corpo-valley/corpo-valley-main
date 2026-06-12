@@ -191,12 +191,10 @@ const CSS = `
   .btn-danger:hover { background: #6b3217; }
   .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
 
-  /* Tier badges */
+  /* Role badges */
   .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
-  .badge-EVERYONE { background: #4d6624; color: #c3e0a0; }
-  .badge-BETA { background: #6b5a2a; color: #e8d39a; }
-  .badge-ALPHA { background: #5a4a2a; color: #d8c48a; }
   .badge-ADMIN { background: #7f3d1d; color: #f3a5a5; }
+  .badge-USER { background: #4d6624; color: #c3e0a0; }
   .badge-access { background: #4a3c2c; color: #c4b698; }
 
   /* Tables */
@@ -612,8 +610,10 @@ export function renderInfo(title: string, message: string): string {
 
 // ── Dashboard Templates ────────────────────────────────────
 
-export function tierBadge(tier: string): string {
-  return `<span class="badge badge-${escapeHtml(tier)}">${escapeHtml(tier)}</span>`;
+export function roleBadge(isAdmin: boolean): string {
+  return isAdmin
+    ? '<span class="badge badge-ADMIN">Admin</span>'
+    : '<span class="badge badge-USER">User</span>';
 }
 
 interface NavItem { label: string; href: string; key: string; }
@@ -728,11 +728,10 @@ function accessBadge(value: string): string {
 export function renderProjects(
   email: string,
   projects: ProjectRow[],
-  userTier: string,
   isAdmin: boolean
 ): string {
   let body = `
-    <p class="tagline">Your patch of the valley — every app starts as a project. Your tier: ${tierBadge(userTier)}</p>
+    <p class="tagline">Your patch of the valley — every app starts as a project.${isAdmin ? ` ${roleBadge(true)}` : ''}</p>
     <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.25rem;">
       <a href="/projects/new" class="btn btn-primary">Plant a new project</a>
       <a href="/connect" class="btn btn-secondary">Connect Claude Code</a>
@@ -1522,7 +1521,7 @@ export interface UserRow {
   lastName: string;
   name: string;
   state: string;
-  tier: string;
+  isAdmin: boolean;
 }
 
 export function renderAdminUsers(
@@ -1534,7 +1533,7 @@ export function renderAdminUsers(
   let body = `<p style="margin-bottom:1rem;"><a href="/admin/users/new" class="btn btn-primary">Create User</a></p>`;
 
   body += `<div class="table-wrap"><table class="table">
-    <thead><tr><th>Email</th><th>Username</th><th>Name</th><th>State</th><th>Tier</th><th></th></tr></thead>
+    <thead><tr><th>Email</th><th>Username</th><th>Name</th><th>State</th><th>Role</th><th></th></tr></thead>
     <tbody>`;
   for (const u of users) {
     body += `<tr>
@@ -1542,7 +1541,7 @@ export function renderAdminUsers(
       <td>${u.preferredUsername ? `<code>${escapeHtml(u.preferredUsername)}</code>` : '<span style="color:#8a7a5a">—</span>'}</td>
       <td>${escapeHtml(u.name)}</td>
       <td>${escapeHtml(u.state)}</td>
-      <td>${tierBadge(u.tier)}</td>
+      <td>${roleBadge(u.isAdmin)}</td>
       <td><a href="/admin/users/${escapeHtml(u.id)}" class="btn btn-secondary btn-sm">Edit</a></td>
     </tr>`;
   }
@@ -1567,17 +1566,12 @@ export function renderAdminUserDetail(
   email: string,
   csrf: string = ''
 ): string {
-  const tiers = ['EVERYONE', 'BETA', 'ALPHA', 'ADMIN'];
-  const tierOptions = tiers.map(t =>
-    `<option value="${t}"${t === user.tier ? ' selected' : ''}>${t}</option>`
-  ).join('');
-
   const body = `
     <p style="margin-bottom:1rem;"><a href="/admin/users" class="btn btn-secondary btn-sm">Back to Users</a></p>
     <table class="table">
       <tr><th>State</th><td>${escapeHtml(user.state)}</td></tr>
       <tr><th>ID</th><td><code>${escapeHtml(user.id)}</code></td></tr>
-      <tr><th>Tier</th><td>${tierBadge(user.tier)}</td></tr>
+      <tr><th>Role</th><td>${roleBadge(user.isAdmin)}</td></tr>
     </table>
 
     <h3 style="margin-top:1.5rem;">Profile</h3>
@@ -1606,16 +1600,15 @@ export function renderAdminUserDetail(
       <button type="submit" class="btn btn-primary">Save Profile</button>
     </form>
 
-    <h3 style="margin-top:1.5rem;">Tier</h3>
-    <form method="POST" action="/admin/users/${escapeHtml(user.id)}/tier">
+    <h3 style="margin-top:1.5rem;">Role</h3>
+    <p class="help">Admins can manage users, services, and the project template. Everyone else is a regular user.</p>
+    <form method="POST" action="/admin/users/${escapeHtml(user.id)}/role"
+          ${user.isAdmin ? `data-confirm="Remove the admin role from ${escapeHtml(user.email)}?"` : ''}>
       ${csrf}
-      <div class="form-row">
-        <div class="field">
-          <label>Change Tier</label>
-          <select name="tier">${tierOptions}</select>
-        </div>
-        <button type="submit" class="btn btn-primary">Update Tier</button>
-      </div>
+      <input type="hidden" name="role" value="${user.isAdmin ? 'user' : 'admin'}">
+      <button type="submit" class="btn ${user.isAdmin ? 'btn-danger' : 'btn-primary'}">
+        ${user.isAdmin ? 'Remove admin role' : 'Make admin'}
+      </button>
     </form>
 
     <h3 style="margin-top:1.5rem;">Password</h3>
@@ -1702,7 +1695,7 @@ export function renderAdminRecoveryResult(
 export interface AppRow {
   clientId: string;
   clientName: string;
-  tier: string;
+  adminOnly: boolean;
 }
 
 export function renderAdminApps(
@@ -1710,24 +1703,22 @@ export function renderAdminApps(
   email: string,
   csrf: string = ''
 ): string {
-  const tiers = ['EVERYONE', 'BETA', 'ALPHA', 'ADMIN'];
   let body = `<p style="margin-bottom:1rem;"><a href="/admin/apps/register" class="btn btn-primary">Register New Service</a></p>`;
 
   body += `<div class="table-wrap"><table class="table">
-    <thead><tr><th>Client ID</th><th>Name</th><th>Tier</th><th>Actions</th></tr></thead>
+    <thead><tr><th>Client ID</th><th>Name</th><th>Access</th><th>Actions</th></tr></thead>
     <tbody>`;
   for (const app of apps) {
-    const tierOptions = tiers.map(t =>
-      `<option value="${t}"${t === app.tier ? ' selected' : ''}>${t}</option>`
-    ).join('');
-
     body += `<tr>
       <td><code>${escapeHtml(app.clientId)}</code></td>
       <td>${escapeHtml(app.clientName)}</td>
       <td>
-        <form method="POST" action="/admin/apps/${escapeHtml(app.clientId)}/tier" class="inline-form">
+        <form method="POST" action="/admin/apps/${escapeHtml(app.clientId)}/access" class="inline-form">
           ${csrf}
-          <select name="tier">${tierOptions}</select>
+          <select name="access">
+            <option value="all"${app.adminOnly ? '' : ' selected'}>All users</option>
+            <option value="admin"${app.adminOnly ? ' selected' : ''}>Admins only</option>
+          </select>
           <button type="submit" class="btn btn-secondary btn-sm">Set</button>
         </form>
       </td>
@@ -1805,9 +1796,6 @@ export function renderAdminTemplate(
 }
 
 export function renderAdminRegisterForm(email: string, csrf: string = ''): string {
-  const tiers = ['EVERYONE', 'BETA', 'ALPHA', 'ADMIN'];
-  const tierOptions = tiers.map(t => `<option value="${t}">${t}</option>`).join('');
-
   const body = `
     <p style="margin-bottom:1rem;"><a href="/admin/apps" class="btn btn-secondary btn-sm">Back to Services</a></p>
     <form method="POST" action="/admin/apps/register">
@@ -1821,12 +1809,15 @@ export function renderAdminRegisterForm(email: string, csrf: string = ''): strin
         <input type="text" name="displayName" required placeholder="e.g. Gitea">
       </div>
       <div class="field">
-        <label>Tier</label>
-        <select name="tier">${tierOptions}</select>
+        <label>Access</label>
+        <select name="access">
+          <option value="all">All users</option>
+          <option value="admin">Admins only</option>
+        </select>
       </div>
       <div class="field">
         <label>Redirect URI</label>
-        <input type="text" name="redirectUri" placeholder="https://app.corpo-valley.com/auth/callback">
+        <input type="text" name="redirectUri" required placeholder="https://app.example.com/auth/callback">
       </div>
       <button type="submit" class="btn btn-primary" style="width:auto;">Register</button>
     </form>
@@ -1837,7 +1828,7 @@ export function renderAdminRegisterForm(email: string, csrf: string = ''): strin
 export function renderAdminRegisterResult(
   clientId: string,
   clientSecret: string,
-  tier: string,
+  adminOnly: boolean,
   email: string
 ): string {
   const body = `
@@ -1846,7 +1837,7 @@ export function renderAdminRegisterResult(
     <div class="key-display">
       <strong>Client ID:</strong><br>${escapeHtml(clientId)}<br><br>
       <strong>Client Secret:</strong><br>${escapeHtml(clientSecret)}<br><br>
-      <strong>Tier:</strong><br>${tierBadge(tier)}
+      <strong>Access:</strong><br>${adminOnly ? 'Admins only' : 'All users'}
     </div>
     <p style="margin-top:1rem;"><a href="/admin/apps" class="btn btn-secondary">Back to Services</a></p>
   `;

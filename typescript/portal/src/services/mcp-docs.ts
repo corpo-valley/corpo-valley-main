@@ -336,9 +336,11 @@ VAP rejects any project Ingress that lacks the platform auth-url
 annotation, so a deployed site can never be reached without a Kratos
 session.
 
-Admin tier (Ory Keto) grants are issued via the portal's Admin → Users
-flow. ALPHA / BETA / EVERYONE are the standard tiers; ADMIN gates the
-admin pages.
+Roles are simple: every account is a regular **user**; **admins**
+additionally manage users, services, and the project template via the
+portal's Admin pages. The admin role is an Ory Keto grant, issued from
+Admin → Users (or bootstrap-admin.sh for the first admin). There are no
+other tiers.
 `,
 };
 

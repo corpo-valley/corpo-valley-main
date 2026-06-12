@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { getUserTier } from '../services/keto';
+import { isUserAdmin } from '../services/keto';
 import { renderError } from '../templates';
 
 export async function requireAdmin(
@@ -13,8 +13,7 @@ export async function requireAdmin(
   }
 
   try {
-    const tier = await getUserTier(req.portalSession.id);
-    if (tier !== 'ADMIN') {
+    if (!(await isUserAdmin(req.portalSession.id))) {
       res.status(403).send(renderError('Forbidden', 'Admin access required.'));
       return;
     }

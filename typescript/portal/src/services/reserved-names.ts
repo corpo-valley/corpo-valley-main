@@ -36,8 +36,9 @@ export function isReservedUsername(username: unknown): boolean {
   if (RESERVED_USERNAMES.has(u)) return true;
   // The platform pairs each human with a `<username>.bot` companion created via
   // the Kratos admin API (which skips these guards). Letting a *human* claim a
-  // `*.bot` name would let them impersonate a bot identity, which carries a
-  // separate (BETA) tier. Bot creation goes through the admin path, so this
+  // `*.bot` name would let them impersonate a bot identity, which the
+  // platform treats as machine-owned. Bot creation goes through the admin
+  // path, so this
   // block never interferes with legitimate bot provisioning.
   if (u.endsWith('.bot')) return true;
   return false;
