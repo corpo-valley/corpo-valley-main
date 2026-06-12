@@ -10,6 +10,7 @@
 // e.g. local dev outside the cluster.
 import * as https from 'https';
 import * as fs from 'fs';
+import { KRATOS_NAMESPACE, PROJECTS_DOMAIN } from './platform-config';
 
 const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
 const TOKEN_FILE = `${SA_DIR}/token`;
@@ -460,7 +461,9 @@ function tenantEgressPolicyObject(slug: string) {
         // Same-namespace traffic (app → its own Postgres, sibling containers).
         { to: [{ podSelector: {} }] },
         // Kratos public ONLY — for session/identity resolution. No other Ory.
-        { to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'cv-ory' } }, podSelector: { matchLabels: { app: 'ory-kratos' } } }],
+        // Namespace derived from KRATOS_PUBLIC_URL so a non-default
+        // namespacePrefix deployment doesn't pin egress to a nonexistent ns.
+        { to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': KRATOS_NAMESPACE } }, podSelector: { matchLabels: { app: 'ory-kratos' } } }],
           ports: [{ protocol: 'TCP', port: 4433 }] },
         // The public internet, but NOT anything in-cluster, on the node, or the
         // cloud-metadata endpoint. This blocks Keto-write, the Ory admin ports,
@@ -533,7 +536,6 @@ const TENANT_NS_LABELS: Record<string, string> = {
 // SA). A tenant-authored /mcp Ingress without the auth-url is still rejected.
 const MCP_GATEWAY_FQDN = process.env.MCP_GATEWAY_FQDN || 'mcp-gateway.cv-portal.svc.cluster.local';
 const MCP_GATEWAY_SVC = 'cv-mcp-gateway';
-const PROJECTS_DOMAIN = process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com';
 
 function mcpGatewayExternalName(slug: string) {
   return {

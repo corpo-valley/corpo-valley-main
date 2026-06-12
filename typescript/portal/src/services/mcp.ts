@@ -50,6 +50,7 @@ import {
 import { purgeProjectResources } from './project-purge';
 import { buildSealedSecretYaml } from './seal';
 import { getDocsTopic, listDocsTopics, type DocsTopic } from './mcp-docs';
+import { PROJECTS_DOMAIN, GITEA_PUBLIC_URL } from './platform-config';
 
 const PROTOCOL_VERSION = '2025-03-26';
 const SERVER_INFO = {
@@ -221,7 +222,7 @@ const tools: Record<string, ToolDef> = {
   },
 
   delete_project: {
-    description: 'Delete a Corpo Valley project AND all its external resources: the Gitea repository, the ArgoCD Application in cv-projects-argocd (which prunes the running pods/PVCs/Secrets), the project\'s Kubernetes namespace, and finally the portal DB row. This is destructive and irreversible — Postgres data and any committed code go too. Pass `keep_repo: true` to retain the Gitea repo (e.g. to fork/archive it) or `keep_namespace: true` to retain the cluster namespace (e.g. for forensic inspection). Requires `confirm_slug` to match the project slug exactly to prevent accidents.',
+    description: `Delete a Corpo Valley project AND all its external resources: the Gitea repository, the ArgoCD Application in ${CV_PROJECTS_ARGOCD_NAMESPACE} (which prunes the running pods/PVCs/Secrets), the project's Kubernetes namespace, and finally the portal DB row. This is destructive and irreversible — Postgres data and any committed code go too. Pass \`keep_repo: true\` to retain the Gitea repo (e.g. to fork/archive it) or \`keep_namespace: true\` to retain the cluster namespace (e.g. for forensic inspection). Requires \`confirm_slug\` to match the project slug exactly to prevent accidents.`,
     inputSchema: {
       type: 'object',
       required: ['id_or_slug', 'confirm_slug'],
@@ -443,7 +444,7 @@ const tools: Record<string, ToolDef> = {
         username: ctx.preferredUsername,
         token,
         token_name: tokenName,
-        clone_url: `https://gitea.corpo-valley.com/${p.gitea_repo}.git`,
+        clone_url: `${GITEA_PUBLIC_URL}/${p.gitea_repo}.git`,
         usage: 'git clone with a credential helper, e.g.: git -c credential.helper=\'!f(){ echo "username=' + ctx.preferredUsername + '"; echo "password=$CV_TOKEN"; };f\' clone <clone_url>  (export CV_TOKEN=<token>)',
       };
     },
@@ -731,7 +732,7 @@ const tools: Record<string, ToolDef> = {
   },
 
   get_argo_status: {
-    description: 'Read the ArgoCD Application for a project: sync status (Synced / OutOfSync), health (Healthy / Progressing / Degraded / Suspended / Missing), the revision ArgoCD currently has, last sync operation outcome, conditions, and any non-Healthy child resources. One call replaces a chain of Deployment / Pod / Event reads when you just want "is the deploy in good shape, and if not, why." Pass `also_sync: true` to also trigger a refresh+sync after reading the status.',
+    description: 'Read the ArgoCD Application for a project. Start from the `healthy` boolean and `status_summary` — they are the overall verdict: ArgoCD can report health=Healthy while sync is Unknown and error conditions show the controller cannot even read cluster state, so `health` alone is NOT trustworthy. Also returns sync status (Synced / OutOfSync / Unknown), the revision ArgoCD currently has, last sync operation outcome, raw conditions, and any non-Healthy child resources. One call replaces a chain of Deployment / Pod / Event reads when you just want "is the deploy in good shape, and if not, why." Pass `also_sync: true` to also trigger a refresh+sync after reading the status.',
     inputSchema: {
       type: 'object',
       required: ['project_id_or_slug'],
@@ -756,6 +757,23 @@ const tools: Record<string, ToolDef> = {
         };
       }
       const degraded = app.resources.filter((r) => (r.health?.status && r.health.status !== 'Healthy') || (r.status && r.status !== 'Synced'));
+
+      // Overall verdict. ArgoCD's `health` can read Healthy while the
+      // controller can't even load cluster state (sync Unknown + error
+      // conditions, e.g. missing RBAC) — echoing it verbatim told agents a
+      // broken deploy was fine. healthy=true requires ALL of: health Healthy,
+      // sync Synced, no error conditions, no degraded child resources.
+      const errorConditions = app.conditions.filter((c) => /error|warning/i.test(c.type));
+      const problems: string[] = [];
+      if (app.health.status !== 'Healthy') problems.push(`health is ${app.health.status}${app.health.message ? ` (${app.health.message})` : ''}`);
+      if (app.sync.status !== 'Synced') problems.push(`sync is ${app.sync.status}`);
+      for (const c of errorConditions) problems.push(`${c.type}: ${c.message}`);
+      if (degraded.length > 0) problems.push(`${degraded.length} resource(s) not Healthy/Synced`);
+      const healthy = problems.length === 0;
+      const statusSummary = healthy
+        ? 'Synced and healthy.'
+        : `NOT healthy: ${problems.join('; ')}`;
+
       let syncTriggered = false;
       if (args.also_sync) {
         requireVerified(ctx);
@@ -768,6 +786,8 @@ const tools: Record<string, ToolDef> = {
           return {
             project: p.slug,
             found: true,
+            healthy,
+            status_summary: statusSummary,
             sync: app.sync,
             health: app.health,
             conditions: app.conditions,
@@ -781,6 +801,8 @@ const tools: Record<string, ToolDef> = {
       return {
         project: p.slug,
         found: true,
+        healthy,
+        status_summary: statusSummary,
         sync: app.sync,
         health: app.health,
         conditions: app.conditions,
@@ -1060,12 +1082,12 @@ function toToolProject(p: Project) {
     id: p.id,
     slug: p.slug,
     name: p.name,
-    url: `https://${p.slug}.projects.corpo-valley.com`,
+    url: `https://${p.slug}.${PROJECTS_DOMAIN}`,
     service_access: p.service_access,
     repo_access: p.repo_access,
     created_at: p.created_at,
     gitea_repo: p.gitea_repo,
-    gitea_url: p.gitea_repo ? `https://gitea.corpo-valley.com/${p.gitea_repo}` : null,
+    gitea_url: p.gitea_repo ? `${GITEA_PUBLIC_URL}/${p.gitea_repo}` : null,
   };
 }
 

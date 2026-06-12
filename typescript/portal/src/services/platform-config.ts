@@ -11,6 +11,18 @@
 export const PROJECTS_DOMAIN =
   process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com';
 
+// The deployment's base domain: the projects suffix minus its first label
+// (projects.example.com → example.com). Used to derive public hosts for
+// links the portal/MCP hands to users and agents.
+export const BASE_DOMAIN = PROJECTS_DOMAIN.split('.').slice(1).join('.');
+
+// Public Gitea URL for browser/git links (clone URLs, repo links, docs).
+// NOT the GITEA_URL env — that's the in-cluster API endpoint. Defaults to
+// the chart's `gitea.<domain>` host convention; override with
+// GITEA_PUBLIC_URL when hosts.gitea differs.
+export const GITEA_PUBLIC_URL =
+  (process.env.GITEA_PUBLIC_URL || `https://gitea.${BASE_DOMAIN}`).replace(/\/+$/, '');
+
 // The portal's public base URL — project Ingresses bounce unauthenticated
 // browsers to `${PORTAL_PUBLIC_URL}/login`. Note the production default, NOT
 // the localhost default the rest of the portal uses for BASE_URL: this value
@@ -37,6 +49,19 @@ export const PORTAL_INTERNAL_URL =
 export const KRATOS_CLUSTER_URL =
   (process.env.KRATOS_PUBLIC_URL || 'http://ory-kratos-public.cv-ory.svc.cluster.local:4433')
     .replace(/\/+$/, '');
+
+// Namespace Kratos runs in, parsed from KRATOS_CLUSTER_URL's in-cluster DNS
+// name (ory-kratos-public.<ns>.svc.cluster.local). The per-project egress
+// NetworkPolicy pins tenant → Kratos traffic to this namespace. Falls back
+// to the original cv-ory when the URL isn't an in-cluster DNS name (dev).
+export const KRATOS_NAMESPACE = (() => {
+  try {
+    const host = new URL(KRATOS_CLUSTER_URL).hostname;
+    const m = /^[^.]+\.([^.]+)\.svc(\.|$)/.exec(host);
+    if (m) return m[1];
+  } catch { /* fall through */ }
+  return 'cv-ory';
+})();
 
 // StorageClass for per-project Postgres PVCs (postgres.ts). Three states:
 //   - env unset          → 'microk8s-hostpath' (the original deployment's SC,
