@@ -2,15 +2,14 @@ import { Router, Request, Response } from 'express';
 import { requireSession } from '../middleware/session';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { csrfHiddenField } from '../middleware/csrf';
-import { getUserTier, setUserTier, setServiceTier } from '../services/keto';
+import { isUserAdmin, setUserAdmin, setServiceAdminOnly, listAllServices } from '../services/keto';
 import {
   listIdentities, getIdentity, createIdentity, updateIdentityTraits,
   createRecoveryCodeForIdentity,
 } from '../services/kratos-admin';
-import { listClients, getClient, getClientTier, createClient, deleteClient, updateClientMetadata, API_KEY_TYPE } from '../services/hydra-admin';
+import { listClients, getClient, createClient, deleteClient, API_KEY_TYPE } from '../services/hydra-admin';
 import { ensureProvisioned } from '../services/provisioning';
 import { isReservedUsername, isValidUsername } from '../services/reserved-names';
-import { isTier, Tier } from '../services/tiers';
 import {
   renderAdminUsers, renderAdminUserDetail, renderAdminUserCreate,
   renderAdminRecoveryResult, renderAdminApps,
@@ -29,7 +28,7 @@ router.use(requireSession, requireAdmin);
 
 // ── Users ──────────────────────────────────────────────────
 
-function toUserRow(identity: { id: string; state?: string; traits?: any }, tier: string): UserRow {
+function toUserRow(identity: { id: string; state?: string; traits?: any }, isAdmin: boolean): UserRow {
   const traits = (identity.traits ?? {}) as Record<string, any>;
   const first = traits?.name?.first || '';
   const last = traits?.name?.last || '';
@@ -41,7 +40,7 @@ function toUserRow(identity: { id: string; state?: string; traits?: any }, tier:
     lastName: last,
     name: `${first} ${last}`.trim(),
     state: identity.state || 'active',
-    tier,
+    isAdmin,
   };
 }
 
@@ -54,9 +53,9 @@ router.get('/users', async (req: Request, res: Response) => {
 
     const users: UserRow[] = await Promise.all(
       identities.map(async (identity) => {
-        let tier = 'EVERYONE';
-        try { tier = await getUserTier(identity.id); } catch { /* default */ }
-        return toUserRow(identity, tier);
+        let admin = false;
+        try { admin = await isUserAdmin(identity.id); } catch { /* default to user */ }
+        return toUserRow(identity, admin);
       })
     );
 
@@ -99,10 +98,10 @@ router.post('/users', async (req: Request, res: Response) => {
 
   try {
     const identity = await createIdentity(traits as any);
-    // Provision EVERYONE grant + paired .bot identity + Gitea accounts. Shared,
-    // idempotent, best-effort — same path self-service registrants hit on first
-    // login (services/provisioning.ts). Awaited here so the admin sees a fully
-    // provisioned user on redirect.
+    // Provision the paired .bot identity + Gitea accounts. Shared, idempotent,
+    // best-effort (services/provisioning.ts). Awaited here so the admin sees a
+    // fully provisioned user on redirect. New accounts are regular users; the
+    // admin role is granted separately via the toggle on the user page.
     await ensureProvisioned(identity);
     res.redirect(`/admin/users/${identity.id}`);
   } catch (err: any) {
@@ -121,9 +120,9 @@ router.get('/users/:id', async (req: Request, res: Response) => {
 
   try {
     const identity = await getIdentity(req.params.id);
-    const tier = await getUserTier(identity.id);
+    const admin = await isUserAdmin(identity.id);
     const csrf = csrfHiddenField(req, res);
-    res.send(renderAdminUserDetail(toUserRow(identity, tier), session.email, csrf));
+    res.send(renderAdminUserDetail(toUserRow(identity, admin), session.email, csrf));
   } catch (err: any) {
     console.error('Admin user detail error:');
     res.status(500).send(renderError('Error', 'Failed to load user.'));
@@ -169,10 +168,10 @@ router.post('/users/:id/recovery', async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const identity = await getIdentity(req.params.id);
-    const tier = await getUserTier(identity.id);
+    const admin = await isUserAdmin(identity.id);
     const recovery = await createRecoveryCodeForIdentity(identity.id);
     res.send(renderAdminRecoveryResult(
-      toUserRow(identity, tier),
+      toUserRow(identity, admin),
       recovery.recovery_link,
       recovery.recovery_code,
       recovery.expires_at,
@@ -184,19 +183,26 @@ router.post('/users/:id/recovery', async (req: Request, res: Response) => {
   }
 });
 
-router.post('/users/:id/tier', async (req: Request, res: Response) => {
-  const tier = req.body?.tier;
-  if (!tier || !isTier(tier)) {
-    res.status(400).send(renderError('Invalid Tier', 'Tier must be EVERYONE, BETA, ALPHA, or ADMIN.'));
+router.post('/users/:id/role', async (req: Request, res: Response) => {
+  const role = req.body?.role;
+  if (role !== 'admin' && role !== 'user') {
+    res.status(400).send(renderError('Invalid Role', 'Role must be admin or user.'));
+    return;
+  }
+
+  // Don't let an admin demote themselves — the platform must always keep the
+  // acting admin able to undo the change.
+  if (role === 'user' && req.params.id === req.portalSession!.id) {
+    res.status(400).send(renderError('Invalid Role', 'You cannot remove your own admin role.'));
     return;
   }
 
   try {
-    await setUserTier(req.params.id, tier as Tier);
+    await setUserAdmin(req.params.id, role === 'admin');
     res.redirect(`/admin/users/${req.params.id}`);
   } catch (err: any) {
-    console.error('Set tier error:');
-    res.status(500).send(renderError('Error', 'Failed to update tier.'));
+    console.error('Set role error:');
+    res.status(500).send(renderError('Error', 'Failed to update role.'));
   }
 });
 
@@ -207,6 +213,11 @@ router.get('/apps', async (req: Request, res: Response) => {
 
   try {
     const clients = await listClients();
+    // Access lives in Keto: an admins-only tuple restricts the service,
+    // absence means open to all signed-in users.
+    const adminOnlyServices = new Set(
+      (await listAllServices()).filter((s) => s.adminOnly).map((s) => s.name)
+    );
     const apps: AppRow[] = clients
       .filter(c => {
         const meta = c.metadata as Record<string, string> | undefined;
@@ -215,7 +226,7 @@ router.get('/apps', async (req: Request, res: Response) => {
       .map(c => ({
         clientId: c.client_id || '',
         clientName: c.client_name || c.client_id || '',
-        tier: getClientTier(c),
+        adminOnly: adminOnlyServices.has(c.client_id || ''),
       }));
 
     apps.sort((a, b) => a.clientId.localeCompare(b.clientId));
@@ -228,7 +239,7 @@ router.get('/apps', async (req: Request, res: Response) => {
 });
 
 // First-party SSO clients the consent auto-trust + MCP denylist depend on.
-// Deleting or re-tiering these silently changes the platform's security posture,
+// Deleting or re-gating these silently changes the platform's security posture,
 // so the admin app routes refuse to touch them (same set as TRUSTED_CLIENT_IDS).
 const PROTECTED_CLIENT_IDS = new Set(
   (process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea').split(',').map((s) => s.trim()).filter(Boolean),
@@ -258,22 +269,21 @@ async function loadManageableServiceClient(appId: string, res: Response) {
   return client;
 }
 
-router.post('/apps/:appId/tier', async (req: Request, res: Response) => {
-  const tier = req.body?.tier;
-  if (!tier || !isTier(tier)) {
-    res.status(400).send(renderError('Invalid Tier', 'Tier must be EVERYONE, BETA, ALPHA, or ADMIN.'));
+router.post('/apps/:appId/access', async (req: Request, res: Response) => {
+  const access = req.body?.access;
+  if (access !== 'all' && access !== 'admin') {
+    res.status(400).send(renderError('Invalid Access', 'Access must be all or admin.'));
     return;
   }
 
   try {
     const { appId } = req.params;
     if (!(await loadManageableServiceClient(appId, res))) return;
-    await setServiceTier(appId, tier as Tier);
-    await updateClientMetadata(appId, { tier });
+    await setServiceAdminOnly(appId, access === 'admin');
     res.redirect('/admin/apps');
   } catch (err: any) {
-    console.error('Set app tier error:');
-    res.status(500).send(renderError('Error', 'Failed to update service tier.'));
+    console.error('Set app access error:');
+    res.status(500).send(renderError('Error', 'Failed to update service access.'));
   }
 });
 
@@ -284,40 +294,41 @@ router.get('/apps/register', async (req: Request, res: Response) => {
 
 router.post('/apps/register', async (req: Request, res: Response) => {
   const session = req.portalSession!;
-  const { appName, displayName, tier, redirectUri } = req.body || {};
+  const { appName, displayName, redirectUri, access } = req.body || {};
+  const adminOnly = access === 'admin';
 
-  if (!appName || !displayName || !tier || !isTier(tier)) {
-    res.status(400).send(renderError('Invalid Input', 'App name, display name, and valid tier are required.'));
+  // redirectUri is required — there is no sensible default to invent for an
+  // arbitrary deployment's domain layout.
+  if (!appName || !displayName || !redirectUri) {
+    res.status(400).send(renderError('Invalid Input', 'App name, display name, and redirect URI are required.'));
     return;
   }
 
   try {
-    const redirectUris = redirectUri
-      ? [redirectUri]
-      : [`https://${appName}.corpo-valley.com/auth/callback`];
-
     const { client, secret } = await createClient({
       id: appName,
       name: displayName,
-      tier,
-      redirectUris,
+      redirectUris: [redirectUri],
       grantTypes: ['authorization_code', 'refresh_token'],
-      metadata: { tier },
     });
 
-    try {
-      await setServiceTier(appName, tier as Tier);
-    } catch (tierErr: any) {
-      // Compensate: the Hydra client now exists (with a secret the admin never
-      // saw) but has no tier relation. Roll it back so a retry with the same
-      // appName doesn't fail with a duplicate-client error and wedge the admin.
-      console.error('Register app: setServiceTier failed, rolling back client', appName, tierErr?.message);
-      await deleteClient(appName).catch((delErr: any) =>
-        console.error('Register app: rollback deleteClient failed', appName, delErr?.message));
-      throw tierErr;
+    if (adminOnly) {
+      try {
+        await setServiceAdminOnly(appName, true);
+      } catch (gateErr: any) {
+        // Compensate: the Hydra client now exists (with a secret the admin never
+        // saw) but is NOT admins-only as requested. Roll it back so a retry with
+        // the same appName doesn't fail with a duplicate-client error and wedge
+        // the admin — and so the service is never live with looser access than
+        // the admin asked for.
+        console.error('Register app: setServiceAdminOnly failed, rolling back client', appName, gateErr?.message);
+        await deleteClient(appName).catch((delErr: any) =>
+          console.error('Register app: rollback deleteClient failed', appName, delErr?.message));
+        throw gateErr;
+      }
     }
 
-    res.send(renderAdminRegisterResult(client.client_id || appName, secret, tier, session.email));
+    res.send(renderAdminRegisterResult(client.client_id || appName, secret, adminOnly, session.email));
   } catch (err: any) {
     console.error('Register app error:');
     res.status(500).send(renderError('Error', 'Failed to register service.'));

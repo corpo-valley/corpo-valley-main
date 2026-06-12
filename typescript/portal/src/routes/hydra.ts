@@ -122,25 +122,22 @@ function isTrustedClient(clientId: string | undefined): boolean {
   return TRUSTED_CLIENTS.has(clientId);
 }
 
-// Enforce the per-service tier gate for admin-registered service clients. The
-// platform's Admin → Apps UI assigns each registered service a required tier
-// (EVERYONE/BETA/ALPHA/ADMIN), but nothing consulted it at request time, so the
-// gating was decorative — any authenticated user could complete consent for any
-// service regardless of its tier. We close that here, at the point Hydra issues
-// the service a token. Trusted first-party clients (argocd/gitea) and
-// dynamically-registered clients (the MCP OAuth flow, which carry no tier) are
-// unaffected: userCanAccessService returns true when no tier tuple exists.
+// Enforce the admins-only gate for admin-registered service clients, at the
+// point Hydra issues the service a token. Trusted first-party clients
+// (argocd/gitea) and dynamically-registered clients (the MCP OAuth flow,
+// which carry no access tuple) are unaffected: userCanAccessService returns
+// true when no admins-only tuple exists.
 // Returns true if allowed; otherwise sends a 403 and returns false. Any Keto
 // error propagates (caught by the route's try/catch → 500), i.e. fail closed.
-async function ensureServiceTierAccess(
+async function ensureServiceAccess(
   res: Response,
   clientId: string | undefined,
   subject: string,
 ): Promise<boolean> {
   if (!clientId) return true;
   if (await userCanAccessService(subject, clientId)) return true;
-  console.warn('[consent] tier gate denied: subject lacks required tier for service', { clientId, subject });
-  res.status(403).send(renderError('Access Denied', 'Your account tier does not have access to this application.'));
+  console.warn('[consent] access denied: admins-only service', { clientId, subject });
+  res.status(403).send(renderError('Access Denied', 'This application is restricted to administrators.'));
   return false;
 }
 
@@ -201,9 +198,9 @@ router.get('/consent', requireSession, async (req: Request, res: Response) => {
       return res.redirect(completedRequest.redirect_to);
     }
 
-    // Tier gate: deny before showing consent if the subject's tier is below the
-    // service's required tier. (Trusted clients above are exempt by design.)
-    if (!(await ensureServiceTierAccess(res, clientId, consentRequest.subject || ''))) return;
+    // Admins-only gate: deny before showing consent if the service is restricted
+    // and the subject is not an admin. (Trusted clients above are exempt by design.)
+    if (!(await ensureServiceAccess(res, clientId, consentRequest.subject || ''))) return;
 
     // For unknown/external clients, show consent page (with a CSRF token).
     res.send(renderConsentPage(
@@ -231,9 +228,9 @@ router.post('/consent/accept', requireSession, validateCsrf, async (req: Request
     const consentRequest = await loadConsentForSession(req, res, consentChallenge);
     if (!consentRequest) return;
 
-    // Re-check the service tier gate at the point of issuance (defense in depth
+    // Re-check the admins-only gate at the point of issuance (defense in depth
     // against a direct POST that skips the GET render).
-    if (!(await ensureServiceTierAccess(res, consentRequest.client?.client_id, consentRequest.subject || ''))) return;
+    if (!(await ensureServiceAccess(res, consentRequest.client?.client_id, consentRequest.subject || ''))) return;
 
     const idTokenClaims = await buildIdTokenClaims(consentRequest.subject || '');
     const { data: completedRequest } = await hydra.acceptOAuth2ConsentRequest({

@@ -1,5 +1,7 @@
-// Platform-side provisioning for human identities: the EVERYONE membership
-// grant, a paired `.bot` identity (+ BETA tier), and Gitea accounts.
+// Platform-side provisioning for human identities: a paired `.bot` identity
+// and Gitea accounts. Roles need no provisioning — a regular user carries no
+// Keto tuple at all; admins are granted explicitly (bootstrap-admin.sh or the
+// Admin → Users toggle).
 //
 // Self-service registration is disabled, so the only way an account is created
 // is an admin via routes/admin.ts, which calls this synchronously at create
@@ -8,7 +10,6 @@
 
 import { Identity } from '@ory/client';
 import { ensureBotForHuman } from './kratos-admin';
-import { setUserTier, grantEveryone } from './keto';
 import { provisionGiteaForIdentities } from './gitea';
 import { isReservedUsername } from './reserved-names';
 
@@ -32,16 +33,9 @@ export async function ensureProvisioned(identity: Identity): Promise<void> {
     return;
   }
 
-  try {
-    await grantEveryone(identity.id);
-  } catch (err: any) {
-    console.error('[provision] grantEveryone failed', identity.id, err?.message);
-  }
-
   let bot: Identity | null = null;
   try {
     bot = await ensureBotForHuman(identity);
-    if (bot) await setUserTier(bot.id, 'BETA');
   } catch (err: any) {
     console.error('[provision] bot provisioning failed', identity.id, err?.message);
   }

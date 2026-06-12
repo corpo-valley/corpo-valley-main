@@ -1,7 +1,22 @@
-import { Tier, TIERS, highestTier, hasAccess } from './tiers';
+// Role model: a user is either an ADMIN or a regular user. The marker is a
+// single Keto tuple — `groups:ADMIN#members@<userId>` — written by the chart's
+// bootstrap-admin.sh for the first admin and by the portal's Admin → Users
+// toggle for everyone else. Regular users carry NO tuple at all.
+//
+// Services (admin-registered OAuth clients) are either open to every signed-in
+// user (no tuple) or admins-only (`services:<app>#access → groups:ADMIN#members`).
+//
+// This replaces the legacy four-level tier hierarchy (EVERYONE/BETA/ALPHA/
+// ADMIN). Tuples for the retired groups may still exist in older deployments;
+// they are ignored everywhere and deleted opportunistically when a user's
+// role or a service's access is changed.
 
 const ketoReadUrl = process.env.KETO_READ_URL || 'http://localhost:4466';
 const ketoWriteUrl = process.env.KETO_WRITE_URL || 'http://localhost:4467';
+
+const ADMIN_GROUP = 'ADMIN';
+// Retired tier groups — only referenced for opportunistic tuple cleanup.
+const LEGACY_GROUPS = ['EVERYONE', 'BETA', 'ALPHA'];
 
 interface RelationTuple {
   namespace: string;
@@ -48,134 +63,106 @@ async function deleteRelation(params: Record<string, string>): Promise<void> {
   }
 }
 
-export async function getUserTier(userId: string): Promise<Tier> {
+export async function isUserAdmin(userId: string): Promise<boolean> {
   const { relation_tuples } = await listRelations({
     namespace: 'groups',
+    object: ADMIN_GROUP,
     relation: 'members',
     subject_id: userId,
   });
-  const tiers = relation_tuples
-    .map((t) => t.object)
-    .filter((obj): obj is Tier => TIERS.includes(obj as Tier));
-  return highestTier(tiers);
+  return relation_tuples.length > 0;
 }
 
-export async function removeUserFromAllTiers(userId: string): Promise<void> {
-  for (const tier of TIERS) {
+// Grant or revoke the admin role. Also strips any legacy tier tuples the user
+// still carries from before the admin/user model, so toggling a role leaves
+// Keto clean.
+export async function setUserAdmin(userId: string, admin: boolean): Promise<void> {
+  if (admin) {
+    await createRelation({
+      namespace: 'groups',
+      object: ADMIN_GROUP,
+      relation: 'members',
+      subject_id: userId,
+    });
+  } else {
     await deleteRelation({
       namespace: 'groups',
-      object: tier,
+      object: ADMIN_GROUP,
+      relation: 'members',
+      subject_id: userId,
+    });
+  }
+  for (const group of LEGACY_GROUPS) {
+    await deleteRelation({
+      namespace: 'groups',
+      object: group,
       relation: 'members',
       subject_id: userId,
     });
   }
 }
 
-export async function setUserTier(userId: string, tier: Tier): Promise<void> {
-  // Add the target tier FIRST, then strip the others. The reverse order
-  // (remove-all then add) leaves the user in NO tier if the process dies or the
-  // add fails between the two calls — silently dropping ADMIN or the EVERYONE
-  // base grant (getUserTier then defaults to EVERYONE). Add-before-remove fails
-  // safe: a crash mid-change leaves the user with at most an extra tier, never
-  // de-privileged below the target.
-  await createRelation({
-    namespace: 'groups',
-    object: tier,
-    relation: 'members',
-    subject_id: userId,
-  });
-  for (const t of TIERS) {
-    if (t === tier) continue;
-    await deleteRelation({
-      namespace: 'groups',
-      object: t,
-      relation: 'members',
-      subject_id: userId,
-    });
-  }
-}
-
-// Grant the EVERYONE base tier without first wiping the user's other tiers.
-// Used when bootstrapping a freshly-created human so they're a member of the
-// EVERYONE group on top of whatever else admin assigns.
-export async function grantEveryone(userId: string): Promise<void> {
-  await createRelation({
-    namespace: 'groups',
-    object: 'EVERYONE',
-    relation: 'members',
-    subject_id: userId,
-  });
-}
-
-export async function getServiceTier(appName: string): Promise<Tier | null> {
+// True iff the service is restricted to admins. Legacy tier gates
+// (EVERYONE/BETA/ALPHA subject sets) read as open.
+export async function isServiceAdminOnly(appName: string): Promise<boolean> {
   const { relation_tuples } = await listRelations({
     namespace: 'services',
     object: appName,
     relation: 'access',
   });
-  for (const tuple of relation_tuples) {
-    if (tuple.subject_set?.namespace === 'groups') {
-      const obj = tuple.subject_set.object;
-      if (TIERS.includes(obj as Tier)) return obj as Tier;
-    }
-  }
-  return null;
+  return relation_tuples.some(
+    (t) => t.subject_set?.namespace === 'groups' && t.subject_set.object === ADMIN_GROUP
+  );
 }
 
-export async function setServiceTier(appName: string, tier: Tier): Promise<void> {
-  // Remove existing service-tier relationships
-  for (const t of TIERS) {
+// Restrict a service to admins (or open it to all signed-in users). Clears
+// any legacy tier gate either way.
+export async function setServiceAdminOnly(appName: string, adminOnly: boolean): Promise<void> {
+  for (const group of [ADMIN_GROUP, ...LEGACY_GROUPS]) {
+    if (adminOnly && group === ADMIN_GROUP) continue;
     await deleteRelation({
       namespace: 'services',
       object: appName,
       relation: 'access',
       'subject_set.namespace': 'groups',
-      'subject_set.object': t,
+      'subject_set.object': group,
       'subject_set.relation': 'members',
     });
   }
-  await createRelation({
-    namespace: 'services',
-    object: appName,
-    relation: 'access',
-    subject_set: {
-      namespace: 'groups',
-      object: tier,
-      relation: 'members',
-    },
-  });
+  if (adminOnly) {
+    await createRelation({
+      namespace: 'services',
+      object: appName,
+      relation: 'access',
+      subject_set: {
+        namespace: 'groups',
+        object: ADMIN_GROUP,
+        relation: 'members',
+      },
+    });
+  }
 }
 
-export async function listAllServices(): Promise<{ name: string; tier: Tier }[]> {
+export async function listAllServices(): Promise<{ name: string; adminOnly: boolean }[]> {
   const { relation_tuples } = await listRelations({
     namespace: 'services',
     relation: 'access',
   });
-  const services: { name: string; tier: Tier }[] = [];
+  const services = new Map<string, boolean>();
   for (const tuple of relation_tuples) {
-    if (tuple.subject_set?.namespace === 'groups') {
-      const tierName = tuple.subject_set.object;
-      if (TIERS.includes(tierName as Tier)) {
-        services.push({ name: tuple.object, tier: tierName as Tier });
-      }
-    }
+    if (tuple.subject_set?.namespace !== 'groups') continue;
+    const adminOnly = tuple.subject_set.object === ADMIN_GROUP;
+    services.set(tuple.object, (services.get(tuple.object) ?? false) || adminOnly);
   }
-  return services;
+  return [...services.entries()].map(([name, adminOnly]) => ({ name, adminOnly }));
 }
 
 // Authoritative per-service access decision. Gates OAuth consent for
-// admin-registered service clients (see routes/hydra.ts): a service's required
-// tier is the `services/<app>/access -> groups:<tier>#members` tuple written by
-// setServiceTier. Tiers are HIERARCHICAL (ADMIN > ALPHA > BETA > EVERYONE), so
-// we compare the user's effective tier RANK against the service's required tier
-// rather than testing literal Keto group membership — a Keto subject_id check
-// would deny an ADMIN user a BETA-gated service because the user is only a
-// literal member of their own tier group plus EVERYONE, not of every lower
-// group. A service with no tier tuple is open to EVERYONE. Throws on a Keto
-// error so callers fail closed (no token issued) rather than guessing.
+// admin-registered service clients (see routes/hydra.ts): a service with no
+// access tuple (or only a legacy tier tuple) is open to every signed-in user;
+// an admins-only service requires the ADMIN role. Throws on a Keto error so
+// callers fail closed (no token issued) rather than guessing.
 export async function userCanAccessService(userId: string, appName: string): Promise<boolean> {
-  const required = await getServiceTier(appName);
-  if (!required) return true; // no tier configured → open to everyone
-  const userTier = await getUserTier(userId);
-  return hasAccess(userTier, required);
+  if (!(await isServiceAdminOnly(appName))) return true;
+  return isUserAdmin(userId);
 }

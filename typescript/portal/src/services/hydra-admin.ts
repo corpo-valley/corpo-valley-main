@@ -55,10 +55,11 @@ export async function getClient(id: string): Promise<OAuth2Client> {
   return data;
 }
 
+// Access control lives in Keto (services namespace, admins-only tuple) — the
+// client metadata here only carries type tags like API_KEY_TYPE.
 export async function createClient(opts: {
   id: string;
   name: string;
-  tier: string;
   redirectUris?: string[];
   grantTypes?: string[];
   metadata?: Record<string, string>;
@@ -74,7 +75,7 @@ export async function createClient(opts: {
       scope: 'openid profile email',
       redirect_uris: opts.redirectUris || [],
       token_endpoint_auth_method: 'client_secret_post',
-      metadata: { tier: opts.tier, ...opts.metadata },
+      metadata: opts.metadata || {},
     },
   });
   return { client: data, secret };
@@ -98,10 +99,6 @@ export async function updateClientMetadata(
   });
 }
 
-export function getClientTier(client: OAuth2Client): string {
-  const meta = client.metadata as Record<string, string> | undefined;
-  return meta?.tier || 'EVERYONE';
-}
 
 // ── Generic platform API keys ──────────────────────────────
 // API keys are Hydra OAuth2 clients using the client_credentials grant.

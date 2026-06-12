@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { requireSession, requireVerifiedEmail } from '../middleware/session';
 import { POST_LOGIN_COOKIE } from './kratos';
 import { csrfHiddenField } from '../middleware/csrf';
-import { getUserTier } from '../services/keto';
+import { isUserAdmin } from '../services/keto';
 import { createApiKey, listUserApiKeys, isKeyOwnedBy, deleteClient } from '../services/hydra-admin';
 import {
   listProjectsByOwner, getProjectById, getProjectBySlug, createProject, updateProjectAccess,
@@ -118,13 +118,12 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
   }
 
   try {
-    const tier = await getUserTier(session.id);
+    const isAdmin = await isUserAdmin(session.id);
     const projects = await listProjectsByOwner(session.id);
     res.send(renderProjects(
       session.email,
       projects.map((p) => toProjectRow(p)),
-      tier,
-      tier === 'ADMIN',
+      isAdmin,
     ));
   } catch (err: any) {
     console.error('Projects list error:', err.message);
@@ -136,10 +135,10 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
 router.get('/projects/new', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const tier = await getUserTier(session.id);
+    const isAdmin = await isUserAdmin(session.id);
     const csrf = csrfHiddenField(req, res);
     res.send(renderProjectCreate(
-      session.email, tier === 'ADMIN', csrf, '', {},
+      session.email, isAdmin, csrf, '', {},
     ));
   } catch (err: any) {
     console.error('Project create form error:', err.message);
@@ -155,8 +154,7 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
   const session = req.portalSession!;
   const { slug: rawSlug, name, service_access, repo_access, visibility } = req.body || {};
 
-  const tier = await getUserTier(session.id).catch(() => 'EVERYONE');
-  const isAdmin = tier === 'ADMIN';
+  const isAdmin = await isUserAdmin(session.id).catch(() => false);
   const fail = (msg: string, status = 400) => {
     const csrf = csrfHiddenField(req, res);
     res.status(status).send(renderProjectCreate(
@@ -258,7 +256,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       res.status(404).send(renderError('Not Found', 'Project not found.'));
       return;
     }
-    const tier = await getUserTier(session.id);
+    const isAdmin = await isUserAdmin(session.id);
     const csrf = csrfHiddenField(req, res);
     const secrets = await listProjectSecretNames(project);
     let postgresEnabledNow = false;
@@ -267,7 +265,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       postgresEnabledNow = await projectPostgresEnabled({ owner: pgOwner, repo: pgRepo }).catch(() => false);
     }
     res.send(renderProjectDetail(
-      session.email, tier === 'ADMIN',
+      session.email, isAdmin,
       toProjectRow(project, { postgresEnabled: postgresEnabledNow }),
       csrf, secrets,
     ));
@@ -330,9 +328,9 @@ router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, asy
       tokenName,
       scopes: ['write:repository'],
     });
-    const tier = await getUserTier(session.id).catch(() => 'EVERYONE');
+    const isAdmin = await isUserAdmin(session.id).catch(() => false);
     res.send(renderGiteaCliTokenReveal(
-      session.email, tier === 'ADMIN', toProjectRow(project), username, token, tokenName
+      session.email, isAdmin, toProjectRow(project), username, token, tokenName
     ));
   } catch (err: any) {
     // Don't reflect raw upstream (Gitea) error bodies to the tenant — keep the
@@ -347,13 +345,13 @@ router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, asy
 router.post('/projects/:id/secrets', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const fail = async (msg: string, status = 400) => {
-    const tier = await getUserTier(session.id).catch(() => 'EVERYONE');
+    const isAdmin = await isUserAdmin(session.id).catch(() => false);
     const project = await getProjectById(req.params.id);
     if (!project) { res.status(404).send(renderError('Not Found', 'Project not found.')); return; }
     const csrf = csrfHiddenField(req, res);
     const secrets = await listProjectSecretNames(project);
     res.status(status).send(renderProjectDetail(
-      session.email, tier === 'ADMIN', toProjectRow(project), csrf, secrets,
+      session.email, isAdmin, toProjectRow(project), csrf, secrets,
       { type: 'error', text: msg }
     ));
   };
@@ -586,14 +584,14 @@ router.get('/connect', requireSession, (req: Request, res: Response) => res.redi
 router.get('/keys', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const tier = await getUserTier(session.id);
+    const isAdmin = await isUserAdmin(session.id);
     const keys = await listUserApiKeys(session.id);
     const keyRows: ApiKeyRow[] = keys.map(k => ({
       clientId: k.client_id || '',
       createdAt: k.created_at ? new Date(k.created_at).toLocaleDateString() : 'Unknown',
     }));
     const csrf = csrfHiddenField(req, res);
-    res.send(renderKeyManagement(keyRows, session.email, tier === 'ADMIN', hydraPublicUrl, csrf));
+    res.send(renderKeyManagement(keyRows, session.email, isAdmin, hydraPublicUrl, csrf));
   } catch (err: any) {
     console.error('Key list error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load API keys.'));
@@ -604,9 +602,9 @@ router.get('/keys', requireSession, async (req: Request, res: Response) => {
 router.post('/keys', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const tier = await getUserTier(session.id);
+    const isAdmin = await isUserAdmin(session.id);
     const { clientId, clientSecret } = await createApiKey(session.id);
-    res.send(renderNewKeyDisplay(clientId, clientSecret, session.email, tier === 'ADMIN', hydraPublicUrl));
+    res.send(renderNewKeyDisplay(clientId, clientSecret, session.email, isAdmin, hydraPublicUrl));
   } catch (err: any) {
     console.error('Key create error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to create API key.'));

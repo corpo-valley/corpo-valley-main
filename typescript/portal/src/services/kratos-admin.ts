@@ -116,7 +116,7 @@ async function findIdentityByEmail(email: string): Promise<Identity | null> {
 // Only adopt an existing identity as this human's bot if it is actually tagged
 // as a bot owned by this human. Otherwise (e.g. someone self-registered the
 // `<victim>.bot` username/email to squat the mapping) refuse — we must never
-// hand bot tier / provisioning to an identity we didn't create for this human.
+// hand bot provisioning to an identity we didn't create for this human.
 function isBotOwnedBy(identity: Identity, humanId: string): boolean {
   const meta = (identity.metadata_public ?? {}) as Record<string, any>;
   return meta.type === 'bot' && meta.human_id === humanId;
