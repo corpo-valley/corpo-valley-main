@@ -11,7 +11,7 @@
 // retry from later.
 
 import type { Project } from './projects';
-import { claimOrGetPostgresPassword, decodePostgresPassword, setGiteaRepo, setPinTokenHash, repoDefaultAccess } from './projects';
+import { claimOrGetPostgresPassword, decodePostgresPassword, setGiteaRepo, setPinTokenHash } from './projects';
 import { syncRepoAccess } from './repo-access';
 import { type Capabilities, requiresPostgres, TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO } from './templates';
 import { enablePostgres, generatePostgresPassword } from './postgres';
@@ -63,12 +63,14 @@ export async function provisionProject(
     const ownerUsername = ctx.ownerUsername;
     try {
       await ensureUser({ username: ownerUsername, email: ctx.email || `${ownerUsername}@unknown` });
-      // Visibility is keyed on the REPO default (it used to be keyed on the
-      // site axis, which made a shared-site/private-repo project publicly
-      // readable in Gitea).
+      // The repo is ALWAYS created private. Project repos live under the owner's
+      // personal Gitea account, which has no org-internal visibility tier, so a
+      // non-private repo would be anonymously cloneable from the internet
+      // (finding F1). Member read/write access is granted as collaborators by
+      // syncRepoAccess below, never by flipping the repo public.
       const fullName = await generateFromTemplate({
         ownerUsername, name: slug,
-        private: repoDefaultAccess(project) === 'none', description: project.name,
+        private: true, description: project.name,
         templateOwner: TEMPLATE_GITEA_OWNER, templateRepo: TEMPLATE_GITEA_REPO,
       });
       await setGiteaRepo(project.id, fullName);

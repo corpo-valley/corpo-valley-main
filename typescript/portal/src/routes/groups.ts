@@ -6,7 +6,7 @@
 // the background — site permissions need no sync, they're resolved live).
 
 import { Router, Request, Response } from 'express';
-import { requireSession } from '../middleware/session';
+import { requireSession, requireVerifiedEmail } from '../middleware/session';
 import { csrfHiddenField } from '../middleware/csrf';
 import { isUserAdmin } from '../services/keto';
 import {
@@ -35,8 +35,11 @@ router.get('/groups', async (req: Request, res: Response) => {
   }
 });
 
-// POST /groups — create a group owned by the caller.
-router.post('/groups', async (req: Request, res: Response) => {
+// POST /groups — create a group owned by the caller. Group mutations require a
+// verified email (parity with project/provisioning routes): an unverified
+// self-registered user must not be able to mutate real Gitea collaborators via
+// group membership changes on projects a group is granted.
+router.post('/groups', requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const name = String(req.body?.name || '').trim().toLowerCase();
   const fail = async (msg: string, status = 400) => {
@@ -85,7 +88,7 @@ router.get('/groups/:id', async (req: Request, res: Response) => {
 });
 
 // POST /groups/:id/members — add a member by email or username.
-router.post('/groups/:id/members', async (req: Request, res: Response) => {
+router.post('/groups/:id/members', requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const identifier = String(req.body?.identifier || '').trim();
   try {
@@ -132,7 +135,7 @@ router.post('/groups/:id/members', async (req: Request, res: Response) => {
 });
 
 // POST /groups/:id/members/:userId/remove
-router.post('/groups/:id/members/:userId/remove', async (req: Request, res: Response) => {
+router.post('/groups/:id/members/:userId/remove', requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const group = await getGroupById(req.params.id);
@@ -156,7 +159,7 @@ router.post('/groups/:id/members/:userId/remove', async (req: Request, res: Resp
 
 // POST /groups/:id/delete — removes the group AND every grant that points at
 // it. Affected repos are re-converged after the grants are gone.
-router.post('/groups/:id/delete', async (req: Request, res: Response) => {
+router.post('/groups/:id/delete', requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const group = await getGroupById(req.params.id);

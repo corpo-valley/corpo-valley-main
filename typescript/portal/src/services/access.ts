@@ -94,6 +94,13 @@ export async function listGroups(): Promise<Array<Group & { member_count: number
   return rows.map((r) => ({ ...r, member_count: parseInt(String(r.member_count), 10) || 0 }));
 }
 
+// Groups owned by a user — the set the user-delete cascade deletes (each drops
+// its own grants; the cascade re-converges the projects those grants touched).
+export async function listGroupsByOwner(ownerId: string): Promise<Group[]> {
+  const { rows } = await pool.query<Group>('SELECT * FROM groups WHERE owner_id = $1 ORDER BY name', [ownerId]);
+  return rows;
+}
+
 export async function deleteGroup(id: string): Promise<void> {
   // Grants pointing at the group go with it — a dangling group grant would
   // read as a permission nobody can inspect.
@@ -122,6 +129,18 @@ export async function addGroupMember(member: {
 
 export async function removeGroupMember(groupId: string, userId: string): Promise<void> {
   await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_id = $2', [groupId, userId]);
+}
+
+// Strip a user from every group they belong to. Part of the user-delete cascade
+// (the user's Gitea account purge drops the matching collaborator rows).
+export async function removeUserFromAllGroups(userId: string): Promise<void> {
+  await pool.query('DELETE FROM group_members WHERE user_id = $1', [userId]);
+}
+
+// Delete every direct (user-subject) grant naming this user, across all projects.
+// Part of the user-delete cascade.
+export async function deleteUserGrants(userId: string): Promise<void> {
+  await pool.query(`DELETE FROM project_grants WHERE subject_type = 'user' AND subject_id = $1`, [userId]);
 }
 
 // Projects that carry a grant for this group — the set the Gitea reconciler

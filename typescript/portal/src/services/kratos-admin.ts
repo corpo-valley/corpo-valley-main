@@ -53,6 +53,17 @@ export async function updateIdentityTraits(
   return data;
 }
 
+// Delete an identity. Idempotent — a 404 (already gone) is success. Used by the
+// admin user-delete cascade for both the human and its paired .bot identity.
+export async function deleteIdentity(id: string): Promise<void> {
+  try {
+    await identityApi.deleteIdentity({ id });
+  } catch (err: any) {
+    if (err?.response?.status === 404) return;
+    throw err;
+  }
+}
+
 export interface RecoveryCode {
   recovery_code: string;
   recovery_link: string;
@@ -204,6 +215,18 @@ export async function ensureBotForHuman(human: Identity): Promise<Identity | nul
     }
     throw err;
   }
+}
+
+// Resolve the .bot identity paired with a human, or null if none exists. Only
+// returns an identity genuinely tagged as this human's bot (same ownership
+// backstop ensureBotForHuman uses), so the user-delete cascade can never reap a
+// squatted or unrelated identity.
+export async function findBotForHuman(human: Identity): Promise<Identity | null> {
+  const botUsername = deriveBotUsername(human);
+  if (!botUsername) return null;
+  const botEmail = `${botUsername}@${BOT_EMAIL_DOMAIN}`;
+  const existing = await findIdentityByEmail(botEmail);
+  return existing && isBotOwnedBy(existing, human.id) ? existing : null;
 }
 
 // Issues a one-time recovery code an admin can hand to the user. Kratos

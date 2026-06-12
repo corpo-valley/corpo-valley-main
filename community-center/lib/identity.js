@@ -21,15 +21,21 @@
 // receives X-User-Id from the MCP gateway instead (no perm — MCP access is
 // owner-only at the gateway), so it keeps using resolveUser's fallbacks.
 //
-// Fallback: when the headers are absent (running the container locally, or a
-// project deployed before the header standard) we re-validate the forwarded
-// Kratos session cookie against Kratos, like this helper always did, and
-// report perm `write` so legacy behavior is unchanged.
+// Fallback: when the edge headers are absent (running the container locally),
+// we re-validate the forwarded Kratos session cookie against Kratos and report
+// perm `write`. This is DISABLED by default and only enabled when
+// CV_DEV_COOKIE_FALLBACK is set — inside the cluster the trusted edge headers
+// are always present, so a deployed container that somehow loses its auth-url
+// must fail closed (deny) rather than silently granting `write` to any
+// signed-in session.
 
 const KRATOS_URL = (process.env.KRATOS_PUBLIC_URL
   || '{{CV_KRATOS_PUBLIC_URL}}').replace(/\/+$/, '');
 
 const PERMS = new Set(['read', 'write', 'admin']);
+
+const DEV_COOKIE_FALLBACK = process.env.CV_DEV_COOKIE_FALLBACK === '1'
+  || process.env.CV_DEV_COOKIE_FALLBACK === 'true';
 
 const TTL_MS = 30_000;
 const NEG_TTL_MS = 3_000;
@@ -45,18 +51,24 @@ function sessionToken(cookieHeader) {
 }
 
 async function resolveUser(req) {
-  // Primary path: the trusted edge headers.
+  // Primary path: the trusted edge headers. The edge ALWAYS co-sends a valid
+  // X-CV-Perm with the id (nginx overwrites both from the portal's answer), so a
+  // present id with an absent/garbage perm means the request did NOT come
+  // through the platform edge — default-deny rather than inventing a permission.
   const headerId = req.headers['x-cv-user-id'];
   if (headerId) {
     const rawPerm = String(req.headers['x-cv-perm'] || '');
+    if (!PERMS.has(rawPerm)) return null;
     return {
       id: String(headerId),
       email: req.headers['x-cv-user-email'] ? String(req.headers['x-cv-user-email']) : undefined,
-      perm: PERMS.has(rawPerm) ? rawPerm : 'read',
+      perm: rawPerm,
     };
   }
 
-  // Fallback: validate the forwarded Kratos session cookie directly.
+  // Fallback (LOCAL DEV ONLY, off unless CV_DEV_COOKIE_FALLBACK is set): validate
+  // the forwarded Kratos session cookie directly. In-cluster this never runs.
+  if (!DEV_COOKIE_FALLBACK) return null;
   const cookieHeader = req.headers.cookie || '';
   const token = sessionToken(cookieHeader);
   if (!token) return null;

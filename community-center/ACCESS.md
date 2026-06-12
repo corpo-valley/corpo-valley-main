@@ -66,10 +66,15 @@ Rules of thumb:
 
 ## Local development
 
-Running a container outside the cluster, the headers are absent. `resolveUser` falls back to
-validating an `ory_kratos_session` cookie against Kratos (the pre-standard behavior, reported as
-`write`), or returns `null` with no cookie. Easiest local approximation: set the headers yourself
-with curl, e.g. `curl -H 'X-CV-User-Id: dev' -H 'X-CV-Perm: admin' …`.
+Running a container outside the cluster, the headers are absent. Easiest local approximation: set
+the headers yourself with curl, e.g. `curl -H 'X-CV-User-Id: dev' -H 'X-CV-Perm: admin' …`.
+
+There is also a cookie fallback: with `CV_DEV_COOKIE_FALLBACK=1` set, `resolveUser` validates an
+`ory_kratos_session` cookie against Kratos and reports `write`. **It is off by default and must never
+be enabled in a deployed container** — in the cluster the trusted edge headers are always present, so
+a deployment with the fallback off fails closed (denies) if its auth-url is ever misconfigured,
+instead of silently granting `write` to any signed-in member. A request carrying `X-CV-User-Id` but
+no valid `X-CV-Perm` (i.e. not through the platform edge) is likewise denied.
 
 ## MCP capability note
 

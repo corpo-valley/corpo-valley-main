@@ -12,6 +12,7 @@ import siteAccessRouter from './routes/site-access';
 import groupsRouter from './routes/groups';
 import { validateCsrf } from './middleware/csrf';
 import { migrate } from './services/projects';
+import { reconcileAllProjects } from './services/repo-access';
 import { backfillPinTokens } from './services/pin-token-backfill';
 import { seedCommunityCenterTemplate } from './services/template-seed';
 import { runWithNonce } from './lib/csp-nonce';
@@ -170,6 +171,22 @@ async function start() {
       (seeded.written !== undefined ? ` (${seeded.written} written, ${seeded.deleted} deleted)` : ''));
   } catch (err: any) {
     console.error('Community Center template seed failed:', err?.message);
+  }
+
+  // Periodic repo-access reconcile sweep. Triggered grant/default/membership
+  // changes are the fast path; this self-heals any converge step that failed
+  // transiently — above all a collaborator removal (revocation) a Gitea blip
+  // left stale, which would otherwise be silent write access. Interval is
+  // REPO_RECONCILE_INTERVAL_MS (default 30m); set to 0 to disable. unref() so
+  // the timer never holds the process open on shutdown.
+  const reconcileMs = parseInt(process.env.REPO_RECONCILE_INTERVAL_MS || '1800000', 10);
+  if (reconcileMs > 0) {
+    const timer = setInterval(() => {
+      reconcileAllProjects().catch((err: any) =>
+        console.error('[repo-access] periodic reconcile sweep failed:', err?.message));
+    }, reconcileMs);
+    timer.unref();
+    console.log(`Repo-access reconcile sweep every ${Math.round(reconcileMs / 1000)}s`);
   }
 
   app.listen(port, '0.0.0.0', () => {

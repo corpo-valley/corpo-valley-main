@@ -43,11 +43,15 @@ function requireInClusterCaller(req: Request, res: Response, next: NextFunction)
 // (response.ignore=true on the Kratos side, so signup latency doesn't depend
 // on us). The body only NAMES an identity id; the portal re-fetches the
 // canonical identity from the Kratos admin API and runs the same idempotent
-// ensureProvisioned the admin-create flow uses. That's why no shared secret
-// is needed: a forged in-cluster call can at worst trigger idempotent
-// provisioning of a real identity. The lazy backstop in the dashboard
-// (ensureProvisionedLazy) covers a hook delivery that flaked.
-router.post('/internal/hooks/registration', requireInClusterCaller, async (req: Request, res: Response) => {
+// ensureProvisioned the admin-create flow uses.
+//
+// Auth: requireInternalSecret (the X-Internal-Secret Kratos sends, configured
+// in the kratos-google-oidc sealed fragment) on top of the network-origin
+// guard. Without it ANY in-cluster pod — including tenant-controlled
+// gitea-runners — could POST here and trigger repeated provisioning fan-out
+// against real identities (finding F3). The lazy backstop in the dashboard
+// (ensureProvisionedLazy) still covers a hook delivery that flaked.
+router.post('/internal/hooks/registration', requireInClusterCaller, requireInternalSecret, async (req: Request, res: Response) => {
   const identityId = String(req.body?.identity_id || '');
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identityId)) {
     res.status(400).json({ error: 'identity_id required' });

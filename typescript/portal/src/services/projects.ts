@@ -368,14 +368,21 @@ export async function updateProjectDefaults(
   return rows[0] ?? null;
 }
 
-// Projects whose repo default grants every member `write` — the Gitea
-// collaborator fan-out set a newly provisioned user must be added to. The
-// COALESCE mirrors repoDefaultAccess()'s lazy legacy derivation.
-export async function listProjectsWithRepoDefaultWrite(): Promise<Project[]> {
+// Projects whose repo default shares the repo with every member (`read` or
+// `write`) — the Gitea collaborator fan-out set a newly provisioned user must be
+// added to. The COALESCE mirrors repoDefaultAccess()'s lazy legacy derivation
+// (legacy rows only ever derive `write` or `none`, never `read`).
+export async function listProjectsWithSharedRepoDefault(): Promise<Project[]> {
   const { rows } = await pool.query<Project>(
     `SELECT * FROM projects
-     WHERE COALESCE(repo_default_access, CASE WHEN repo_access = 'shared-edit' THEN 'write' ELSE 'none' END) = 'write'`
+     WHERE COALESCE(repo_default_access, CASE WHEN repo_access = 'shared-edit' THEN 'write' ELSE 'none' END) IN ('read', 'write')`
   );
+  return rows;
+}
+
+// Every project, for the periodic repo-access reconcile sweep.
+export async function listAllProjects(): Promise<Project[]> {
+  const { rows } = await pool.query<Project>('SELECT * FROM projects ORDER BY created_at');
   return rows;
 }
 

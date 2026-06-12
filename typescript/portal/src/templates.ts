@@ -1797,8 +1797,22 @@ export function renderAdminUsers(
 export function renderAdminUserDetail(
   user: UserRow,
   email: string,
-  csrf: string = ''
+  csrf: string = '',
+  isSelf: boolean = false,
 ): string {
+  // Danger zone — irreversible delete. Hidden for the acting admin's own row
+  // (the route refuses a self-delete anyway).
+  const dangerZone = isSelf ? '' : `
+    <h3 style="margin-top:1.5rem;color:var(--danger,#c0392b);">Danger Zone</h3>
+    <p class="help">Permanently delete this user and everything attached to them — owned projects
+      (and their repos, namespaces, and databases), owned groups, group memberships, access grants,
+      API keys, the admin role, and the paired bot account. This cannot be undone.</p>
+    <form method="POST" action="/admin/users/${escapeHtml(user.id)}/delete"
+          data-confirm="Permanently delete ${escapeHtml(user.email)} and ALL their projects, repos, and data? This cannot be undone.">
+      ${csrf}
+      <button type="submit" class="btn btn-danger">Delete user</button>
+    </form>
+  `;
   const body = `
     <p style="margin-bottom:1rem;"><a href="/admin/users" class="btn btn-secondary btn-sm">Back to Users</a></p>
     <table class="table">
@@ -1850,6 +1864,7 @@ export function renderAdminUserDetail(
       ${csrf}
       <button type="submit" class="btn btn-secondary">Generate Recovery Code</button>
     </form>
+    ${dangerZone}
   `;
   return dashboardLayout(`User: ${user.email}`, body, email, true, 'users');
 }

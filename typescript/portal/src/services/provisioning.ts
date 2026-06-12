@@ -15,8 +15,9 @@
 import { Identity } from '@ory/client';
 import { ensureBotForHuman, getIdentity } from './kratos-admin';
 import { provisionGiteaForIdentities } from './gitea';
+import { resolveGiteaUsername } from './gitea-identity';
 import { isReservedUsername } from './reserved-names';
-import { addMemberToDefaultWriteRepos, giteaUsernameForIdentity } from './repo-access';
+import { addMemberToDefaultAccessRepos } from './repo-access';
 
 // Idempotent. Best-effort: each step is wrapped so a downstream hiccup (Gitea
 // outage, Keto blip) can't abort the others or bubble out to the caller.
@@ -38,6 +39,17 @@ export async function ensureProvisioned(identity: Identity): Promise<void> {
     return;
   }
 
+  // Assign (and persist to Kratos) the canonical, Gitea-unique login BEFORE
+  // anything else — bot derivation, the Gitea account, and the collaborator
+  // fan-out all key off the resulting preferred_username, so they must agree on
+  // a single non-colliding name (finding F2).
+  let username: string | null = null;
+  try {
+    username = await resolveGiteaUsername(identity);
+  } catch (err: any) {
+    console.error('[provision] canonical username resolution failed', identity.id, err?.message);
+  }
+
   let bot: Identity | null = null;
   try {
     bot = await ensureBotForHuman(identity);
@@ -51,13 +63,13 @@ export async function ensureProvisioned(identity: Identity): Promise<void> {
     console.error('[provision] Gitea provisioning failed', identity.id, err?.message);
   }
 
-  // Default-`write` repos advertise "any member can push"; Gitea has no such
-  // switch, so each new member is fanned out as a write collaborator.
+  // Repos with a `read`/`write` default advertise "any member may read/push";
+  // Gitea (and our always-private repos) have no such switch, so each new member
+  // is fanned out as a collaborator at the default's level.
   try {
-    const username = giteaUsernameForIdentity(identity);
-    if (username) await addMemberToDefaultWriteRepos(username, identity.id);
+    if (username) await addMemberToDefaultAccessRepos(username, identity.id);
   } catch (err: any) {
-    console.error('[provision] default-write repo fan-out failed', identity.id, err?.message);
+    console.error('[provision] default-access repo fan-out failed', identity.id, err?.message);
   }
 }
 
