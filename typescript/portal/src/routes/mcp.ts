@@ -231,11 +231,16 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   // allow-list client_ids, because legitimate MCP clients register dynamically
   // (DCR) with random ids. So we DENY the first-party clients that the consent
   // flow auto-trusts — those are exactly the confused-deputy risk (their tokens
-  // carry the user's sub and skip consent). The denylist defaults to the SAME
-  // value as the consent allow-list (TRUSTED_CLIENT_IDS) so the two can't drift:
-  // onboarding a new SSO client (e.g. argocd) auto-denies it here too. The
-  // static `claude-code-mcp` client and DCR clients aren't trusted-for-consent,
-  // so they pass.
+  // carry the user's sub and skip consent).
+  //
+  // Set MCP_DENY_CLIENT_IDS EXPLICITLY in deployment (the chart wires it from
+  // `mcp.denyClientIds` to this portal AND the mcp-gateway, so the two enforce
+  // identically). The in-code fallback to TRUSTED_CLIENT_IDS is a safety net
+  // for non-chart deploys — but beware: it denies EVERY trusted client, and a
+  // deployment that trusts an MCP-driver client for consent (e.g. the static
+  // `claude-code-mcp`) would deny the one client that's supposed to reach MCP.
+  // That's why the chart's deny list is `argocd,gitea` (SSO clients only),
+  // not the trusted list. DCR clients aren't trusted-for-consent, so they pass.
   const DENY_CLIENT_IDS = (process.env.MCP_DENY_CLIENT_IDS || process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea')
     .split(',').map((s) => s.trim()).filter(Boolean);
   if (introspection.client_id && DENY_CLIENT_IDS.includes(introspection.client_id)) {

@@ -53,6 +53,17 @@ export async function updateIdentityTraits(
   return data;
 }
 
+// Delete an identity. Idempotent — a 404 (already gone) is success. Used by the
+// admin user-delete cascade for both the human and its paired .bot identity.
+export async function deleteIdentity(id: string): Promise<void> {
+  try {
+    await identityApi.deleteIdentity({ id });
+  } catch (err: any) {
+    if (err?.response?.status === 404) return;
+    throw err;
+  }
+}
+
 export interface RecoveryCode {
   recovery_code: string;
   recovery_link: string;
@@ -93,7 +104,8 @@ function nextIdentitiesPageToken(linkHeader: unknown): string | undefined {
 // match beyond the first page — e.g. a squatter on `<victim>.bot@…` sorted past
 // the first 250 identities — is still found (the bot-ownership backstop in
 // ensureBotForHuman relies on this pre-check seeing the collision).
-async function findIdentityByEmail(email: string): Promise<Identity | null> {
+// Exported for the grant/group-member pickers (routes/groups.ts, dashboard).
+export async function findIdentityByEmail(email: string): Promise<Identity | null> {
   const target = email.toLowerCase();
   let pageToken: string | undefined;
   for (let page = 0; page < 1000; page++) {
@@ -107,6 +119,45 @@ async function findIdentityByEmail(email: string): Promise<Identity | null> {
     pageToken = next;
   }
   return null;
+}
+
+// Look up an identity by its preferred_username trait. Same cursor walk as
+// findIdentityByEmail (Kratos has no trait lookup). Bots match too — callers
+// that must exclude them check metadata_public.type.
+export async function findIdentityByUsername(username: string): Promise<Identity | null> {
+  const target = username.toLowerCase();
+  let pageToken: string | undefined;
+  for (let page = 0; page < 1000; page++) {
+    const resp = await identityApi.listIdentities({ pageSize: 250, pageToken });
+    const hit = resp.data.find(
+      (i) => ((i.traits as any) ?? {}).preferred_username?.toLowerCase() === target,
+    );
+    if (hit) return hit;
+    const next = nextIdentitiesPageToken((resp.headers as Record<string, unknown> | undefined)?.link);
+    if (!next) break;
+    pageToken = next;
+  }
+  return null;
+}
+
+// Every human identity (bots excluded), capped. Used by the Gitea reconciler's
+// default-`write` collaborator fan-out; the cap bounds a runaway directory.
+export async function listAllHumanIdentities(cap: number = 2000): Promise<Identity[]> {
+  const out: Identity[] = [];
+  let pageToken: string | undefined;
+  while (out.length < cap) {
+    const resp = await identityApi.listIdentities({ pageSize: 250, pageToken });
+    for (const i of resp.data) {
+      const meta = (i.metadata_public ?? {}) as Record<string, any>;
+      if (meta.type === 'bot') continue;
+      out.push(i);
+      if (out.length >= cap) break;
+    }
+    const next = nextIdentitiesPageToken((resp.headers as Record<string, unknown> | undefined)?.link);
+    if (!next) break;
+    pageToken = next;
+  }
+  return out;
 }
 
 // Idempotently provision a `<username>.bot` companion identity for a human.
@@ -164,6 +215,18 @@ export async function ensureBotForHuman(human: Identity): Promise<Identity | nul
     }
     throw err;
   }
+}
+
+// Resolve the .bot identity paired with a human, or null if none exists. Only
+// returns an identity genuinely tagged as this human's bot (same ownership
+// backstop ensureBotForHuman uses), so the user-delete cascade can never reap a
+// squatted or unrelated identity.
+export async function findBotForHuman(human: Identity): Promise<Identity | null> {
+  const botUsername = deriveBotUsername(human);
+  if (!botUsername) return null;
+  const botEmail = `${botUsername}@${BOT_EMAIL_DOMAIN}`;
+  const existing = await findIdentityByEmail(botEmail);
+  return existing && isBotOwnedBy(existing, human.id) ? existing : null;
 }
 
 // Issues a one-time recovery code an admin can hand to the user. Kratos

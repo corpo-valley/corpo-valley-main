@@ -8,8 +8,11 @@ import adminRouter from './routes/admin';
 import internalRouter from './routes/internal';
 import mcpRouter from './routes/mcp';
 import docsRouter from './routes/docs';
+import siteAccessRouter from './routes/site-access';
+import groupsRouter from './routes/groups';
 import { validateCsrf } from './middleware/csrf';
 import { migrate } from './services/projects';
+import { reconcileAllProjects } from './services/repo-access';
 import { backfillPinTokens } from './services/pin-token-backfill';
 import { seedCommunityCenterTemplate } from './services/template-seed';
 import { runWithNonce } from './lib/csp-nonce';
@@ -48,6 +51,12 @@ const HYDRA_BROWSER_ORIGIN = (() => {
   }
 })();
 
+// Google OIDC: the Kratos login/registration form POST 303s to
+// accounts.google.com; Chromium enforces form-action across the redirect
+// chain (same mechanism as HYDRA_BROWSER_ORIGIN above).
+const GOOGLE_FORM_ACTION_ORIGIN =
+  process.env.GOOGLE_LOGIN_ENABLED === 'true' ? 'https://accounts.google.com' : '';
+
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
@@ -85,10 +94,11 @@ app.use((req, res, next) => {
       "object-src 'none'",
       "base-uri 'self'",
       // 'self' for the portal's own POSTs (consent, logout, dashboard/admin),
-      // the Kratos origin for the auth-flow forms, and the Hydra origin for the
-      // login-form 303 that continues an OAuth login_challenge (see
-      // KRATOS_BROWSER_ORIGIN / HYDRA_BROWSER_ORIGIN above).
-      `form-action 'self'${[KRATOS_BROWSER_ORIGIN, HYDRA_BROWSER_ORIGIN].filter(Boolean).map((o) => ' ' + o).join('')}`,
+      // the Kratos origin for the auth-flow forms, the Hydra origin for the
+      // login-form 303 that continues an OAuth login_challenge, and (when Google
+      // login is on) accounts.google.com for the OIDC 303 (see
+      // KRATOS_BROWSER_ORIGIN / HYDRA_BROWSER_ORIGIN / GOOGLE_FORM_ACTION_ORIGIN above).
+      `form-action 'self'${[KRATOS_BROWSER_ORIGIN, HYDRA_BROWSER_ORIGIN, GOOGLE_FORM_ACTION_ORIGIN].filter(Boolean).map((o) => ' ' + o).join('')}`,
       "frame-ancestors 'none'",
     ].join('; '),
   );
@@ -107,6 +117,10 @@ app.use(hydraRouter);
 // Internal webhooks (cluster-only, no CSRF, no session — Kratos posts here)
 app.use(internalRouter);
 
+// Project-site auth subrequests from ingress-nginx (GET-only, validates the
+// forwarded Kratos cookie itself — no session middleware, no CSRF).
+app.use(siteAccessRouter);
+
 // MCP server (Bearer-token auth via Hydra introspection; no CSRF, no
 // session cookies). Mounted BEFORE the CSRF middleware below so it isn't
 // caught by it.
@@ -119,9 +133,13 @@ app.use(docsRouter);
 app.use('/projects', validateCsrf);
 app.use('/keys', validateCsrf);
 app.use('/admin', validateCsrf);
+app.use('/groups', validateCsrf);
 
 // Admin routes (session + admin required) — scoped to /admin
 app.use('/admin', adminRouter);
+
+// Groups (session required)
+app.use(groupsRouter);
 
 // Dashboard routes (session required) — last since it has GET /
 app.use(dashboardRouter);
@@ -160,6 +178,22 @@ async function start() {
       (seeded.written !== undefined ? ` (${seeded.written} written, ${seeded.deleted} deleted)` : ''));
   } catch (err: any) {
     console.error('Community Center template seed failed:', err?.message);
+  }
+
+  // Periodic repo-access reconcile sweep. Triggered grant/default/membership
+  // changes are the fast path; this self-heals any converge step that failed
+  // transiently — above all a collaborator removal (revocation) a Gitea blip
+  // left stale, which would otherwise be silent write access. Interval is
+  // REPO_RECONCILE_INTERVAL_MS (default 30m); set to 0 to disable. unref() so
+  // the timer never holds the process open on shutdown.
+  const reconcileMs = parseInt(process.env.REPO_RECONCILE_INTERVAL_MS || '1800000', 10);
+  if (reconcileMs > 0) {
+    const timer = setInterval(() => {
+      reconcileAllProjects().catch((err: any) =>
+        console.error('[repo-access] periodic reconcile sweep failed:', err?.message));
+    }, reconcileMs);
+    timer.unref();
+    console.log(`Repo-access reconcile sweep every ${Math.round(reconcileMs / 1000)}s`);
   }
 
   app.listen(port, '0.0.0.0', () => {

@@ -84,14 +84,17 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
-interface GiteaUser {
+export interface GiteaUser {
   id: number;
   login: string;
   email?: string;
 }
 
 // Resolve a username to a Gitea user record, or null if it doesn't exist yet.
-async function getUser(username: string): Promise<GiteaUser | null> {
+// Exported as getGiteaUser for the canonical-username resolver
+// (services/gitea-identity.ts), which uses the account's email to tell a
+// genuine re-provision from a username collision with a DIFFERENT identity.
+export async function getGiteaUser(username: string): Promise<GiteaUser | null> {
   try {
     return await call<GiteaUser>(`/users/${encodeURIComponent(username)}`);
   } catch (err) {
@@ -111,8 +114,22 @@ export async function ensureUser(opts: {
 }): Promise<void> {
   if (!giteaEnabled()) return;
 
-  const existing = await getUser(opts.username);
-  if (existing) return;
+  // Collision safety: a username already held by a Gitea account whose email is
+  // NOT this caller's must never be treated as success — doing so maps two
+  // Kratos identities onto one Gitea account, so a repo grant for one lands on
+  // the other (privilege misassignment). Only a same-email match is an
+  // idempotent re-provision. The canonical-username resolver normally hands us a
+  // deduped name, so a foreign collision here is the rare TOCTOU/legacy case;
+  // throw so the caller logs it rather than silently sharing the account.
+  const sameEmail = (a?: string, b?: string) =>
+    !!a && !!b && a.toLowerCase() === b.toLowerCase();
+  const existing = await getGiteaUser(opts.username);
+  if (existing) {
+    if (sameEmail(existing.email, opts.email)) return;
+    throw new GiteaApiError(409, {
+      message: `username "${opts.username}" is held by a different Gitea account — refusing to reuse it`,
+    });
+  }
 
   const password = randomHex(32);
   try {
@@ -130,10 +147,36 @@ export async function ensureUser(opts: {
       }),
     });
   } catch (err) {
-    // Race / pre-existing: another caller created it, or username/email taken.
+    // Race: another caller created it concurrently. Re-fetch and accept ONLY if
+    // it's the same person (same email); otherwise it's a collision — surface it.
     if (err instanceof GiteaApiError && (err.status === 409 || alreadyExists(err))) {
-      return;
+      const after = await getGiteaUser(opts.username);
+      if (after && sameEmail(after.email, opts.email)) return;
+      throw new GiteaApiError(409, {
+        message: `username "${opts.username}" collided with a different Gitea account during create`,
+      });
     }
+    throw err;
+  }
+}
+
+// Delete a Gitea user account (and, with purge, its owned repos/org memberships).
+// Idempotent — a 404 (already gone) is success. Used by the admin user-delete
+// cascade. Platform-reserved accounts (cvportal, etc.) are refused outright so a
+// bug can never reap the site-admin account; the cascade passes allowBot for the
+// paired `<name>.bot` account, which IS meant to be reaped here (the `.bot`
+// suffix is otherwise reserved only to stop humans impersonating bots).
+export async function deleteGiteaUser(username: string, opts: { allowBot?: boolean } = {}): Promise<void> {
+  if (!giteaEnabled()) return;
+  const isBotName = typeof username === 'string' && username.toLowerCase().endsWith('.bot');
+  const reserved = isReservedUsername(username) && !(opts.allowBot && isBotName);
+  if (reserved || !isValidUsername(username)) {
+    throw new GiteaApiError(0, { message: `refusing to delete reserved or invalid Gitea user "${username}"` });
+  }
+  try {
+    await call(`/admin/users/${encodeURIComponent(username)}?purge=true`, { method: 'DELETE' });
+  } catch (err) {
+    if (err instanceof GiteaApiError && err.status === 404) return;
     throw err;
   }
 }
@@ -409,6 +452,95 @@ export async function deleteRepo(opts: { owner: string; repo: string }): Promise
     if (err instanceof GiteaApiError && err.status === 404) return;
     throw err;
   }
+}
+
+// ── Collaborators & repo visibility (project access grants) ───────────────
+//
+// Repo-area grants (read/write/admin) map 1:1 onto Gitea collaborator
+// permissions. Project repos are ALWAYS kept private: they are owned by the
+// project owner's personal Gitea account, which has no org-internal visibility
+// tier — a non-private user repo is world-readable (anonymously cloneable),
+// which would expose tenant source. So member read/write access is materialised
+// purely as collaborators (services/repo-access.ts converges the set);
+// setRepoVisibility only ever re-asserts `private` as a backstop.
+
+export type GiteaRepoPermission = 'read' | 'write' | 'admin';
+
+// Current collaborators with their effective permission level. Gitea reports
+// permissions as a {admin, push, pull} object; collapse to our three levels.
+export async function listCollaborators(opts: {
+  owner: string; repo: string;
+}): Promise<Array<{ username: string; permission: GiteaRepoPermission }>> {
+  if (!giteaEnabled()) return [];
+  const out: Array<{ username: string; permission: GiteaRepoPermission }> = [];
+  // Default-write fan-out can produce hundreds of collaborators; page through
+  // (50/page, hard cap 40 pages = 2000) rather than truncating silently.
+  for (let page = 1; page <= 40; page++) {
+    let res: Array<{ login: string; permissions?: { admin?: boolean; push?: boolean; pull?: boolean } }>;
+    try {
+      res = await call(
+        `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/collaborators?limit=50&page=${page}`
+      );
+    } catch (err) {
+      if (err instanceof GiteaApiError && err.status === 404) return out;
+      throw err;
+    }
+    if (!Array.isArray(res) || res.length === 0) break;
+    for (const c of res) {
+      out.push({
+        username: c.login,
+        permission: c.permissions?.admin ? 'admin' : c.permissions?.push ? 'write' : 'read',
+      });
+    }
+    if (res.length < 50) break;
+  }
+  return out;
+}
+
+// Add or update a collaborator at a permission level. Idempotent — Gitea's
+// PUT both creates and updates. Same reserved-name backstop as
+// mintUserCliToken: never let a grant target a platform account.
+export async function setCollaborator(opts: {
+  owner: string; repo: string; username: string; permission: GiteaRepoPermission;
+}): Promise<void> {
+  if (!giteaEnabled()) return;
+  if (isReservedUsername(opts.username) || !isValidUsername(opts.username)) {
+    throw new GiteaApiError(0, { message: `refusing to add reserved or invalid collaborator "${opts.username}"` });
+  }
+  await call(
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/collaborators/${encodeURIComponent(opts.username)}`,
+    { method: 'PUT', body: JSON.stringify({ permission: opts.permission }) }
+  );
+}
+
+// Remove a collaborator. Idempotent — 404 (not a collaborator / no such user)
+// is success.
+export async function removeCollaborator(opts: {
+  owner: string; repo: string; username: string;
+}): Promise<void> {
+  if (!giteaEnabled()) return;
+  try {
+    await call(
+      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/collaborators/${encodeURIComponent(opts.username)}`,
+      { method: 'DELETE' }
+    );
+  } catch (err) {
+    if (err instanceof GiteaApiError && err.status === 404) return;
+    throw err;
+  }
+}
+
+// Set a repo's private flag. Idempotent PATCH. Project repos are always kept
+// private (see the section header) — callers pass `private: true`; the
+// parameter is kept general only so the reconciler can re-assert it.
+export async function setRepoVisibility(opts: {
+  owner: string; repo: string; private: boolean;
+}): Promise<void> {
+  if (!giteaEnabled()) return;
+  await call(
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}`,
+    { method: 'PATCH', body: JSON.stringify({ private: opts.private }) }
+  );
 }
 
 // ── Pull requests ──────────────────────────────────────────────────────────
@@ -863,9 +995,18 @@ export async function provisionGiteaForIdentities(
   const collect = (id: { traits?: any } | null) => {
     if (!id) return;
     const traits = (id.traits ?? {}) as Record<string, any>;
-    const username = traits.preferred_username;
     const email = traits.email;
+    // Username convention: preferred_username, else the email local part —
+    // Google-signup identities carry no username trait but still need a Gitea
+    // account for repo grants. Reserved/invalid derivations are refused (the
+    // same backstop mintUserCliToken enforces).
+    const username = traits.preferred_username
+      || (typeof email === 'string' && email.includes('@') ? email.split('@')[0] : null);
     if (!username || !email) return;
+    if (!isValidUsername(username) || isReservedUsername(username)) {
+      console.warn('[gitea] skipping account provisioning for reserved/invalid derived username', username);
+      return;
+    }
     const first = traits?.name?.first || '';
     const last = traits?.name?.last || '';
     const fullName = `${first} ${last}`.trim() || undefined;

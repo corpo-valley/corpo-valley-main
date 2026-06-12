@@ -16,6 +16,15 @@ const SITE_FOOTER = `
       <a href="https://github.com/corpo-valley/corpo-valley-main" target="_blank" rel="noopener noreferrer">${GITHUB_SVG}corpo-valley on GitHub</a>
     </footer>`;
 
+// Deployment-specific public URLs — the portal receives these as env vars
+// (chart 20-portal.yaml: GITEA_PUBLIC_URL / PROJECTS_DOMAIN). The corpo-valley.com
+// fallbacks are only for local/unset dev; every rendered link must derive from
+// these so a deployment on another domain doesn't get corpo-valley.com links.
+const GITEA_PUBLIC_URL = (process.env.GITEA_PUBLIC_URL || 'https://gitea.corpo-valley.com').replace(/\/+$/, '');
+const PROJECTS_DOMAIN = (process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com').replace(/^[.]+|[/]+$/g, '');
+// Build a project's public site URL from its slug.
+function projectSiteUrl(slug: string): string { return `https://${slug}.${PROJECTS_DOMAIN}`; }
+
 // Warm valley palette: deep soil-night background, parchment text, harvest
 // gold + leaf green accents.
 const CSS = `
@@ -627,6 +636,7 @@ function dashboardLayout(
 ): string {
   const navItems: NavItem[] = [
     { label: 'Projects', href: '/', key: 'projects' },
+    { label: 'Groups', href: '/groups', key: 'groups' },
     { label: 'Connect Claude Code', href: '/connect', key: 'connect' },
   ];
   let adminNav = '';
@@ -712,13 +722,34 @@ export interface ProjectRow {
   id: string;
   slug: string;
   name: string;
-  serviceAccess: string;
-  repoAccess: string;
+  // Default access every signed-in member gets, per area: none|read|write.
+  // Explicit grants layer on top (see renderProjectDetail's Access section).
+  siteDefault: string;
+  repoDefault: string;
   createdAt: string;
   giteaRepo?: string | null;
   // True when k8s/postgres.yaml exists in the project repo — the Database
   // card uses this to choose the enable vs. remove control.
   postgresEnabled?: boolean;
+}
+
+// A project shared with the viewer via a grant, with their effective levels.
+export interface SharedProjectRow extends ProjectRow {
+  sitePerm: string;
+  repoPerm: string;
+}
+
+export interface ProjectGrantRow {
+  id: string;
+  subject_type: string;
+  subject_name: string | null;
+  site_perm: string | null;
+  repo_perm: string | null;
+}
+
+export interface GroupOptionRow {
+  name: string;
+  memberCount: number;
 }
 
 function accessBadge(value: string): string {
@@ -728,7 +759,8 @@ function accessBadge(value: string): string {
 export function renderProjects(
   email: string,
   projects: ProjectRow[],
-  isAdmin: boolean
+  isAdmin: boolean,
+  shared: SharedProjectRow[] = []
 ): string {
   let body = `
     <p class="tagline">Your patch of the valley — every app starts as a project.${isAdmin ? ` ${roleBadge(true)}` : ''}</p>
@@ -753,20 +785,42 @@ export function renderProjects(
   } else {
     body += '<div class="app-grid">';
     for (const p of projects) {
-      const url = `https://${escapeHtml(p.slug)}.projects.corpo-valley.com`;
+      const url = projectSiteUrl(escapeHtml(p.slug));
       body += `
         <div class="app-card">
           <div class="app-card-header">
             <span class="app-card-name">${escapeHtml(p.name)}</span>
           </div>
-          <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.projects.corpo-valley.com ↗</a></div>
-          <div class="app-card-sub" style="margin-top:0.4rem;">Service: ${accessBadge(p.serviceAccess)} &nbsp; Repo: ${accessBadge(p.repoAccess)}</div>
+          <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
+          <div class="app-card-sub" style="margin-top:0.4rem;">Members: site ${accessBadge(p.siteDefault)} &nbsp; repo ${accessBadge(p.repoDefault)}</div>
           <div class="app-card-actions">
-            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-secondary">Open</a>
+            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-secondary">Edit</a>
             ${p.giteaRepo
-              ? `<a href="https://gitea.corpo-valley.com/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a>`
+              ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a>`
               : ''}
           </div>
+        </div>`;
+    }
+    body += '</div>';
+  }
+
+  if (shared.length > 0) {
+    body += `
+      <h3 style="color:#fdf6e8;margin-top:2rem;">Shared with you</h3>
+      <p class="help">Projects other members granted you (or one of your groups) access to.</p>
+      <div class="app-grid">`;
+    for (const p of shared) {
+      const url = projectSiteUrl(escapeHtml(p.slug));
+      body += `
+        <div class="app-card">
+          <div class="app-card-header">
+            <span class="app-card-name">${escapeHtml(p.name)}</span>
+          </div>
+          <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
+          <div class="app-card-sub" style="margin-top:0.4rem;">Your access: site ${accessBadge(p.sitePerm)} &nbsp; repo ${accessBadge(p.repoPerm)}</div>
+          ${p.giteaRepo && p.repoPerm !== 'none'
+            ? `<div class="app-card-actions"><a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a></div>`
+            : ''}
         </div>`;
     }
     body += '</div>';
@@ -775,8 +829,8 @@ export function renderProjects(
   return dashboardLayout('Projects', body, email, isAdmin, 'projects');
 }
 
-const SERVICE_ACCESS_OPTS = ['private', 'shared'];
-const REPO_ACCESS_OPTS = ['private-edit', 'shared-edit'];
+const DEFAULT_ACCESS_OPTS = ['none', 'read', 'write'];
+const GRANT_LEVEL_OPTS = ['read', 'write', 'admin'];
 
 function selectOptions(opts: string[], selected: string): string {
   return opts.map(o => `<option value="${escapeHtml(o)}"${o === selected ? ' selected' : ''}>${escapeHtml(o)}</option>`).join('');
@@ -787,7 +841,7 @@ export function renderProjectCreate(
   isAdmin: boolean,
   csrf: string = '',
   errorMessage: string = '',
-  prefill: { slug?: string; name?: string; service_access?: string; repo_access?: string; visibility?: string; database?: boolean; mcp?: boolean } = {}
+  prefill: { slug?: string; name?: string; site_default_access?: string; repo_default_access?: string; visibility?: string; database?: boolean; mcp?: boolean } = {}
 ): string {
   const errorBanner = errorMessage
     ? `<div class="message error" style="margin-bottom:1rem;">${escapeHtml(errorMessage)}</div>`
@@ -796,10 +850,10 @@ export function renderProjectCreate(
   // Map prefill back to a visibility preset. Anything that doesn't fall
   // into one of the two named presets re-opens the advanced section as Custom.
   const preset = ((): string => {
-    const sa = prefill.service_access, ra = prefill.repo_access;
+    const sa = prefill.site_default_access, ra = prefill.repo_default_access;
     if (!sa && !ra) return prefill.visibility || 'private';
-    if (sa === 'private' && ra === 'private-edit') return 'private';
-    if (sa === 'shared' && ra === 'shared-edit') return 'internal';
+    if (sa === 'none' && ra === 'none') return 'private';
+    if (sa === 'write' && ra === 'write') return 'internal';
     return 'custom';
   })();
 
@@ -828,7 +882,7 @@ export function renderProjectCreate(
 
     <div class="app-card">
       <h2 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:1.4rem;">Plant a new project</h2>
-      <p class="help" style="margin-bottom:1.25rem;">A project is a Gitea repo, an auto-deployed site at <code>&lt;slug&gt;.projects.corpo-valley.com</code>, and the wiring to point Claude Code at it.</p>
+      <p class="help" style="margin-bottom:1.25rem;">A project is a Gitea repo, an auto-deployed site at <code>&lt;slug&gt;.${escapeHtml(PROJECTS_DOMAIN)}</code>, and the wiring to point Claude Code at it.</p>
 
       <form method="POST" action="/projects" id="cv-project-form">
         ${csrf}
@@ -839,7 +893,7 @@ export function renderProjectCreate(
                  placeholder="My farm stand"
                  autofocus>
           <p class="help" style="margin-top:0.4rem;">
-            Your URL will be <code><span id="cv-slug-display" style="color:#e8b94a;">&lt;slug&gt;</span>.projects.corpo-valley.com</code>
+            Your URL will be <code><span id="cv-slug-display" style="color:#e8b94a;">&lt;slug&gt;</span>.${escapeHtml(PROJECTS_DOMAIN)}</code>
             <a href="#" id="cv-slug-edit" style="margin-left:0.5rem;color:#a89878;font-size:0.8rem;">edit slug</a>
           </p>
           <div id="cv-slug-wrap" style="display:${prefill.slug ? 'block' : 'none'};margin-top:0.5rem;">
@@ -863,24 +917,24 @@ export function renderProjectCreate(
         <div class="field">
           <label>Who can see it?</label>
           <div id="cv-visibility-group" style="display:flex;flex-direction:column;gap:0.4rem;">
-            ${radio('private', 'Private', 'Only you can see the repo. The deployed site requires sign-in.')}
-            ${radio('custom', 'Custom', 'Pick repo and service access independently in the advanced section below.')}
-            ${radio('internal', 'Internal', 'Visible to other Corpo Valley members. The deployed site still requires sign-in — Corpo Valley does not publish projects publicly.')}
+            ${radio('private', 'Private', 'Only you. Grant individual members or groups access later from the project page.')}
+            ${radio('custom', 'Custom', 'Pick the site and repo defaults independently in the advanced section below.')}
+            ${radio('internal', 'Internal', 'Every Corpo Valley member can use the site and edit the repo. Still sign-in-gated — Corpo Valley does not publish projects publicly.')}
           </div>
         </div>
 
         <details style="margin:1rem 0;"${preset === 'custom' ? ' open' : ''}>
-          <summary style="cursor:pointer;color:#a89878;font-size:0.85rem;">Advanced: customise per-axis access</summary>
+          <summary style="cursor:pointer;color:#a89878;font-size:0.85rem;">Advanced: customise the member defaults</summary>
           <div style="margin-top:0.6rem;padding-left:0.5rem;border-left:2px solid #5a4a36;">
-            <p class="help">If you set either select below, it overrides the preset.</p>
+            <p class="help">The default every signed-in member gets, per area (none / read / write). Explicit user and group grants layer on top from the project page. If you set either select, it overrides the preset.</p>
             <div class="form-row">
               <div class="field">
-                <label for="service_access">Service access</label>
-                <select name="service_access" id="service_access"><option value="">(use preset)</option>${selectOptions(SERVICE_ACCESS_OPTS, prefill.service_access || '')}</select>
+                <label for="site_default_access">Site default</label>
+                <select name="site_default_access" id="site_default_access"><option value="">(use preset)</option>${selectOptions(DEFAULT_ACCESS_OPTS, prefill.site_default_access || '')}</select>
               </div>
               <div class="field">
-                <label for="repo_access">Repo access</label>
-                <select name="repo_access" id="repo_access"><option value="">(use preset)</option>${selectOptions(REPO_ACCESS_OPTS, prefill.repo_access || '')}</select>
+                <label for="repo_default_access">Repo default</label>
+                <select name="repo_default_access" id="repo_default_access"><option value="">(use preset)</option>${selectOptions(DEFAULT_ACCESS_OPTS, prefill.repo_default_access || '')}</select>
               </div>
             </div>
           </div>
@@ -988,7 +1042,9 @@ export function renderProjectDetail(
   project: ProjectRow,
   csrf: string = '',
   secrets: ProjectSecretRow[] = [],
-  secretMessage: { type: 'error' | 'success'; text: string } | null = null
+  secretMessage: { type: 'error' | 'success'; text: string } | null = null,
+  grants: ProjectGrantRow[] = [],
+  groups: GroupOptionRow[] = []
 ): string {
   const secretsList = secrets.length === 0
     ? '<div class="message info">No secrets yet.</div>'
@@ -1016,7 +1072,7 @@ export function renderProjectDetail(
     : '';
 
   const cloneCommands = project.giteaRepo
-    ? `git clone https://gitea.corpo-valley.com/${escapeHtml(project.giteaRepo)}.git
+    ? `git clone ${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}.git
 cd ${escapeHtml(project.slug)}
 claude`
     : '';
@@ -1027,13 +1083,13 @@ claude`
     <div class="app-card">
       <h2 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:1.4rem;">${escapeHtml(project.name)}</h2>
       <div style="margin-bottom:0.5rem;">
-        <a href="https://${escapeHtml(project.slug)}.projects.corpo-valley.com" target="_blank" rel="noopener" style="color:#e8b94a;font-size:0.95rem;">
-          ${escapeHtml(project.slug)}.projects.corpo-valley.com ↗
+        <a href="${projectSiteUrl(escapeHtml(project.slug))}" target="_blank" rel="noopener" style="color:#e8b94a;font-size:0.95rem;">
+          ${escapeHtml(project.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗
         </a>
       </div>
       <div style="font-size:0.8rem;color:#a89878;">
         ${project.giteaRepo
-          ? `<a href="https://gitea.corpo-valley.com/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `
+          ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `
           : ''}Created ${escapeHtml(project.createdAt)} · <code>${escapeHtml(project.slug)}</code>
       </div>
     </div>
@@ -1153,20 +1209,78 @@ claude`
       <hr style="border:none;border-top:1px solid #5a4a36;margin:1.5rem 0 1rem 0;" />
 
       <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Access</h4>
-      <p class="help" style="margin-bottom:0.75rem;">Who can see this project's running service and edit its repository.</p>
+      <p class="help" style="margin-bottom:0.75rem;">
+        Two areas, three levels each. <strong>Site</strong> — what a visitor can do on the deployed
+        website (your code reads it from the <code>X-CV-Perm</code> header: read / write / admin;
+        no read = blocked before reaching your app). <strong>Repo</strong> — Gitea permission on the
+        project repository. Everyone gets the default below; grants add more; the highest wins.
+        You always have admin on both.
+      </p>
       <form method="POST" action="/projects/${escapeHtml(project.id)}">
         ${csrf}
         <div class="form-row">
           <div class="field">
-            <label for="service_access">Service access</label>
-            <select name="service_access" id="service_access">${selectOptions(SERVICE_ACCESS_OPTS, project.serviceAccess)}</select>
+            <label for="site_default_access">Site default (all members)</label>
+            <select name="site_default_access" id="site_default_access">${selectOptions(DEFAULT_ACCESS_OPTS, project.siteDefault)}</select>
           </div>
           <div class="field">
-            <label for="repo_access">Repo access</label>
-            <select name="repo_access" id="repo_access">${selectOptions(REPO_ACCESS_OPTS, project.repoAccess)}</select>
+            <label for="repo_default_access">Repo default (all members)</label>
+            <select name="repo_default_access" id="repo_default_access">${selectOptions(DEFAULT_ACCESS_OPTS, project.repoDefault)}</select>
           </div>
         </div>
-        <button type="submit" class="btn btn-primary">Save access</button>
+        <button type="submit" class="btn btn-primary">Save defaults</button>
+      </form>
+
+      <h4 style="margin:1.25rem 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Grants</h4>
+      ${grants.length === 0
+        ? '<div class="message info">No user or group grants yet.</div>'
+        : `<div class="table-wrap"><table class="table">
+            <thead><tr><th>Who</th><th>Type</th><th>Site</th><th>Repo</th><th></th></tr></thead>
+            <tbody>
+            ${grants.map((g) => `
+              <tr>
+                <td>${escapeHtml(g.subject_name || '(unknown)')}</td>
+                <td>${accessBadge(g.subject_type)}</td>
+                <td>${g.site_perm ? accessBadge(g.site_perm) : '—'}</td>
+                <td>${g.repo_perm ? accessBadge(g.repo_perm) : '—'}</td>
+                <td>
+                  <form method="POST" action="/projects/${escapeHtml(project.id)}/grants/${escapeHtml(g.id)}/delete" class="inline-form">
+                    ${csrf}
+                    <button type="submit" class="btn btn-danger btn-sm">Revoke</button>
+                  </form>
+                </td>
+              </tr>
+            `).join('')}
+            </tbody></table></div>`}
+      <form method="POST" action="/projects/${escapeHtml(project.id)}/grants" style="margin-top:0.85rem;">
+        ${csrf}
+        <div class="form-row">
+          <div class="field">
+            <label for="grant_subject_type">Grant to</label>
+            <select name="subject_type" id="grant_subject_type">
+              <option value="user">user</option>
+              <option value="group">group</option>
+            </select>
+          </div>
+          <div class="field" style="flex:2;">
+            <label for="grant_identifier">Email / username / group name</label>
+            <input type="text" name="identifier" id="grant_identifier" required placeholder="alice@example.com or platform-team">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label for="grant_site_perm">Site permission</label>
+            <select name="site_perm" id="grant_site_perm"><option value="">(none)</option>${selectOptions(GRANT_LEVEL_OPTS, 'read')}</select>
+          </div>
+          <div class="field">
+            <label for="grant_repo_perm">Repo permission</label>
+            <select name="repo_perm" id="grant_repo_perm"><option value="" selected>(none)</option>${selectOptions(GRANT_LEVEL_OPTS, '')}</select>
+          </div>
+          <button type="submit" class="btn btn-primary">Add grant</button>
+        </div>
+        ${groups.length > 0
+          ? `<p class="help" style="margin-top:0.25rem;">Groups: ${groups.map((g) => `<code>${escapeHtml(g.name)}</code> (${g.memberCount})`).join(', ')} — manage under <a href="/groups" style="color:#e8b94a;">Groups</a>.</p>`
+          : `<p class="help" style="margin-top:0.25rem;">No groups exist yet — create one under <a href="/groups" style="color:#e8b94a;">Groups</a> to grant many members at once.</p>`}
       </form>
     </div>
   `;
@@ -1227,6 +1341,132 @@ claude`
     ${dangerCard}
   `;
   return dashboardLayout(`Project: ${project.name}`, body, email, isAdmin, 'projects');
+}
+
+// ── Groups ─────────────────────────────────────────────────
+
+export interface GroupRow {
+  id: string;
+  name: string;
+  owner_id: string;
+  member_count: number;
+  created_at: string;
+}
+
+export interface GroupMemberRow {
+  user_id: string;
+  username: string | null;
+  email: string | null;
+}
+
+export function renderGroups(
+  email: string,
+  isAdmin: boolean,
+  viewerId: string,
+  groups: GroupRow[],
+  csrf: string = '',
+  errorMessage: string = ''
+): string {
+  const errorBanner = errorMessage
+    ? `<div class="message error" style="margin-bottom:1rem;">${escapeHtml(errorMessage)}</div>`
+    : '';
+  const list = groups.length === 0
+    ? '<div class="message info">No groups yet. Create the first one below.</div>'
+    : `<div class="table-wrap"><table class="table">
+        <thead><tr><th>Group</th><th>Members</th><th>Yours?</th></tr></thead>
+        <tbody>
+        ${groups.map((g) => `
+          <tr>
+            <td><a href="/groups/${escapeHtml(g.id)}">${escapeHtml(g.name)}</a></td>
+            <td>${g.member_count}</td>
+            <td>${g.owner_id === viewerId ? '<span class="badge badge-USER">owner</span>' : ''}</td>
+          </tr>
+        `).join('')}
+        </tbody></table></div>`;
+
+  const body = `
+    <p class="tagline">Groups bundle members so project owners can grant access to many people at once.</p>
+    ${errorBanner}
+    ${list}
+    <div class="app-card" style="margin-top:1.5rem;">
+      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">Create a group</h3>
+      <p class="help" style="margin-bottom:0.75rem;">You own groups you create: you manage their members, and any project owner can grant them access. Groups are visible to every member.</p>
+      <form method="POST" action="/groups" style="max-width:420px;">
+        ${csrf}
+        <div class="field">
+          <label for="group_name">Group name</label>
+          <input type="text" name="name" id="group_name" required
+                 pattern="[a-z0-9][a-z0-9._-]*" maxlength="64"
+                 title="lowercase letters, digits, dots, dashes, underscores"
+                 placeholder="platform-team">
+        </div>
+        <button type="submit" class="btn btn-primary">Create group</button>
+      </form>
+    </div>
+  `;
+  return dashboardLayout('Groups', body, email, isAdmin, 'groups');
+}
+
+export function renderGroupDetail(
+  email: string,
+  isAdmin: boolean,
+  group: { id: string; name: string; owner_id: string },
+  members: GroupMemberRow[],
+  manageable: boolean,
+  csrf: string = ''
+): string {
+  const memberRows = members.length === 0
+    ? '<div class="message info">No members yet.</div>'
+    : `<div class="table-wrap"><table class="table">
+        <thead><tr><th>Member</th><th>Username</th>${manageable ? '<th></th>' : ''}</tr></thead>
+        <tbody>
+        ${members.map((m) => `
+          <tr>
+            <td>${escapeHtml(m.email || m.user_id)}</td>
+            <td>${m.username ? `<code>${escapeHtml(m.username)}</code>` : '—'}</td>
+            ${manageable ? `
+              <td>
+                <form method="POST" action="/groups/${escapeHtml(group.id)}/members/${escapeHtml(m.user_id)}/remove" class="inline-form">
+                  ${csrf}
+                  <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+                </form>
+              </td>` : ''}
+          </tr>
+        `).join('')}
+        </tbody></table></div>`;
+
+  const manageForms = manageable ? `
+    <form method="POST" action="/groups/${escapeHtml(group.id)}/members" style="margin-top:0.85rem;">
+      ${csrf}
+      <div class="form-row">
+        <div class="field">
+          <label for="member_identifier">Add member (email or username)</label>
+          <input type="text" name="identifier" id="member_identifier" required placeholder="alice@example.com">
+        </div>
+        <button type="submit" class="btn btn-primary">Add</button>
+      </div>
+    </form>
+    <div class="app-card" style="margin-top:1.25rem;border-color:#7f3d1d;">
+      <h3 style="margin:0 0 0.35rem 0;color:#f3a5a5;">Danger zone</h3>
+      <p class="help" style="margin-bottom:0.75rem;">Deleting the group also revokes every project grant that points at it.</p>
+      <form method="POST" action="/groups/${escapeHtml(group.id)}/delete"
+            data-confirm="Delete group ${escapeHtml(group.name)}? Project grants to this group are revoked.">
+        ${csrf}
+        <button type="submit" class="btn btn-danger">Delete group</button>
+      </form>
+    </div>
+  ` : '<p class="help" style="margin-top:0.85rem;">Only the group owner or a platform admin can manage members.</p>';
+
+  const body = `
+    <p style="margin-bottom:1rem;"><a href="/groups" class="btn btn-secondary btn-sm">← All groups</a></p>
+    <div class="app-card">
+      <h2 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:1.4rem;"><code>${escapeHtml(group.name)}</code></h2>
+      <p class="help" style="margin-bottom:0.75rem;">Project owners grant this group access from their project page (Access → Grants).</p>
+      ${memberRows}
+      ${manageForms}
+    </div>
+  `;
+  return dashboardLayout(`Group: ${group.name}`, body, email, isAdmin, 'groups');
 }
 
 // ── API Keys ───────────────────────────────────────────────
@@ -1482,7 +1722,7 @@ export function renderGiteaCliTokenReveal(
   tokenName: string
 ): string {
   const cloneUrl = project.giteaRepo
-    ? `https://${encodeURIComponent(username)}:${encodeURIComponent(token)}@gitea.corpo-valley.com/${project.giteaRepo}.git`
+    ? `${GITEA_PUBLIC_URL.replace('://', `://${encodeURIComponent(username)}:${encodeURIComponent(token)}@`)}/${project.giteaRepo}.git`
     : '';
   const cmdBlock = cloneUrl
     ? `git clone ${cloneUrl}
@@ -1564,8 +1804,22 @@ export function renderAdminUsers(
 export function renderAdminUserDetail(
   user: UserRow,
   email: string,
-  csrf: string = ''
+  csrf: string = '',
+  isSelf: boolean = false,
 ): string {
+  // Danger zone — irreversible delete. Hidden for the acting admin's own row
+  // (the route refuses a self-delete anyway).
+  const dangerZone = isSelf ? '' : `
+    <h3 style="margin-top:1.5rem;color:var(--danger,#c0392b);">Danger Zone</h3>
+    <p class="help">Permanently delete this user and everything attached to them — owned projects
+      (and their repos, namespaces, and databases), owned groups, group memberships, access grants,
+      API keys, the admin role, and the paired bot account. This cannot be undone.</p>
+    <form method="POST" action="/admin/users/${escapeHtml(user.id)}/delete"
+          data-confirm="Permanently delete ${escapeHtml(user.email)} and ALL their projects, repos, and data? This cannot be undone.">
+      ${csrf}
+      <button type="submit" class="btn btn-danger">Delete user</button>
+    </form>
+  `;
   const body = `
     <p style="margin-bottom:1rem;"><a href="/admin/users" class="btn btn-secondary btn-sm">Back to Users</a></p>
     <table class="table">
@@ -1617,6 +1871,7 @@ export function renderAdminUserDetail(
       ${csrf}
       <button type="submit" class="btn btn-secondary">Generate Recovery Code</button>
     </form>
+    ${dangerZone}
   `;
   return dashboardLayout(`User: ${user.email}`, body, email, true, 'users');
 }
@@ -1912,6 +2167,11 @@ export function renderLoginPage(
   nodes: UiNode[],
   messages: UiMessage[] | undefined,
   footerHtml: string,
+  // Google-only mode (decision D4): show just the OIDC button(s); the
+  // password/code forms stay reachable via /login?method=password as the
+  // break-glass path. Ignored when the flow carries no OIDC nodes (e.g.
+  // Kratos misconfigured) so a broken Google setup can't lock everyone out.
+  opts: { googleOnly?: boolean } = {},
 ): string {
   const csrf = extractCsrf(nodes);
   const oidc = extractOidcProviders(nodes);
@@ -1952,15 +2212,16 @@ export function renderLoginPage(
   }
 
   // Stage 1 (default): show the OIDC button + the email/password form.
+  const googleOnly = !!opts.googleOnly && oidc.length > 0;
   if (oidc.length > 0) {
     body += `<form action="${escapeHtml(action)}" method="POST">
       ${hiddenCsrf(csrf)}
       ${oidc.map(oidcButtonHtml).join('')}
     </form>`;
-    if (hasPassword || hasCodeSubmit) body += '<div class="divider">or</div>';
+    if (!googleOnly && (hasPassword || hasCodeSubmit)) body += '<div class="divider">or</div>';
   }
 
-  if (hasPassword || hasCodeSubmit) {
+  if (!googleOnly && (hasPassword || hasCodeSubmit)) {
     body += `<form action="${escapeHtml(action)}" method="POST">
       ${hiddenCsrf(csrf)}
       <div class="field">

@@ -9,6 +9,7 @@ import {
 } from '../services/kratos-admin';
 import { listClients, getClient, createClient, deleteClient, API_KEY_TYPE } from '../services/hydra-admin';
 import { ensureProvisioned } from '../services/provisioning';
+import { deleteUserCascade } from '../services/user-delete';
 import { isReservedUsername, isValidUsername } from '../services/reserved-names';
 import {
   renderAdminUsers, renderAdminUserDetail, renderAdminUserCreate,
@@ -122,7 +123,7 @@ router.get('/users/:id', async (req: Request, res: Response) => {
     const identity = await getIdentity(req.params.id);
     const admin = await isUserAdmin(identity.id);
     const csrf = csrfHiddenField(req, res);
-    res.send(renderAdminUserDetail(toUserRow(identity, admin), session.email, csrf));
+    res.send(renderAdminUserDetail(toUserRow(identity, admin), session.email, csrf, identity.id === session.id));
   } catch (err: any) {
     console.error('Admin user detail error:');
     res.status(500).send(renderError('Error', 'Failed to load user.'));
@@ -203,6 +204,61 @@ router.post('/users/:id/role', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Set role error:');
     res.status(500).send(renderError('Error', 'Failed to update role.'));
+  }
+});
+
+// POST /users/:id/delete — permanently delete a user and everything attached to
+// them (owned projects, groups, grants, API keys, admin role, paired .bot, and
+// both Gitea accounts). Irreversible. See services/user-delete.ts.
+router.post('/users/:id/delete', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const targetId = req.params.id;
+
+  // An admin must never delete themselves — it could orphan the platform (no
+  // path to undo) and races the acting session. Mirrors the role-demotion guard.
+  if (targetId === session.id) {
+    res.status(400).send(renderError('Invalid Target', 'You cannot delete your own account.'));
+    return;
+  }
+
+  let identity;
+  try {
+    identity = await getIdentity(targetId);
+  } catch {
+    res.status(404).send(renderError('Not Found', 'User not found.'));
+    return;
+  }
+  // Bots are deleted only as part of their human's cascade, never on their own.
+  const meta = (identity.metadata_public ?? {}) as Record<string, any>;
+  if (meta.type === 'bot') {
+    res.status(400).send(renderError('Invalid Target', 'Bot identities are removed automatically when their owner is deleted.'));
+    return;
+  }
+
+  try {
+    const result = await deleteUserCascade(identity);
+    const traits = (identity.traits ?? {}) as Record<string, any>;
+    const who = traits.email || targetId;
+    console.log(`[admin] user ${who} delete by ${session.email}: ` +
+      `${result.projectsPurged} project(s), ${result.groupsDeleted} group(s), ${result.apiKeysRevoked} key(s), ` +
+      `identityDeleted=${result.identityDeleted}` +
+      (result.errors.length ? `; ${result.errors.length} error(s): ${result.errors.join('; ')}` : ''));
+    // Don't report a clean success when teardown was partial — the admin must
+    // know what's left and (if the identity was kept) that they can retry.
+    if (result.errors.length) {
+      const retryNote = result.identityDeleted
+        ? 'The account was removed, but the listed resources may need manual cleanup.'
+        : 'The account was KEPT so you can re-run the delete once the issue clears.';
+      res.status(500).send(renderError(
+        'User deletion incomplete',
+        `Some teardown steps for ${who} did not complete:\n\n- ${result.errors.join('\n- ')}\n\n${retryNote}`,
+      ));
+      return;
+    }
+    res.redirect('/admin/users');
+  } catch (err: any) {
+    console.error('Delete user error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to delete user — see portal logs.'));
   }
 });
 

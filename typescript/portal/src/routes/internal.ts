@@ -3,6 +3,7 @@ import { getFile, upsertRepoFile, getBranchHead, getCommitStatus } from '../serv
 import { getProjectBySlug, getProjectByPinTokenHash } from '../services/projects';
 import { hashPinToken, pinTokenHashMatches } from '../services/pin-token';
 import { requireInternalSecret } from '../middleware/internalAuth';
+import { ensureProvisionedById } from '../services/provisioning';
 
 const router = Router();
 
@@ -36,12 +37,58 @@ function requireInClusterCaller(req: Request, res: Response, next: NextFunction)
   next();
 }
 
-// NOTE: the Kratos after-registration web_hook used to live here. Provisioning a
-// new human's `.bot` identity + Gitea accounts now happens
-// inside the portal itself — synchronously for admin-created users
-// (routes/admin.ts) and on first authenticated request for self-service
-// registrants (middleware/session.ts -> services/provisioning.ts). That removes
-// the need to deliver a shared secret into Kratos's hook config.
+// ── Kratos registration webhooks (Google Workspace signup) ────────────────
+//
+// POST /internal/hooks/registration — Kratos `after.oidc` registration hook
+// (response.ignore=true on the Kratos side, so signup latency doesn't depend
+// on us). The body only NAMES an identity id; the portal re-fetches the
+// canonical identity from the Kratos admin API and runs the same idempotent
+// ensureProvisioned the admin-create flow uses.
+//
+// Auth: requireInternalSecret (the X-Internal-Secret Kratos sends, configured
+// in the kratos-google-oidc sealed fragment) on top of the network-origin
+// guard. Without it ANY in-cluster pod — including tenant-controlled
+// gitea-runners — could POST here and trigger repeated provisioning fan-out
+// against real identities (finding F3). The lazy backstop in the dashboard
+// (ensureProvisionedLazy) still covers a hook delivery that flaked.
+router.post('/internal/hooks/registration', requireInClusterCaller, requireInternalSecret, async (req: Request, res: Response) => {
+  const identityId = String(req.body?.identity_id || '');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identityId)) {
+    res.status(400).json({ error: 'identity_id required' });
+    return;
+  }
+  try {
+    await ensureProvisionedById(identityId);
+  } catch (err: any) {
+    // Never signal failure back into the registration flow — provisioning is
+    // best-effort by design and retried lazily on first dashboard visit.
+    console.error('[internal/registration-hook] provisioning failed for', identityId, err?.message);
+  }
+  res.json({ ok: true });
+});
+
+// POST /internal/hooks/registration/deny — `can_interrupt` hook on the
+// password and code registration methods. Enabling the registration FLOW for
+// Google signup would otherwise re-open password/code self-signup via direct
+// Kratos API calls (the portal UI never offered them); this hook makes those
+// methods always fail with a user-readable message. Body format per Kratos's
+// webhook flow-interrupt contract.
+router.post('/internal/hooks/registration/deny', requireInClusterCaller, (_req: Request, res: Response) => {
+  res.status(403).json({
+    messages: [
+      {
+        instance_ptr: '#/',
+        messages: [
+          {
+            id: 4000001,
+            text: 'Self-service sign-up with a password or email code is disabled. Use "Continue with Google", or ask an administrator to create your account.',
+            type: 'error',
+          },
+        ],
+      },
+    ],
+  });
+});
 
 // GET /internal/projects/:slug/owner
 //

@@ -6,10 +6,15 @@
 //
 // ── Authorization is baked in ────────────────────────────────────────────
 // Every request that reaches this container has already passed the platform's
-// edge auth gate (the Ingress requires a valid Kratos session). The shared
-// identity helper re-validates the forwarded Kratos session cookie to get the
-// caller's stable id — a workload in this namespace can't forge it, because a
-// valid identity requires a real session only the signed-in user holds.
+// edge access gate: anonymous visitors and members without `read` on this
+// project never get here. The request carries the trusted identity headers
+// (X-CV-User-Id / X-CV-User-Email / X-CV-Perm — see ACCESS.md); the shared
+// identity helper reads them (falling back to the legacy Kratos-cookie
+// re-validation when absent) and exposes the caller's permission class:
+//
+//   read   can view  → GET routes
+//   write  can create/update/delete THEIR OWN data → mutating routes
+//   admin  app-level moderator → may delete ANYONE's rows here
 //
 // By default every row is scoped to its owner: a caller only ever sees and
 // mutates their own data (`WHERE owner_id = $caller`). The platform flips
@@ -20,7 +25,7 @@
 
 const express = require('express');
 const { Pool } = require('pg');
-const { resolveUser } = require('../lib/identity');
+const { resolveUser, requirePerm } = require('../lib/identity');
 
 // nosemgrep: javascript.express.security.audit.express-check-csurf-middleware-usage.express-check-csurf-middleware-usage -- CSRF is handled by csrfGuard below (Sec-Fetch-Site same-origin check); the csurf package the rule looks for is deprecated.
 const app = express();
@@ -70,21 +75,10 @@ async function ensureSchema() {
   await pool.query('CREATE INDEX IF NOT EXISTS items_owner_idx ON items (owner_id);');
 }
 
-// Identity gate. Resolve the caller from the forwarded Kratos session cookie.
-// No valid session → refuse rather than guess.
-async function requireUser(req, res, next) {
-  const user = await resolveUser(req);
-  if (!user) {
-    res.status(401).json({ error: 'unauthenticated' });
-    return;
-  }
-  req.userId = user.id;
-  req.userEmail = user.email;
-  next();
-}
-
 const api = express.Router();
-api.use(requireUser);
+// Identity + permission gate. `read` is the floor — the edge already blocks
+// anyone below it, so this mostly matters for local runs without the headers.
+api.use(requirePerm('read'));
 
 // List items the caller is allowed to see. Parameterized — the SHARED
 // branch decides scope, the value is never interpolated into SQL.
@@ -105,10 +99,10 @@ api.get('/items', async (req, res) => {
   }
 });
 
-// Create an item owned by the caller. owner_id always comes from the resolved
-// session identity (req.userId), never the request body, so a caller can't
-// write as someone else.
-api.post('/items', async (req, res) => {
+// Create an item owned by the caller. Requires the `write` class. owner_id
+// always comes from the resolved identity (req.userId), never the request
+// body, so a caller can't write as someone else.
+api.post('/items', requirePerm('write'), async (req, res) => {
   const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 280) : '';
   if (!title) {
     res.status(400).json({ error: 'title is required' });
@@ -126,19 +120,19 @@ api.post('/items', async (req, res) => {
   }
 });
 
-// Delete one of the caller's own items. The owner_id predicate means a caller
-// can only ever delete rows they own, even in shared mode.
-api.delete('/items/:id', async (req, res) => {
+// Delete an item. `write` callers can only delete rows they own; `admin`
+// callers (app-level moderators) may delete anyone's — that's the canonical
+// use of the third permission class.
+api.delete('/items/:id', requirePerm('write'), async (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'invalid id' });
     return;
   }
   try {
-    const { rowCount } = await pool.query(
-      'DELETE FROM items WHERE id = $1 AND owner_id = $2',
-      [id, req.userId]
-    );
+    const { rowCount } = req.userPerm === 'admin'
+      ? await pool.query('DELETE FROM items WHERE id = $1', [id])
+      : await pool.query('DELETE FROM items WHERE id = $1 AND owner_id = $2', [id, req.userId]);
     res.json({ deleted: rowCount > 0 });
   } catch (err) {
     console.error('DELETE /items failed:', err.message);
