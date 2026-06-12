@@ -37,3 +37,16 @@ export const PORTAL_INTERNAL_URL =
 export const KRATOS_CLUSTER_URL =
   (process.env.KRATOS_PUBLIC_URL || 'http://ory-kratos-public.cv-ory.svc.cluster.local:4433')
     .replace(/\/+$/, '');
+
+// StorageClass for per-project Postgres PVCs (postgres.ts). Three states:
+//   - env unset          → 'microk8s-hostpath' (the original deployment's SC,
+//                          so non-chart upgrades behave exactly as before)
+//   - env set but empty  → undefined: omit storageClassName entirely, letting
+//                          the cluster's default StorageClass bind (EKS gp3,
+//                          k3s local-path, ...)
+//   - env set, non-empty → that class
+// The chart always injects CV_STORAGE_CLASS from `storage.className`.
+export const POSTGRES_STORAGE_CLASS: string | undefined =
+  process.env.CV_STORAGE_CLASS === undefined
+    ? 'microk8s-hostpath'
+    : (process.env.CV_STORAGE_CLASS || undefined);
