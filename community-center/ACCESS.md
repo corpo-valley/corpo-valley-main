@@ -78,6 +78,19 @@ no valid `X-CV-Perm` (i.e. not through the platform edge) is likewise denied.
 
 ## MCP capability note
 
-The `/mcp` endpoint does not use this standard — MCP requests are OAuth-authenticated by the
-platform's MCP gateway, which only admits the project owner and forwards `X-User-Id` (no perm
-header).
+The `/mcp` endpoint is OAuth-authenticated by the platform's MCP gateway rather than the cookie
+edge, but access **mirrors the site gate**: the gateway admits any user with at least `read`
+(owner, direct grant, group grant, or site default >= read — the owner is always `admin`). It
+forwards `X-User-Id`, `X-User-Email`, and `X-CV-Perm`.
+
+Per-tool authorization is **your** responsibility, exactly like the site's mutating routes: gate
+which tools a caller may invoke on `X-CV-Perm`. A typical split is read-only tools for `read`,
+create/update-your-own for `write`, and moderation tools for `admin`:
+
+```js
+const { resolveUser } = require('../lib/identity'); // reads X-User-Id / X-CV-Perm
+// inside your MCP tool dispatch:
+if (TOOL_WRITES.has(toolName) && req.userPerm === 'read') {
+  return { error: 'requires write access' };
+}
+```

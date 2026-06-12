@@ -6,11 +6,11 @@ import { getProjectBySlug } from '../services/projects';
 import { userCanAccessService } from '../services/keto';
 import { requireSession } from '../middleware/session';
 import { validateCsrf, csrfHiddenField } from '../middleware/csrf';
+import { PROJECTS_DOMAIN } from '../services/platform-config';
 
 const router = Router();
 
 const hydraAdminUrl = process.env.HYDRA_ADMIN_URL || 'http://localhost:4445';
-const PROJECTS_DOMAIN = process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com';
 
 // Parse the project slug out of a per-project MCP resource indicator
 // (`https://<slug>.<PROJECTS_DOMAIN>/mcp`). Returns null for any audience that

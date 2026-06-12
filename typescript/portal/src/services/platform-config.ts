@@ -27,9 +27,19 @@ export const GITEA_PUBLIC_URL =
 // browsers to `${PORTAL_PUBLIC_URL}/login`. Note the production default, NOT
 // the localhost default the rest of the portal uses for BASE_URL: this value
 // is written into cluster-facing artifacts, where localhost would be wrong
-// even in dev.
+// even in dev. Falls back to this deployment's own domain, never corpo-valley.com.
 export const PORTAL_PUBLIC_URL =
-  (process.env.BASE_URL || 'https://portal.corpo-valley.com').replace(/\/+$/, '');
+  (process.env.BASE_URL || `https://portal.${BASE_DOMAIN}`).replace(/\/+$/, '');
+
+// Public MCP endpoint editor configs point at. PUBLIC_MCP_URL is the RFC 9728
+// resource identifier (host only); the JSON-RPC endpoint is <resource>/mcp.
+export const PUBLIC_MCP_URL =
+  (process.env.PUBLIC_MCP_URL || `https://mcp.${BASE_DOMAIN}`).replace(/\/+$/, '');
+export const MCP_ENDPOINT_URL = `${PUBLIC_MCP_URL}/mcp`;
+
+// Public OAuth (Hydra) URL editors are sent to for the OAuth handshake.
+export const OAUTH_PUBLIC_URL =
+  (process.env.HYDRA_PUBLIC_URL || `https://oauth.${BASE_DOMAIN}`).replace(/\/+$/, '');
 
 // In-cluster registry the tenant Build workflows push to and the tenant
 // Deployments pull from.

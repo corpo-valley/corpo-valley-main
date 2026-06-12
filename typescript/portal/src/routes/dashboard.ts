@@ -45,6 +45,7 @@ import {
 import { createArgoApplication, k8sEnabled, namespaceExists } from '../services/k8s';
 import { purgeProjectResources } from '../services/project-purge';
 import { buildSealedSecretYaml } from '../services/seal';
+import { PROJECTS_DOMAIN } from '../services/platform-config';
 import {
   renderProjects, renderProjectCreate, renderProjectDetail,
   renderKeyManagement, renderNewKeyDisplay, renderError,
@@ -54,8 +55,6 @@ import {
 import * as crypto from 'crypto';
 
 const router = Router();
-
-const PROJECTS_DOMAIN = process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com';
 
 // A stashed post-login destination must be an https project host.
 function isSafePostLoginDest(url: string): boolean {
