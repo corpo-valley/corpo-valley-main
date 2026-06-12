@@ -24,6 +24,7 @@ import {
 } from './gitea';
 import { buildSealedSecretYaml } from './seal';
 import { k8sDeleteNamespaced, k8sEnabled } from './k8s';
+import { POSTGRES_STORAGE_CLASS } from './platform-config';
 
 // Workflow file path inside a project repo. Used both by the postgres
 // flow (no direct touch) and by the pin-token backfill which refreshes
@@ -158,8 +159,7 @@ spec:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
-        storageClassName: microk8s-hostpath
-        resources:
+${POSTGRES_STORAGE_CLASS !== undefined ? `        storageClassName: ${POSTGRES_STORAGE_CLASS}\n` : ''}        resources:
           requests:
             storage: 5Gi
 `;
