@@ -16,6 +16,15 @@ const SITE_FOOTER = `
       <a href="https://github.com/corpo-valley/corpo-valley-main" target="_blank" rel="noopener noreferrer">${GITHUB_SVG}corpo-valley on GitHub</a>
     </footer>`;
 
+// Deployment-specific public URLs — the portal receives these as env vars
+// (chart 20-portal.yaml: GITEA_PUBLIC_URL / PROJECTS_DOMAIN). The corpo-valley.com
+// fallbacks are only for local/unset dev; every rendered link must derive from
+// these so a deployment on another domain doesn't get corpo-valley.com links.
+const GITEA_PUBLIC_URL = (process.env.GITEA_PUBLIC_URL || 'https://gitea.corpo-valley.com').replace(/\/+$/, '');
+const PROJECTS_DOMAIN = (process.env.PROJECTS_DOMAIN || 'projects.corpo-valley.com').replace(/^[.]+|[/]+$/g, '');
+// Build a project's public site URL from its slug.
+function projectSiteUrl(slug: string): string { return `https://${slug}.${PROJECTS_DOMAIN}`; }
+
 // Warm valley palette: deep soil-night background, parchment text, harvest
 // gold + leaf green accents.
 const CSS = `
@@ -776,18 +785,18 @@ export function renderProjects(
   } else {
     body += '<div class="app-grid">';
     for (const p of projects) {
-      const url = `https://${escapeHtml(p.slug)}.projects.corpo-valley.com`;
+      const url = projectSiteUrl(escapeHtml(p.slug));
       body += `
         <div class="app-card">
           <div class="app-card-header">
             <span class="app-card-name">${escapeHtml(p.name)}</span>
           </div>
-          <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.projects.corpo-valley.com ↗</a></div>
+          <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
           <div class="app-card-sub" style="margin-top:0.4rem;">Members: site ${accessBadge(p.siteDefault)} &nbsp; repo ${accessBadge(p.repoDefault)}</div>
           <div class="app-card-actions">
-            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-secondary">Open</a>
+            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-secondary">Edit</a>
             ${p.giteaRepo
-              ? `<a href="https://gitea.corpo-valley.com/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a>`
+              ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a>`
               : ''}
           </div>
         </div>`;
@@ -801,16 +810,16 @@ export function renderProjects(
       <p class="help">Projects other members granted you (or one of your groups) access to.</p>
       <div class="app-grid">`;
     for (const p of shared) {
-      const url = `https://${escapeHtml(p.slug)}.projects.corpo-valley.com`;
+      const url = projectSiteUrl(escapeHtml(p.slug));
       body += `
         <div class="app-card">
           <div class="app-card-header">
             <span class="app-card-name">${escapeHtml(p.name)}</span>
           </div>
-          <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.projects.corpo-valley.com ↗</a></div>
+          <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
           <div class="app-card-sub" style="margin-top:0.4rem;">Your access: site ${accessBadge(p.sitePerm)} &nbsp; repo ${accessBadge(p.repoPerm)}</div>
           ${p.giteaRepo && p.repoPerm !== 'none'
-            ? `<div class="app-card-actions"><a href="https://gitea.corpo-valley.com/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a></div>`
+            ? `<div class="app-card-actions"><a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a></div>`
             : ''}
         </div>`;
     }
@@ -873,7 +882,7 @@ export function renderProjectCreate(
 
     <div class="app-card">
       <h2 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:1.4rem;">Plant a new project</h2>
-      <p class="help" style="margin-bottom:1.25rem;">A project is a Gitea repo, an auto-deployed site at <code>&lt;slug&gt;.projects.corpo-valley.com</code>, and the wiring to point Claude Code at it.</p>
+      <p class="help" style="margin-bottom:1.25rem;">A project is a Gitea repo, an auto-deployed site at <code>&lt;slug&gt;.${escapeHtml(PROJECTS_DOMAIN)}</code>, and the wiring to point Claude Code at it.</p>
 
       <form method="POST" action="/projects" id="cv-project-form">
         ${csrf}
@@ -884,7 +893,7 @@ export function renderProjectCreate(
                  placeholder="My farm stand"
                  autofocus>
           <p class="help" style="margin-top:0.4rem;">
-            Your URL will be <code><span id="cv-slug-display" style="color:#e8b94a;">&lt;slug&gt;</span>.projects.corpo-valley.com</code>
+            Your URL will be <code><span id="cv-slug-display" style="color:#e8b94a;">&lt;slug&gt;</span>.${escapeHtml(PROJECTS_DOMAIN)}</code>
             <a href="#" id="cv-slug-edit" style="margin-left:0.5rem;color:#a89878;font-size:0.8rem;">edit slug</a>
           </p>
           <div id="cv-slug-wrap" style="display:${prefill.slug ? 'block' : 'none'};margin-top:0.5rem;">
@@ -1063,7 +1072,7 @@ export function renderProjectDetail(
     : '';
 
   const cloneCommands = project.giteaRepo
-    ? `git clone https://gitea.corpo-valley.com/${escapeHtml(project.giteaRepo)}.git
+    ? `git clone ${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}.git
 cd ${escapeHtml(project.slug)}
 claude`
     : '';
@@ -1074,13 +1083,13 @@ claude`
     <div class="app-card">
       <h2 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:1.4rem;">${escapeHtml(project.name)}</h2>
       <div style="margin-bottom:0.5rem;">
-        <a href="https://${escapeHtml(project.slug)}.projects.corpo-valley.com" target="_blank" rel="noopener" style="color:#e8b94a;font-size:0.95rem;">
-          ${escapeHtml(project.slug)}.projects.corpo-valley.com ↗
+        <a href="${projectSiteUrl(escapeHtml(project.slug))}" target="_blank" rel="noopener" style="color:#e8b94a;font-size:0.95rem;">
+          ${escapeHtml(project.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗
         </a>
       </div>
       <div style="font-size:0.8rem;color:#a89878;">
         ${project.giteaRepo
-          ? `<a href="https://gitea.corpo-valley.com/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `
+          ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `
           : ''}Created ${escapeHtml(project.createdAt)} · <code>${escapeHtml(project.slug)}</code>
       </div>
     </div>
@@ -1382,18 +1391,16 @@ export function renderGroups(
     <div class="app-card" style="margin-top:1.5rem;">
       <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">Create a group</h3>
       <p class="help" style="margin-bottom:0.75rem;">You own groups you create: you manage their members, and any project owner can grant them access. Groups are visible to every member.</p>
-      <form method="POST" action="/groups">
+      <form method="POST" action="/groups" style="max-width:420px;">
         ${csrf}
-        <div class="form-row">
-          <div class="field">
-            <label for="group_name">Group name</label>
-            <input type="text" name="name" id="group_name" required
-                   pattern="[a-z0-9][a-z0-9._-]*" maxlength="64"
-                   title="lowercase letters, digits, dots, dashes, underscores"
-                   placeholder="platform-team">
-          </div>
-          <button type="submit" class="btn btn-primary">Create</button>
+        <div class="field">
+          <label for="group_name">Group name</label>
+          <input type="text" name="name" id="group_name" required
+                 pattern="[a-z0-9][a-z0-9._-]*" maxlength="64"
+                 title="lowercase letters, digits, dots, dashes, underscores"
+                 placeholder="platform-team">
         </div>
+        <button type="submit" class="btn btn-primary">Create group</button>
       </form>
     </div>
   `;
@@ -1715,7 +1722,7 @@ export function renderGiteaCliTokenReveal(
   tokenName: string
 ): string {
   const cloneUrl = project.giteaRepo
-    ? `https://${encodeURIComponent(username)}:${encodeURIComponent(token)}@gitea.corpo-valley.com/${project.giteaRepo}.git`
+    ? `${GITEA_PUBLIC_URL.replace('://', `://${encodeURIComponent(username)}:${encodeURIComponent(token)}@`)}/${project.giteaRepo}.git`
     : '';
   const cmdBlock = cloneUrl
     ? `git clone ${cloneUrl}
