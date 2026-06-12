@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { getFile, upsertRepoFile, getBranchHead, getCommitStatus } from '../services/gitea';
 import { getProjectBySlug, getProjectByPinTokenHash } from '../services/projects';
+import { effectiveSitePerm } from '../services/access';
 import { hashPinToken, pinTokenHashMatches } from '../services/pin-token';
 import { requireInternalSecret } from '../middleware/internalAuth';
 import { ensureProvisionedById } from '../services/provisioning';
@@ -113,6 +114,39 @@ router.get('/internal/projects/:slug/owner', requireInternalSecret, requireInClu
     res.json({ owner_id: project.owner_id, slug: project.slug });
   } catch (err: any) {
     console.error('[internal/owner] error for', slug, err?.message);
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// GET /internal/projects/:slug/access/:sub
+//
+// The MCP gateway's per-request authorization. MCP is a project's app over a
+// different protocol, so access mirrors the SITE gate: this returns the caller's
+// effective site permission (none|read|write|admin) from the same grants engine
+// that backs GET /access/site/:slug — direct grants, group grants, the site
+// default, and owner=admin all included. The gateway compares it to its required
+// floor (write). Authenticated with the shared internal secret (same as /owner).
+router.get('/internal/projects/:slug/access/:sub', requireInternalSecret, requireInClusterCaller, async (req: Request, res: Response) => {
+  const slug = String(req.params.slug || '');
+  const sub = String(req.params.sub || '');
+  if (!/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(slug)) {
+    res.status(400).json({ error: 'invalid slug' });
+    return;
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sub)) {
+    res.status(400).json({ error: 'invalid sub' });
+    return;
+  }
+  try {
+    const project = await getProjectBySlug(slug);
+    if (!project) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    const perm = await effectiveSitePerm(project, sub);
+    res.json({ slug: project.slug, sub, site_perm: perm });
+  } catch (err: any) {
+    console.error('[internal/access] error for', slug, err?.message);
     res.status(500).json({ error: 'internal error' });
   }
 });

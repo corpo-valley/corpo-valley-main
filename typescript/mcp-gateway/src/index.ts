@@ -128,25 +128,44 @@ function resourceForSlug(slug: string): string {
 const PORTAL_INTERNAL_URL = process.env.PORTAL_INTERNAL_URL || 'http://portal.cv-portal.svc.cluster.local:3000';
 const INTERNAL_WEBHOOK_SECRET = (process.env.INTERNAL_WEBHOOK_SECRET || '').trim();
 
-// Returns true iff `sub` owns the project for `slug`. Fails CLOSED (false) on any
-// error, missing secret, or non-200 — a verification failure must never grant
-// cross-tenant access.
-async function ownsProject(slug: string, sub: string): Promise<boolean> {
+type SitePerm = 'none' | 'read' | 'write' | 'admin';
+const PERM_RANK: Record<SitePerm, number> = { none: 0, read: 1, write: 2, admin: 3 };
+
+// Minimum effective SITE permission required to CONNECT to a project's MCP
+// endpoint. MCP is the project's app over a different protocol, so access mirrors
+// the site gate exactly: the floor is READ — anyone who may use the project's
+// site (owner, direct grant, group grant, or site default >= read) may connect.
+// Per-tool authorization is the MCP developer's responsibility: the gateway
+// forwards X-CV-Perm (see the proxy below), and the project's MCP server gates
+// which tools a read vs write vs admin caller may invoke — the same contract as
+// the site's X-CV-Perm standard (read = view, write = mutate own, admin =
+// moderate). The owner is always admin, so owner access is preserved.
+const MIN_SITE_PERM: SitePerm = 'read';
+
+// The caller's effective site permission for `slug`, from the portal grants
+// engine. Fails CLOSED ('none') on any error, missing secret, or non-200 — a
+// verification failure must never grant cross-tenant access.
+async function sitePermission(slug: string, sub: string): Promise<SitePerm> {
   if (!INTERNAL_WEBHOOK_SECRET) {
-    console.error('[gateway] INTERNAL_WEBHOOK_SECRET not set — cannot verify project ownership (fail closed).');
-    return false;
+    console.error('[gateway] INTERNAL_WEBHOOK_SECRET not set — cannot verify project access (fail closed).');
+    return 'none';
   }
   try {
-    const r = await fetch(`${PORTAL_INTERNAL_URL}/internal/projects/${encodeURIComponent(slug)}/owner`, {
+    const r = await fetch(`${PORTAL_INTERNAL_URL}/internal/projects/${encodeURIComponent(slug)}/access/${encodeURIComponent(sub)}`, {
       headers: { 'X-Internal-Secret': INTERNAL_WEBHOOK_SECRET },
     });
-    if (!r.ok) return false;
-    const body = await r.json() as { owner_id?: string };
-    return typeof body.owner_id === 'string' && body.owner_id === sub;
+    if (!r.ok) return 'none';
+    const body = await r.json() as { site_perm?: string };
+    const p = body.site_perm;
+    return (p === 'read' || p === 'write' || p === 'admin') ? p : 'none';
   } catch (e) {
-    console.error('[gateway] ownership check failed:', (e as Error).message);
-    return false;
+    console.error('[gateway] access check failed:', (e as Error).message);
+    return 'none';
   }
+}
+
+function permits(perm: SitePerm): boolean {
+  return PERM_RANK[perm] >= PERM_RANK[MIN_SITE_PERM];
 }
 
 async function introspect(token: string): Promise<Introspection> {
@@ -262,11 +281,13 @@ async function handleMcp(req: express.Request, res: express.Response) {
     }
   }
 
-  // Ownership check — the authoritative per-request authorization. Unlike the
+  // Site-access check — the authoritative per-request authorization. Unlike the
   // audience check this can't be disabled by a single flag, so even with
-  // MCP_ENFORCE_AUDIENCE=false an attacker can't reach a project they don't own.
-  if (!(await ownsProject(slug, sub))) {
-    console.warn('[gateway] ownership denied', { slug, sub, client_id: intro.client_id });
+  // MCP_ENFORCE_AUDIENCE=false an attacker can't reach a project they lack
+  // access to. Mirrors the site gate (see MIN_SITE_PERM).
+  const perm = await sitePermission(slug, sub);
+  if (!permits(perm)) {
+    console.warn('[gateway] access denied', { slug, sub, perm, client_id: intro.client_id });
     res.status(403).json({ error: 'forbidden_project' });
     return;
   }
@@ -286,6 +307,10 @@ async function handleMcp(req: express.Request, res: express.Response) {
   headers['x-user-id'] = sub;
   const email = intro.ext?.identity?.traits?.email;
   if (typeof email === 'string') headers['x-user-email'] = email;
+  // Forward the effective site permission so a project MCP can apply the same
+  // permission classes per tool (mirrors the site's X-CV-Perm contract). Set
+  // from our computed perm, never from the inbound request.
+  headers['x-cv-perm'] = perm;
 
   const preq = http.request({ host: target, port: PROJECT_MCP_PORT, method: req.method, path: req.url, headers }, (pres) => {
     // The upstream is a tenant-controlled container, so its response headers are
@@ -315,9 +340,9 @@ async function handleMcp(req: express.Request, res: express.Response) {
   const revalidate = setInterval(async () => {
     try {
       const re = await introspect(token);
-      const stillValid = re.active && re.sub === sub && await ownsProject(slug, sub);
+      const stillValid = re.active && re.sub === sub && permits(await sitePermission(slug, sub));
       if (!stillValid) {
-        console.warn('[gateway] tearing down stream: token/ownership no longer valid', { slug, sub });
+        console.warn('[gateway] tearing down stream: token/access no longer valid', { slug, sub });
         clearInterval(revalidate);
         try { preq.destroy(); } catch { /* already gone */ }
         try { res.end(); } catch { /* already gone */ }
