@@ -11,6 +11,18 @@ const kratosPublicUrl = process.env.KRATOS_PUBLIC_URL || 'http://localhost:4433'
 const kratosBrowserUrl = process.env.KRATOS_BROWSER_URL || kratosPublicUrl;
 const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
 
+// "Login with Google" (decision D4): when the chart enables the Kratos Google
+// OIDC provider it also sets this flag, and the login page shows ONLY the
+// Google button. Password/code stay fully functional behind
+// /login?method=password — the break-glass path for admins and for any window
+// where the Google client config is broken. The flag only changes rendering;
+// Kratos decides what methods actually exist.
+const GOOGLE_LOGIN_ENABLED = process.env.GOOGLE_LOGIN_ENABLED === 'true';
+
+// Carries the "show me the password form" choice across the Kratos
+// flow-creation round-trip (/login?method=password → Kratos → /login?flow=…).
+const LOGIN_METHOD_COOKIE = 'cv_lm';
+
 // Allow post-login redirects ONLY to user-project subdomains. The portal's
 // own internal flows don't use return_to (they fall through to Kratos's
 // default_browser_return_url), so we can keep this strict to prevent the
@@ -58,6 +70,15 @@ router.get('/login', async (req: Request, res: Response) => {
   const flowId = req.query.flow as string | undefined;
   const loginChallenge = req.query.login_challenge as string | undefined;
 
+  // Break-glass selector: ?method=password forces the credential form even in
+  // Google-only mode. Persist it across the Kratos flow-creation redirect.
+  if (req.query.method === 'password') {
+    res.cookie(LOGIN_METHOD_COOKIE, 'password', {
+      httpOnly: true, sameSite: 'lax', secure: req.secure, maxAge: 5 * 60 * 1000, path: '/',
+    });
+  }
+  const wantPassword = req.query.method === 'password' || req.cookies?.[LOGIN_METHOD_COOKIE] === 'password';
+
   // If there's a Hydra login_challenge but no flow, bounce the browser
   // straight to Kratos's /self-service/login/browser?login_challenge=...
   // Kratos sees the user's actual session cookie and decides:
@@ -81,17 +102,28 @@ router.get('/login', async (req: Request, res: Response) => {
       cookie: req.headers.cookie,
     });
 
-    // No "Create an account" link — self-service registration is disabled
-    // (accounts are provisioned by an admin). Only the recovery link remains.
-    const footer = `<div class="links">
-      <a href="${kratosBrowserUrl}/self-service/recovery/browser">Forgot password?</a>
-    </div>`;
+    const googleOnly = GOOGLE_LOGIN_ENABLED && !wantPassword;
+    // In Google-only mode the footer offers the discreet break-glass link
+    // instead of password recovery; the full form keeps the recovery link.
+    // No "Create an account" link either way: password/code self-signup stays
+    // disabled (Google signup happens through the Google button itself).
+    const footer = googleOnly
+      ? `<div class="links">
+        <a href="/login?method=password">Sign in another way</a>
+      </div>`
+      : `<div class="links">
+        <a href="${kratosBrowserUrl}/self-service/recovery/browser">Forgot password?</a>
+      </div>`;
+    // NOTE: the cv_lm cookie is deliberately NOT cleared here — a failed
+    // password attempt 303s back to this flow, and clearing it would bounce
+    // the user to the Google-only page mid-error. It expires on its own.
 
     res.send(renderLoginPage(
       flow.ui.action,
       flow.ui.nodes as any,
       flow.ui.messages as any,
       footer,
+      { googleOnly },
     ));
   } catch (err: any) {
     if (err?.response?.status === 410 || err?.response?.status === 403) {
@@ -103,9 +135,53 @@ router.get('/login', async (req: Request, res: Response) => {
   }
 });
 
-// Self-service registration is disabled platform-wide (Kratos
-// selfservice.flows.registration.enabled=false). There is no portal
-// /registration route — accounts are created by an admin via /admin/users.
+// GET /registration — Kratos registration flow UI. Exists only for the
+// Google-signup path (decision D5): with auth.google.enabled the chart turns
+// the Kratos registration FLOW on, restricted to the oidc method (password/
+// code signups are rejected by the deny webhook — see routes/internal.ts).
+// The Google flow normally completes without ever showing this page; Kratos
+// sends the browser here when it has something to say (e.g. the data-mapper
+// rejected the Workspace domain, or a duplicate-email conflict), so this
+// renders the flow's nodes/messages generically.
+router.get('/registration', async (req: Request, res: Response) => {
+  const flowId = req.query.flow as string | undefined;
+
+  if (!flowId) {
+    if (process.env.GOOGLE_LOGIN_ENABLED === 'true') {
+      return res.redirect(`${kratosBrowserUrl}/self-service/registration/browser`);
+    }
+    // Registration disabled: the only accounts are admin-created.
+    return res.redirect('/login');
+  }
+
+  try {
+    const { data: flow } = await kratos.getRegistrationFlow({
+      id: flowId,
+      cookie: req.headers.cookie,
+    });
+    const footer = `<div class="links"><a href="/login">Back to Sign In</a></div>`;
+    // Only the oidc method (plus the flow's hidden defaults) is offered:
+    // password/code signup is policy-rejected by the deny webhook, so showing
+    // those fields would advertise a path that always fails.
+    const nodes = (flow.ui.nodes as any[]).filter(
+      (n) => n.group === 'oidc' || n.group === 'default',
+    );
+    res.send(renderFlow(
+      'Sign up',
+      flow.ui.action,
+      flow.ui.method,
+      nodes as any,
+      flow.ui.messages as any,
+      footer,
+    ));
+  } catch (err: any) {
+    if (err?.response?.status === 410 || err?.response?.status === 403 || err?.response?.status === 404) {
+      return res.redirect('/login');
+    }
+    console.error('Registration flow error:', err?.response?.data || err.message);
+    res.status(500).send(renderError('Registration Error', 'Failed to load registration flow.', err?.response?.data?.error?.message));
+  }
+});
 
 // GET /verification
 router.get('/verification', async (req: Request, res: Response) => {

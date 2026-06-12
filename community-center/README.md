@@ -28,13 +28,16 @@ from the image you already build.
 
 ## Authorization is built in
 
-Every request is authenticated at the platform edge before it reaches a
-container (the Ingress requires a valid Kratos session). The `database` and
-`mcp` modules resolve the caller from the forwarded session via the shared
-`lib/identity.js` helper and scope data **per user by default** — a caller only
-sees their own rows. Ticking "data is shared across users" flips that to a
-shared view (writes still record who made them). The secure posture is the
-default; sharing is the explicit opt-in.
+Every request is authenticated AND authorized at the platform edge before it
+reaches a container: visitors without `read` access to this project never get
+through, and allowed requests carry three trusted headers — `X-CV-User-Id`,
+`X-CV-User-Email`, and `X-CV-Perm` (`read` / `write` / `admin`). Read them via
+the shared `lib/identity.js` helper (`resolveUser` / `requirePerm`) and follow
+the conventions in **[ACCESS.md](ACCESS.md)**: gate mutating routes with
+`requirePerm('write')`, reserve `admin` for moderation. Data is scoped **per
+user by default** — a caller only sees their own rows. Ticking "data is shared
+across users" flips reads to a shared view (writes still record who made
+them). The secure posture is the default; sharing is the explicit opt-in.
 
 ## What's in here
 

@@ -48,6 +48,7 @@ function findBaselineDir(): string | null {
 const RENDER_VARS: Record<string, string> = {
   '{{CV_REGISTRY}}': CV_REGISTRY,
   '{{CV_PORTAL_PIN_URL}}': `${PORTAL_INTERNAL_URL}/internal/projects`,
+  '{{CV_PORTAL_INTERNAL_URL}}': PORTAL_INTERNAL_URL,
   '{{CV_PORTAL_LOGIN_URL}}': `${PORTAL_PUBLIC_URL}/login`,
   '{{CV_KRATOS_PUBLIC_URL}}': KRATOS_CLUSTER_URL,
   '{{CV_PROJECTS_DOMAIN}}': PROJECTS_DOMAIN,

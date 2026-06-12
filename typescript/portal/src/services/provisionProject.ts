@@ -11,7 +11,8 @@
 // retry from later.
 
 import type { Project } from './projects';
-import { claimOrGetPostgresPassword, decodePostgresPassword, setGiteaRepo, setPinTokenHash } from './projects';
+import { claimOrGetPostgresPassword, decodePostgresPassword, setGiteaRepo, setPinTokenHash, repoDefaultAccess } from './projects';
+import { syncRepoAccess } from './repo-access';
 import { type Capabilities, requiresPostgres, TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO } from './templates';
 import { enablePostgres, generatePostgresPassword } from './postgres';
 import { composeProjectManifests } from './manifests';
@@ -62,12 +63,20 @@ export async function provisionProject(
     const ownerUsername = ctx.ownerUsername;
     try {
       await ensureUser({ username: ownerUsername, email: ctx.email || `${ownerUsername}@unknown` });
+      // Visibility is keyed on the REPO default (it used to be keyed on the
+      // site axis, which made a shared-site/private-repo project publicly
+      // readable in Gitea).
       const fullName = await generateFromTemplate({
         ownerUsername, name: slug,
-        private: project.service_access === 'private', description: project.name,
+        private: repoDefaultAccess(project) === 'none', description: project.name,
         templateOwner: TEMPLATE_GITEA_OWNER, templateRepo: TEMPLATE_GITEA_REPO,
       });
       await setGiteaRepo(project.id, fullName);
+
+      // Converge collaborators (default-`write` fan-out for `internal`
+      // projects; explicit grants don't exist yet at create time).
+      try { await syncRepoAccess({ ...project, gitea_repo: fullName }); }
+      catch (e: any) { console.error(`[${tag}] repo access converge failed for ${slug}:`, e?.message); }
 
       // Postgres BEFORE manifests so the Secret exists before ArgoCD first
       // syncs the database container.

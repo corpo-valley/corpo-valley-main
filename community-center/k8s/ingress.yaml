@@ -5,11 +5,13 @@
 #   /     → {{SLUG}}       (the website — always)
 # Don't hand-edit — toggle capabilities in the portal.
 #
-# auth-url gates every request through Kratos's /sessions/whoami: nginx
-# forwards the request cookies, Kratos returns 200 for a valid session and 401
-# otherwise. Unauthenticated browsers are bounced to portal login via
-# auth-signin. The forwarded Kratos cookie also reaches the backend containers,
-# where the database/mcp capabilities re-validate it to identify the caller.
+# auth-url gates every request through the portal's project-access check:
+# anonymous visitors bounce to login (auth-signin), signed-in members without
+# `read` on this project get 403 at the edge, and allowed requests reach your
+# containers carrying the trusted identity headers (auth-response-headers):
+#   X-CV-User-Id, X-CV-User-Email, X-CV-Perm (read|write|admin)
+# nginx overwrites any client-supplied copies of those headers, so your code
+# may trust them as-is — see ACCESS.md for the standard.
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -18,7 +20,8 @@ metadata:
   namespace: {{SLUG}}
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
-    nginx.ingress.kubernetes.io/auth-url: "{{CV_KRATOS_PUBLIC_URL}}/sessions/whoami"
+    nginx.ingress.kubernetes.io/auth-url: "{{CV_PORTAL_INTERNAL_URL}}/access/site/{{SLUG}}"
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-CV-User-Id, X-CV-User-Email, X-CV-Perm"
     nginx.ingress.kubernetes.io/auth-signin: "{{CV_PORTAL_LOGIN_URL}}"
     nginx.ingress.kubernetes.io/auth-signin-redirect-param: "return_to"
 spec:

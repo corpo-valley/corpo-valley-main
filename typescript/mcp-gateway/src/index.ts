@@ -37,7 +37,12 @@ const PROJECT_MCP_PORT = Number(process.env.PROJECT_MCP_PORT || 80);
 // proxy idle timeouts (~60s).
 const STREAM_REVALIDATE_MS = Number(process.env.MCP_STREAM_REVALIDATE_MS || 15000);
 // First-party OIDC clients that must NOT be able to drive MCP (their tokens
-// carry the user's sub and skip consent). Same denylist as the portal MCP.
+// carry the user's sub and skip consent). Set MCP_DENY_CLIENT_IDS explicitly
+// in deployment (the chart wires `mcp.denyClientIds` to this gateway AND the
+// portal MCP, so the two enforce identically); the fallback chain here only
+// covers non-chart deploys and CAN drift from the portal's — notably, a
+// TRUSTED_CLIENT_IDS that includes an MCP-driver client (claude-code-mcp)
+// must not be used as the deny list.
 const DENY_CLIENT_IDS = (process.env.MCP_DENY_CLIENT_IDS || process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea')
   .split(',').map((s) => s.trim()).filter(Boolean);
 

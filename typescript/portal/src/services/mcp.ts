@@ -14,11 +14,11 @@
 import * as crypto from 'crypto';
 import {
   createProject, getProjectById, listProjectsByOwner, deleteProject,
-  slugExists, isValidSlug, SERVICE_ACCESS, REPO_ACCESS,
+  slugExists, isValidSlug, siteDefaultAccess, repoDefaultAccess,
   setGiteaRepo, clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
   setPinTokenHash,
-  type Project,
+  type Project, type DefaultAccess,
 } from './projects';
 import {
   enablePostgres, disablePostgres, postgresEnabled,
@@ -166,7 +166,7 @@ const tools: Record<string, ToolDef> = {
       properties: {
         name: { type: 'string', minLength: 1, description: 'Human-readable name.' },
         slug: { type: 'string', pattern: '^[a-z0-9-]+$', maxLength: 63, description: 'Optional URL slug; derived from name when omitted.' },
-        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Who can see it. `private` = only the owner; `internal` = any signed-in Corpo Valley member (still auth-gated). Defaults to private. Corpo Valley does not publish projects publicly.' },
+        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Member default access. `private` = owner only (site/repo default none); `internal` = every signed-in member gets write on the site and the repo. Defaults to private. Finer control (read-only defaults, per-user/group grants) lives in the portal project page. Corpo Valley does not publish projects publicly.' },
         capabilities: {
           type: 'object',
           description: 'Which optional capabilities to enable. The website is always on.',
@@ -185,9 +185,11 @@ const tools: Record<string, ToolDef> = {
       const name = String(args.name || '').trim();
       if (!name) throw new ToolError('name is required');
       const visibility = (args.visibility && ['private', 'internal'].includes(args.visibility)) ? args.visibility : 'private';
-      const presets: Record<string, { service: typeof SERVICE_ACCESS[number]; repo: typeof REPO_ACCESS[number] }> = {
-        private: { service: 'private', repo: 'private-edit' },
-        internal: { service: 'shared', repo: 'shared-edit' },
+      // Preset → default-access dials (none|read|write per area). Explicit
+      // user/group grants are managed from the portal's project page.
+      const presets: Record<string, { site: DefaultAccess; repo: DefaultAccess }> = {
+        private: { site: 'none', repo: 'none' },
+        internal: { site: 'write', repo: 'write' },
       };
       const preset = presets[visibility];
       const caps = parseCapabilities(args.capabilities);
@@ -203,7 +205,7 @@ const tools: Record<string, ToolDef> = {
 
       const project = await createProject({
         slug, name, ownerId: ctx.userId,
-        serviceAccess: preset.service, repoAccess: preset.repo,
+        siteDefault: preset.site, repoDefault: preset.repo,
       });
 
       // Unified provisioning (shared with the dashboard): seals the namespace
@@ -1083,8 +1085,10 @@ function toToolProject(p: Project) {
     slug: p.slug,
     name: p.name,
     url: `https://${p.slug}.${PROJECTS_DOMAIN}`,
-    service_access: p.service_access,
-    repo_access: p.repo_access,
+    // Default access every signed-in member gets, per area (none|read|write).
+    // Explicit per-user/group grants (managed in the portal UI) layer on top.
+    site_default_access: siteDefaultAccess(p),
+    repo_default_access: repoDefaultAccess(p),
     created_at: p.created_at,
     gitea_repo: p.gitea_repo,
     gitea_url: p.gitea_repo ? `${GITEA_PUBLIC_URL}/${p.gitea_repo}` : null,

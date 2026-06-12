@@ -411,6 +411,90 @@ export async function deleteRepo(opts: { owner: string; repo: string }): Promise
   }
 }
 
+// ── Collaborators & repo visibility (project access grants) ───────────────
+//
+// Repo-area grants (read/write/admin) map 1:1 onto Gitea collaborator
+// permissions; the repo default dial maps onto repo visibility (none →
+// private, read/write → org-visible). services/repo-access.ts computes the
+// desired collaborator set and converges Gitea to it with these helpers.
+
+export type GiteaRepoPermission = 'read' | 'write' | 'admin';
+
+// Current collaborators with their effective permission level. Gitea reports
+// permissions as a {admin, push, pull} object; collapse to our three levels.
+export async function listCollaborators(opts: {
+  owner: string; repo: string;
+}): Promise<Array<{ username: string; permission: GiteaRepoPermission }>> {
+  if (!giteaEnabled()) return [];
+  const out: Array<{ username: string; permission: GiteaRepoPermission }> = [];
+  // Default-write fan-out can produce hundreds of collaborators; page through
+  // (50/page, hard cap 40 pages = 2000) rather than truncating silently.
+  for (let page = 1; page <= 40; page++) {
+    let res: Array<{ login: string; permissions?: { admin?: boolean; push?: boolean; pull?: boolean } }>;
+    try {
+      res = await call(
+        `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/collaborators?limit=50&page=${page}`
+      );
+    } catch (err) {
+      if (err instanceof GiteaApiError && err.status === 404) return out;
+      throw err;
+    }
+    if (!Array.isArray(res) || res.length === 0) break;
+    for (const c of res) {
+      out.push({
+        username: c.login,
+        permission: c.permissions?.admin ? 'admin' : c.permissions?.push ? 'write' : 'read',
+      });
+    }
+    if (res.length < 50) break;
+  }
+  return out;
+}
+
+// Add or update a collaborator at a permission level. Idempotent — Gitea's
+// PUT both creates and updates. Same reserved-name backstop as
+// mintUserCliToken: never let a grant target a platform account.
+export async function setCollaborator(opts: {
+  owner: string; repo: string; username: string; permission: GiteaRepoPermission;
+}): Promise<void> {
+  if (!giteaEnabled()) return;
+  if (isReservedUsername(opts.username) || !isValidUsername(opts.username)) {
+    throw new GiteaApiError(0, { message: `refusing to add reserved or invalid collaborator "${opts.username}"` });
+  }
+  await call(
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/collaborators/${encodeURIComponent(opts.username)}`,
+    { method: 'PUT', body: JSON.stringify({ permission: opts.permission }) }
+  );
+}
+
+// Remove a collaborator. Idempotent — 404 (not a collaborator / no such user)
+// is success.
+export async function removeCollaborator(opts: {
+  owner: string; repo: string; username: string;
+}): Promise<void> {
+  if (!giteaEnabled()) return;
+  try {
+    await call(
+      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/collaborators/${encodeURIComponent(opts.username)}`,
+      { method: 'DELETE' }
+    );
+  } catch (err) {
+    if (err instanceof GiteaApiError && err.status === 404) return;
+    throw err;
+  }
+}
+
+// Flip a repo between private and org-visible. Idempotent PATCH.
+export async function setRepoVisibility(opts: {
+  owner: string; repo: string; private: boolean;
+}): Promise<void> {
+  if (!giteaEnabled()) return;
+  await call(
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}`,
+    { method: 'PATCH', body: JSON.stringify({ private: opts.private }) }
+  );
+}
+
 // ── Pull requests ──────────────────────────────────────────────────────────
 //
 // Used by the MCP `list_prs` / `create_pr` / `merge_pr` tools so an agent can
@@ -863,9 +947,18 @@ export async function provisionGiteaForIdentities(
   const collect = (id: { traits?: any } | null) => {
     if (!id) return;
     const traits = (id.traits ?? {}) as Record<string, any>;
-    const username = traits.preferred_username;
     const email = traits.email;
+    // Username convention: preferred_username, else the email local part —
+    // Google-signup identities carry no username trait but still need a Gitea
+    // account for repo grants. Reserved/invalid derivations are refused (the
+    // same backstop mintUserCliToken enforces).
+    const username = traits.preferred_username
+      || (typeof email === 'string' && email.includes('@') ? email.split('@')[0] : null);
     if (!username || !email) return;
+    if (!isValidUsername(username) || isReservedUsername(username)) {
+      console.warn('[gitea] skipping account provisioning for reserved/invalid derived username', username);
+      return;
+    }
     const first = traits?.name?.first || '';
     const last = traits?.name?.last || '';
     const fullName = `${first} ${last}`.trim() || undefined;

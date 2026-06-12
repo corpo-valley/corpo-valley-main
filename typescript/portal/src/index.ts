@@ -8,6 +8,8 @@ import adminRouter from './routes/admin';
 import internalRouter from './routes/internal';
 import mcpRouter from './routes/mcp';
 import docsRouter from './routes/docs';
+import siteAccessRouter from './routes/site-access';
+import groupsRouter from './routes/groups';
 import { validateCsrf } from './middleware/csrf';
 import { migrate } from './services/projects';
 import { backfillPinTokens } from './services/pin-token-backfill';
@@ -107,6 +109,10 @@ app.use(hydraRouter);
 // Internal webhooks (cluster-only, no CSRF, no session — Kratos posts here)
 app.use(internalRouter);
 
+// Project-site auth subrequests from ingress-nginx (GET-only, validates the
+// forwarded Kratos cookie itself — no session middleware, no CSRF).
+app.use(siteAccessRouter);
+
 // MCP server (Bearer-token auth via Hydra introspection; no CSRF, no
 // session cookies). Mounted BEFORE the CSRF middleware below so it isn't
 // caught by it.
@@ -119,9 +125,13 @@ app.use(docsRouter);
 app.use('/projects', validateCsrf);
 app.use('/keys', validateCsrf);
 app.use('/admin', validateCsrf);
+app.use('/groups', validateCsrf);
 
 // Admin routes (session + admin required) — scoped to /admin
 app.use('/admin', adminRouter);
+
+// Groups (session required)
+app.use(groupsRouter);
 
 // Dashboard routes (session required) — last since it has GET /
 app.use(dashboardRouter);
