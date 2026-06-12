@@ -10,12 +10,13 @@ import { Router, Request, Response } from 'express';
 import { introspectToken } from '../services/hydra-introspect';
 import { dispatchJsonRpc, type McpContext } from '../services/mcp';
 import { getIdentity } from '../services/kratos-admin';
+import {
+  PUBLIC_MCP_URL,
+  OAUTH_PUBLIC_URL as HYDRA_PUBLIC_URL,
+  PORTAL_PUBLIC_URL as PORTAL_BASE_URL,
+} from '../services/platform-config';
 
 const router = Router();
-
-const PUBLIC_MCP_URL = process.env.PUBLIC_MCP_URL || 'https://mcp.corpo-valley.com';
-const HYDRA_PUBLIC_URL = process.env.HYDRA_PUBLIC_URL || 'https://oauth.corpo-valley.com';
-const PORTAL_BASE_URL = process.env.BASE_URL || 'https://portal.corpo-valley.com';
 
 // RFC 9728 — Protected Resource Metadata. MCP clients hit this from the
 // `WWW-Authenticate` Bearer realm header (or by appending the well-known

@@ -4,6 +4,7 @@ import {
   renderFlow, renderError,
   renderLoginPage, renderRecoveryPage, renderSettingsPage,
 } from '../templates';
+import { PROJECTS_DOMAIN } from '../services/platform-config';
 
 const router = Router();
 
@@ -27,14 +28,15 @@ const LOGIN_METHOD_COOKIE = 'cv_lm';
 // own internal flows don't use return_to (they fall through to Kratos's
 // default_browser_return_url), so we can keep this strict to prevent the
 // /login?return_to= parameter from being abused as an open redirect.
-// `endsWith('.projects.corpo-valley.com')` rejects `projects.corpo-valley.com`
-// itself and attacker-controlled lookalikes like `xprojects.corpo-valley.com`
-// or `x.projects.corpo-valley.com.evil.com`.
+// `endsWith('.' + PROJECTS_DOMAIN)` rejects `<PROJECTS_DOMAIN>` itself and
+// attacker-controlled lookalikes like `x<PROJECTS_DOMAIN>` or
+// `x.<PROJECTS_DOMAIN>.evil.com`.
+const PROJECTS_HOST_SUFFIX = '.' + PROJECTS_DOMAIN;
 function isSafeRedirect(url: string): boolean {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== 'https:') return false;
-    return parsed.hostname.endsWith('.projects.corpo-valley.com');
+    return parsed.hostname.endsWith(PROJECTS_HOST_SUFFIX);
   } catch {
     return false;
   }
