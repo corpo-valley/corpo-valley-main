@@ -238,9 +238,23 @@ router.post('/users/:id/delete', async (req: Request, res: Response) => {
   try {
     const result = await deleteUserCascade(identity);
     const traits = (identity.traits ?? {}) as Record<string, any>;
-    console.log(`[admin] user ${traits.email || targetId} deleted by ${session.email}: ` +
-      `${result.projectsPurged} project(s), ${result.groupsDeleted} group(s), ${result.apiKeysRevoked} key(s)` +
-      (result.errors.length ? `; ${result.errors.length} non-fatal error(s): ${result.errors.join('; ')}` : ''));
+    const who = traits.email || targetId;
+    console.log(`[admin] user ${who} delete by ${session.email}: ` +
+      `${result.projectsPurged} project(s), ${result.groupsDeleted} group(s), ${result.apiKeysRevoked} key(s), ` +
+      `identityDeleted=${result.identityDeleted}` +
+      (result.errors.length ? `; ${result.errors.length} error(s): ${result.errors.join('; ')}` : ''));
+    // Don't report a clean success when teardown was partial — the admin must
+    // know what's left and (if the identity was kept) that they can retry.
+    if (result.errors.length) {
+      const retryNote = result.identityDeleted
+        ? 'The account was removed, but the listed resources may need manual cleanup.'
+        : 'The account was KEPT so you can re-run the delete once the issue clears.';
+      res.status(500).send(renderError(
+        'User deletion incomplete',
+        `Some teardown steps for ${who} did not complete:\n\n- ${result.errors.join('\n- ')}\n\n${retryNote}`,
+      ));
+      return;
+    }
     res.redirect('/admin/users');
   } catch (err: any) {
     console.error('Delete user error:', err?.message);

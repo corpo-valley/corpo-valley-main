@@ -34,12 +34,26 @@ export interface UserDeleteResult {
   groupsDeleted: number;
   apiKeysRevoked: number;
   errors: string[];
+  // True iff the Kratos identity (the login + the only handle the cascade can
+  // be retried from) was actually deleted. False means a credential-bearing
+  // teardown step failed and the identity was deliberately KEPT so the admin can
+  // re-run the delete — see the gate on step 7.
+  identityDeleted: boolean;
 }
 
 export async function deleteUserCascade(human: Identity): Promise<UserDeleteResult> {
-  const result: UserDeleteResult = { projectsPurged: 0, groupsDeleted: 0, apiKeysRevoked: 0, errors: [] };
+  const result: UserDeleteResult = {
+    projectsPurged: 0, groupsDeleted: 0, apiKeysRevoked: 0, errors: [], identityDeleted: false,
+  };
   const userId = human.id;
   const humanUsername = giteaUsernameForIdentity(human);
+  // Tracks whether every CREDENTIAL-bearing teardown (API keys, Gitea accounts —
+  // the things that grant access independently of the Kratos identity, e.g. a
+  // Gitea PAT the user minted) succeeded. We only delete the Kratos identity if
+  // it did: deleting the identity is the irreversible step that loses the handle
+  // the cascade re-derives usernames from, so doing it while a Gitea account
+  // still lives would orphan that account (and its PATs) with no way to retry.
+  let credentialTeardownOk = true;
 
   // 1. Owned projects — full external purge, then DB row.
   try {
@@ -81,9 +95,9 @@ export async function deleteUserCascade(human: Identity): Promise<UserDeleteResu
   try {
     for (const key of await listUserApiKeys(userId)) {
       try { await deleteClient(key.client_id || ''); result.apiKeysRevoked++; }
-      catch (e: any) { result.errors.push(`api key ${key.client_id}: ${e?.message}`); }
+      catch (e: any) { result.errors.push(`api key ${key.client_id}: ${e?.message}`); credentialTeardownOk = false; }
     }
-  } catch (e: any) { result.errors.push(`list api keys: ${e?.message}`); }
+  } catch (e: any) { result.errors.push(`list api keys: ${e?.message}`); credentialTeardownOk = false; }
 
   // 5. Admin role tuple (no-op for a regular user).
   try { await setUserAdmin(userId, false); }
@@ -97,20 +111,30 @@ export async function deleteUserCascade(human: Identity): Promise<UserDeleteResu
   const botUsername = typeof botTraits.preferred_username === 'string' ? botTraits.preferred_username : null;
   if (botUsername) {
     try { await deleteGiteaUser(botUsername, { allowBot: true }); }
-    catch (e: any) { result.errors.push(`gitea bot ${botUsername}: ${e?.message}`); }
+    catch (e: any) { result.errors.push(`gitea bot ${botUsername}: ${e?.message}`); credentialTeardownOk = false; }
   }
   if (humanUsername) {
     try { await deleteGiteaUser(humanUsername); }
-    catch (e: any) { result.errors.push(`gitea user ${humanUsername}: ${e?.message}`); }
+    catch (e: any) { result.errors.push(`gitea user ${humanUsername}: ${e?.message}`); credentialTeardownOk = false; }
   }
 
   // 7. Kratos identities — bot first (its human_id points back here), then human.
-  if (bot) {
-    try { await deleteIdentity(bot.id); }
-    catch (e: any) { result.errors.push(`delete bot identity: ${e?.message}`); }
+  //    ONLY if the credential-bearing teardown succeeded: otherwise we keep the
+  //    identity so the admin can re-run the cascade (a retry re-derives the
+  //    Gitea username from it). Deleting it now would strand a live Gitea
+  //    account + its PATs with no handle to reap them — a zombie-access window.
+  if (credentialTeardownOk) {
+    if (bot) {
+      try { await deleteIdentity(bot.id); }
+      catch (e: any) { result.errors.push(`delete bot identity: ${e?.message}`); }
+    }
+    try {
+      await deleteIdentity(userId);
+      result.identityDeleted = true;
+    } catch (e: any) { result.errors.push(`delete identity: ${e?.message}`); }
+  } else {
+    result.errors.push('kept the Kratos identity for retry: credential teardown (API keys / Gitea accounts) did not fully succeed');
   }
-  try { await deleteIdentity(userId); }
-  catch (e: any) { result.errors.push(`delete identity: ${e?.message}`); }
 
   return result;
 }
