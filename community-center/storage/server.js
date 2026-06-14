@@ -17,14 +17,20 @@
 //   write  can create/update/delete THEIR OWN files → mutating routes
 //   admin  app-level moderator → may delete ANYONE's objects here
 //
-// By default every object is scoped to its owner: keys are prefixed with the
-// caller's user id (`<userId>/<name>`), so a caller only ever lists, reads and
-// deletes their own files. The platform flips CV_SHARED=true when the project
-// owner ticks "data is shared across users", which drops the prefix and turns
-// the bucket into one shared view (writes still record the author in the key's
-// metadata is not used here; the key itself carries no owner when shared). The
-// secure posture — per-user isolation — is the default; sharing is the explicit
-// opt-in.
+// ── Ownership is always recorded ──────────────────────────────────────────
+// Every object is stored under its author's prefix — `<userId>/<name>` —
+// ALWAYS, in both modes. That is what lets `write` mean "your own files" and
+// `admin` mean "anyone's", exactly like the database capability keeps an
+// owner_id per row. CV_SHARED only widens what reads return; it never widens
+// who may mutate whose data:
+//
+//   CV_SHARED=false (default): a caller only ever lists/reads/writes/deletes
+//     under their own `<userId>/` prefix. Full per-user isolation.
+//   CV_SHARED=true: reads + lists span EVERY author's objects (the shared
+//     view), and the listing carries each object's `owner` so callers can
+//     address a specific one. But writes still land only in the caller's own
+//     prefix (no overwriting a peer's file), and deleting someone else's
+//     object requires `admin`.
 //
 // The platform injects the S3 connection details from the per-project `garage`
 // Secret via the Deployment's env (endpoint, credentials, bucket). No
@@ -46,11 +52,11 @@ const { requirePerm } = require('../lib/identity');
 const app = express();
 const PORT = process.env.PORT || 7000;
 
-// When true, the bucket is one shared view: objects are stored without an
-// owner prefix and every caller lists/reads the whole bucket. When false
-// (default), each caller is confined to their own `<userId>/` prefix. Set by
-// the platform from the project's "shared across users" setting — don't read it
-// from request input.
+// When true, reads + lists span every author's objects (the shared view). It
+// does NOT change who may write or delete what — writes are always confined to
+// the caller's own prefix and cross-author deletes require admin. Set by the
+// platform from the project's "shared across users" setting — never read from
+// request input.
 const SHARED = process.env.CV_SHARED === 'true';
 
 // The platform populates these from the per-project `garage` Secret via the
@@ -94,18 +100,10 @@ function csrfGuard(req, res, next) {
 }
 app.use(csrfGuard);
 
-// The caller's key prefix. Per-user isolation is the default; SHARED drops it
-// so all objects live flat in the bucket. The prefix is derived from the
-// resolved identity (req.userId), never from request input, so a caller can't
-// reach into another user's space by crafting an object name.
-function prefixFor(userId) {
-  return SHARED ? '' : `${userId}/`;
-}
-
-// Sanitize a user-supplied object name. We reject path traversal, leading
-// slashes and anything outside a conservative charset, so the name can only
-// ever name a file inside the caller's own prefix — never climb out of it.
-// Returns the safe name, or null if it must be refused.
+// Sanitize a user-supplied object name (the part within an owner's space).
+// Rejects path traversal, leading slashes and anything outside a conservative
+// charset, so a name can only ever address a flat file inside one prefix —
+// never climb out of it. Returns the safe name, or null if it must be refused.
 function safeName(input) {
   if (typeof input !== 'string') return null;
   const name = input.trim();
@@ -117,31 +115,58 @@ function safeName(input) {
   return name;
 }
 
+// Sanitize an owner segment (a caller's identity id, e.g. a Kratos UUID). Same
+// conservative rules as a name — it's a single flat key segment, never a path.
+function safeOwner(input) {
+  if (typeof input !== 'string') return null;
+  const owner = input.trim();
+  if (!owner || owner.length > 256) return null;
+  if (owner.startsWith('/') || owner.includes('..') || owner.includes('/')) return null;
+  if (!/^[A-Za-z0-9._-]+$/.test(owner)) return null;
+  return owner;
+}
+
+// Resolve which object a read/delete request targets, and whose it is. The
+// owner is taken from the trusted identity by default; in SHARED mode a caller
+// may name another owner via ?owner=<id> (used to reach objects the shared
+// listing surfaced). In per-user mode the owner is ALWAYS the caller — any
+// ?owner is ignored — so there is no way to address another space. Returns
+// { key, crossOwner } or null if the inputs are invalid.
+function resolveTarget(req) {
+  const name = safeName(req.params.name);
+  if (!name) return null;
+  let owner = req.userId;
+  if (SHARED && typeof req.query.owner === 'string' && req.query.owner) {
+    const o = safeOwner(req.query.owner);
+    if (!o) return null;
+    owner = o;
+  }
+  return { key: `${owner}/${name}`, crossOwner: owner !== req.userId };
+}
+
 const files = express.Router();
 // Identity + permission gate. `read` is the floor — the edge already blocks
 // anyone below it, so this mostly matters for local runs without the headers.
 files.use(requirePerm('read'));
 
-// List objects the caller is allowed to see. The prefix decides scope: per-user
-// callers only ever list under their own `<userId>/`; SHARED lists the bucket.
-// Keys are returned with the prefix stripped so the client sees plain names.
+// List objects the caller may see. Per-user callers list only their own
+// `<userId>/` prefix; SHARED lists the whole bucket. Each entry carries its
+// `owner` and bare `name` (and the full `key`) so a SHARED caller can address a
+// specific peer's object on a later GET/DELETE via ?owner=.
 files.get('/', async (req, res) => {
-  const prefix = prefixFor(req.userId);
+  const prefix = SHARED ? '' : `${req.userId}/`;
   try {
     const out = await s3.send(new ListObjectsV2Command({
       Bucket: BUCKET,
       Prefix: prefix,
       MaxKeys: 1000,
     }));
-    const objects = (out.Contents || [])
-      // A shared bucket may also hold per-user-prefixed keys from when sharing
-      // was off; in SHARED mode we still surface everything under the (empty)
-      // prefix, so just strip whatever prefix applies.
-      .map((o) => ({
-        key: prefix && o.Key.startsWith(prefix) ? o.Key.slice(prefix.length) : o.Key,
-        size: o.Size,
-        lastModified: o.LastModified,
-      }));
+    const objects = (out.Contents || []).map((o) => {
+      const slash = o.Key.indexOf('/');
+      const owner = slash >= 0 ? o.Key.slice(0, slash) : '';
+      const name = slash >= 0 ? o.Key.slice(slash + 1) : o.Key;
+      return { key: o.Key, owner, name, size: o.Size, lastModified: o.LastModified };
+    });
     res.json({ shared: SHARED, files: objects });
   } catch (err) {
     console.error('GET /files failed:', err.message);
@@ -149,11 +174,10 @@ files.get('/', async (req, res) => {
   }
 });
 
-// Presign a direct upload. Requires the `write` class. The browser POSTs the
-// desired name, gets back a short-lived PUT URL, and uploads straight to
-// Garage — the bytes never pass through this service. The key is always built
-// from the caller's prefix + a sanitized name, so a caller can only ever write
-// inside their own space.
+// Presign a direct upload. Requires the `write` class. The key is ALWAYS built
+// from the caller's OWN prefix + a sanitized name — even in SHARED mode — so a
+// caller can only ever create or replace files inside their own space and can
+// never overwrite a peer's object.
 files.post('/presign', requirePerm('write'), async (req, res) => {
   const name = safeName(req.body?.name);
   if (!name) {
@@ -163,33 +187,31 @@ files.post('/presign', requirePerm('write'), async (req, res) => {
   const contentType = typeof req.body?.contentType === 'string'
     ? req.body.contentType.slice(0, 255)
     : undefined;
-  const key = `${prefixFor(req.userId)}${name}`;
+  const key = `${req.userId}/${name}`;
   try {
     const url = await getSignedUrl(
       s3,
       new PutObjectCommand({ Bucket: BUCKET, Key: key, ContentType: contentType }),
       { expiresIn: PRESIGN_EXPIRY_S }
     );
-    res.json({ url, key: name, method: 'PUT', expiresIn: PRESIGN_EXPIRY_S });
+    res.json({ url, key, name, method: 'PUT', expiresIn: PRESIGN_EXPIRY_S });
   } catch (err) {
     console.error('POST /files/presign failed:', err.message);
     res.status(500).json({ error: 'storage error' });
   }
 });
 
-// Presign a download for one of the caller's objects and 302 to it, so a plain
-// <a href> or fetch lands on the bytes. We HEAD first so a missing object is a
-// clean 404 rather than a redirect to a URL that will 404 at Garage. The key is
-// scoped to the caller's prefix; the name is sanitized so it can't escape it.
+// Presign a download and 302 to it. A per-user caller can only reach their own
+// objects; a SHARED caller may reach any author's (reads span the shared view)
+// by passing ?owner=<id>. We HEAD first so a missing object is a clean 404.
 files.get('/:name', async (req, res) => {
-  const name = safeName(req.params.name);
-  if (!name) {
-    res.status(400).json({ error: 'invalid name' });
+  const target = resolveTarget(req);
+  if (!target) {
+    res.status(400).json({ error: 'invalid name or owner' });
     return;
   }
-  const key = `${prefixFor(req.userId)}${name}`;
   try {
-    await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+    await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: target.key }));
   } catch (err) {
     if (err?.$metadata?.httpStatusCode === 404 || err?.name === 'NotFound') {
       res.status(404).json({ error: 'not found' });
@@ -202,7 +224,7 @@ files.get('/:name', async (req, res) => {
   try {
     const url = await getSignedUrl(
       s3,
-      new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+      new GetObjectCommand({ Bucket: BUCKET, Key: target.key }),
       { expiresIn: PRESIGN_EXPIRY_S }
     );
     res.redirect(302, url);
@@ -212,24 +234,26 @@ files.get('/:name', async (req, res) => {
   }
 });
 
-// Delete an object. `write` callers can only delete files under their own
-// prefix; `admin` callers (app-level moderators) may delete anyone's — but only
-// when the bucket is SHARED, where keys aren't owner-prefixed. With per-user
-// isolation there is no "anyone else" to reach, so admin and write behave the
-// same: both are confined to the caller's own prefix.
+// Delete an object. `write` callers may delete only their OWN files. Deleting
+// another author's object (only addressable in SHARED mode via ?owner=) is a
+// moderator action and requires `admin` — mirroring the database capability,
+// where cross-owner row deletes are admin-only regardless of CV_SHARED.
 files.delete('/:name', requirePerm('write'), async (req, res) => {
-  const name = safeName(req.params.name);
-  if (!name) {
-    res.status(400).json({ error: 'invalid name' });
+  const target = resolveTarget(req);
+  if (!target) {
+    res.status(400).json({ error: 'invalid name or owner' });
     return;
   }
-  const key = `${prefixFor(req.userId)}${name}`;
+  if (target.crossOwner && req.userPerm !== 'admin') {
+    res.status(403).json({ error: 'deleting another user\'s file requires admin' });
+    return;
+  }
   try {
     // HEAD first so we can report whether anything was actually removed —
     // S3 DELETE is idempotent and 204s even for a missing key.
     let existed = true;
     try {
-      await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+      await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: target.key }));
     } catch (err) {
       if (err?.$metadata?.httpStatusCode === 404 || err?.name === 'NotFound') {
         existed = false;
@@ -238,7 +262,7 @@ files.delete('/:name', requirePerm('write'), async (req, res) => {
       }
     }
     if (existed) {
-      await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+      await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: target.key }));
     }
     res.json({ deleted: existed });
   } catch (err) {
