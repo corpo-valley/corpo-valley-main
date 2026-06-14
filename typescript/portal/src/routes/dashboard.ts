@@ -11,6 +11,7 @@ import {
   setGiteaRepo,
   clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
+  clearGarageCredentials, claimOrGetGarageCredentials, decodeGarageCredentials,
   setPinTokenHash,
   DefaultAccess, GrantLevel,
 } from '../services/projects';
@@ -30,6 +31,13 @@ import {
   postgresEnabled as projectPostgresEnabled,
   generatePostgresPassword,
 } from '../services/postgres';
+import {
+  enableGarage as enableProjectGarage,
+  disableGarage as disableProjectGarage,
+  destroyGaragePvc,
+  garageEnabled as projectGarageEnabled,
+  generateGarageCredentials,
+} from '../services/garage';
 import {
   parseCapabilities, requiresPostgres, capabilityList,
   TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO,
@@ -89,7 +97,7 @@ function toProjectRow(p: {
   service_access: string; repo_access: string; created_at: string;
   site_default_access?: string | null; repo_default_access?: string | null;
   gitea_repo?: string | null;
-}, extras: { postgresEnabled?: boolean } = {}): ProjectRow {
+}, extras: { postgresEnabled?: boolean; storageEnabled?: boolean } = {}): ProjectRow {
   return {
     id: p.id,
     slug: p.slug,
@@ -99,6 +107,7 @@ function toProjectRow(p: {
     createdAt: p.created_at ? new Date(p.created_at).toLocaleDateString() : '—',
     giteaRepo: p.gitea_repo ?? null,
     postgresEnabled: extras.postgresEnabled ?? false,
+    storageEnabled: extras.storageEnabled ?? false,
   };
 }
 
@@ -183,6 +192,7 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
   // are shared across users", so enabling it also turns sharing on.
   const caps = parseCapabilities({
     database: req.body?.database,
+    storage: req.body?.storage,
     mcp: req.body?.mcp,
     shared: req.body?.database,
   });
@@ -278,15 +288,17 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
     const csrf = csrfHiddenField(req, res);
     const secrets = await listProjectSecretNames(project);
     let postgresEnabledNow = false;
+    let storageEnabledNow = false;
     if (project.gitea_repo) {
       const [pgOwner, pgRepo] = project.gitea_repo.split('/');
       postgresEnabledNow = await projectPostgresEnabled({ owner: pgOwner, repo: pgRepo }).catch(() => false);
+      storageEnabledNow = await projectGarageEnabled({ owner: pgOwner, repo: pgRepo }).catch(() => false);
     }
     const grants = await listProjectGrants(project.id).catch(() => []);
     const groups = await listGroups().catch(() => []);
     res.send(renderProjectDetail(
       session.email, isAdmin,
-      toProjectRow(project, { postgresEnabled: postgresEnabledNow }),
+      toProjectRow(project, { postgresEnabled: postgresEnabledNow, storageEnabled: storageEnabledNow }),
       csrf, secrets, null,
       grants, groups.map((g) => ({ name: g.name, memberCount: g.member_count })),
     ));
@@ -542,6 +554,75 @@ router.post('/projects/:id/postgres/disable', requireSession, requireVerifiedEma
   } catch (err: any) {
     console.error('Postgres disable error:', err?.message);
     res.status(500).send(renderError('Error', 'Failed to disable Postgres.'));
+  }
+});
+
+// POST /projects/:id/storage/enable — turn on per-project Garage object store.
+//
+// Idempotent: commits k8s/garage.yaml + k8s/secrets/garage.sealed.yaml to the
+// user's repo as cvportal. ArgoCD syncs them into the project's namespace
+// within ~a minute and the self-bootstrapping image creates the bucket + key.
+// The credentials live in the projects row so a later disable/enable cycle
+// keeps the same access key and the existing PVC's objects stay usable.
+router.post('/projects/:id/storage/enable', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const project = await getProjectById(req.params.id);
+    if (!project || project.owner_id !== session.id) {
+      res.status(404).send(renderError('Not Found', 'Project not found.'));
+      return;
+    }
+    if (!project.gitea_repo) {
+      res.status(400).send(renderError('Bad Request', 'Project has no Gitea repo.'));
+      return;
+    }
+    const [owner, repo] = project.gitea_repo.split('/');
+    // Atomic claim: concurrent calls don't desync the DB credentials from the
+    // ones that end up sealed in the repo. See
+    // services/projects.ts:claimOrGetGarageCredentials.
+    const existing = decodeGarageCredentials(project);
+    const { creds } = existing
+      ? { creds: existing }
+      : await claimOrGetGarageCredentials(project.id, generateGarageCredentials());
+    await enableProjectGarage({ owner, repo, slug: project.slug, creds });
+    res.redirect(`/projects/${project.id}`);
+  } catch (err: any) {
+    console.error('Storage enable error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to enable storage.'));
+  }
+});
+
+// POST /projects/:id/storage/disable — remove the garage manifest + sealed
+// secret (ArgoCD prunes the StatefulSet/Service). If the form carries
+// destroy_data=true the portal also deletes the PVC and clears the stored
+// credentials so the next enable starts fresh.
+router.post('/projects/:id/storage/disable', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const destroyData = req.body?.destroy_data === 'true' || req.body?.destroy_data === 'on';
+  try {
+    const project = await getProjectById(req.params.id);
+    if (!project || project.owner_id !== session.id) {
+      res.status(404).send(renderError('Not Found', 'Project not found.'));
+      return;
+    }
+    if (!project.gitea_repo) {
+      res.status(400).send(renderError('Bad Request', 'Project has no Gitea repo.'));
+      return;
+    }
+    const [owner, repo] = project.gitea_repo.split('/');
+    await disableProjectGarage({ owner, repo });
+    if (destroyData) {
+      // Best-effort: the PVC delete may queue behind the StatefulSet pod
+      // terminating. We clear the credentials regardless — re-enable mints
+      // fresh ones against the fresh PVC.
+      try { await destroyGaragePvc(project.slug); }
+      catch (e: any) { console.warn('[storage/disable] PVC delete failed:', e?.message); }
+      await clearGarageCredentials(project.id);
+    }
+    res.redirect(`/projects/${project.id}`);
+  } catch (err: any) {
+    console.error('Storage disable error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to disable storage.'));
   }
 });
 

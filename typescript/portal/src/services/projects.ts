@@ -1,5 +1,6 @@
 import { Pool } from 'pg';
 import { encryptSecret, decryptSecret, needsReencrypt, secretCryptoAvailable } from './secret-crypto';
+import type { GarageCredentials } from './garage';
 
 // Resolve the portal's Postgres connection string. In production DATABASE_URL
 // MUST be set: silently falling back to the well-known `portal:portal@localhost`
@@ -95,6 +96,12 @@ export interface Project {
   // directory (volumeClaimTemplate PVC survives a disable). Cleared when the
   // owner explicitly destroys the data via disable + destroy_data.
   postgres_password: string | null;
+  // Set when this project has ever had the storage capability enabled.
+  // Encrypted JSON blob of the per-project Garage credentials
+  // (GarageCredentials). Kept across disable/enable cycles for the same reason
+  // as postgres_password — the re-imported access key must still authorise
+  // against the surviving data PVC. Cleared on disable + destroy_data.
+  garage_creds: string | null;
   // sha256(plaintext token) of the per-project CV_PIN_TOKEN that the
   // project's Build workflow sends to POST /internal/projects/:slug/pin.
   // The plaintext is set as a Gitea Actions secret on the repo at
@@ -187,6 +194,8 @@ export async function migrate(): Promise<void> {
   // Per-project Postgres password (only ever set once per data lifecycle —
   // see services/postgres.ts).
   await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS postgres_password text;');
+  // Per-project Garage credentials (encrypted JSON) — see services/garage.ts.
+  await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS garage_creds text;');
   // CV_PIN_TOKEN hash — see routes/internal.ts. The token authenticates the
   // project's Build workflow's pin request; we only store the hash.
   await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS pin_token_hash text;');
@@ -246,46 +255,51 @@ export async function migrate(): Promise<void> {
   await pool.query('CREATE INDEX IF NOT EXISTS project_grants_subject_idx ON project_grants (subject_type, subject_id);');
   await pool.query('CREATE INDEX IF NOT EXISTS group_members_user_idx ON group_members (user_id);');
 
-  // Bring every stored postgres_password under the CURRENT encryption key:
+  // Bring every stored per-project secret under the CURRENT encryption key:
   // re-encrypts legacy cleartext AND ciphertext written under a now-retired key
-  // (key rotation). decryptSecret→encryptSecret preserves the exact password, so
-  // the per-project databases stay reachable. Skipped (with a warning) when the
-  // key isn't configured, so the portal still boots.
+  // (key rotation). decryptSecret→encryptSecret preserves the exact value, so
+  // the per-project databases (postgres_password) and object stores
+  // (garage_creds) stay reachable. Skipped (with a warning) when the key isn't
+  // configured, so the portal still boots.
   const isProd = process.env.NODE_ENV === 'production';
+  // Each persisted-secret column gets the same re-encrypt treatment.
+  const SECRET_COLUMNS = ['postgres_password', 'garage_creds'] as const;
   if (secretCryptoAvailable()) {
-    const { rows } = await pool.query<{ id: string; postgres_password: string }>(
-      'SELECT id, postgres_password FROM projects WHERE postgres_password IS NOT NULL'
-    );
     let migrated = 0;
     let stillUnprotected = 0;
-    for (const row of rows) {
-      if (!needsReencrypt(row.postgres_password)) continue;
-      try {
-        const plain = decryptSecret(row.postgres_password);
-        await pool.query('UPDATE projects SET postgres_password = $2 WHERE id = $1', [
-          row.id, encryptSecret(plain),
-        ]);
-        migrated++;
-      } catch (e: any) {
-        // Can't decrypt (e.g. retired key dropped before migration) — leaves the
-        // row unprotected/inaccessible. Surface loudly; fail closed in prod below.
-        stillUnprotected++;
-        console.error('[projects] could not re-encrypt postgres_password for', row.id, '-', e?.message);
+    for (const col of SECRET_COLUMNS) {
+      const { rows } = await pool.query<{ id: string; val: string }>(
+        `SELECT id, ${col} AS val FROM projects WHERE ${col} IS NOT NULL`
+      );
+      for (const row of rows) {
+        if (!needsReencrypt(row.val)) continue;
+        try {
+          const plain = decryptSecret(row.val);
+          await pool.query(`UPDATE projects SET ${col} = $2 WHERE id = $1`, [
+            row.id, encryptSecret(plain),
+          ]);
+          migrated++;
+        } catch (e: any) {
+          // Can't decrypt (e.g. retired key dropped before migration) — leaves
+          // the row unprotected/inaccessible. Surface loudly; fail closed below.
+          stillUnprotected++;
+          console.error(`[projects] could not re-encrypt ${col} for`, row.id, '-', e?.message);
+        }
       }
     }
     if (migrated > 0) {
-      console.log(`Re-encrypted ${migrated} postgres_password value(s) under the current key`);
+      console.log(`Re-encrypted ${migrated} per-project secret value(s) under the current key`);
     }
     // Fail closed in production: a leftover cleartext/undecryptable row defeats
     // the at-rest protection this module exists to provide.
     if (isProd && stillUnprotected > 0) {
-      throw new Error(`${stillUnprotected} postgres_password row(s) remain unprotected after migration — refusing to start in production. Ensure PORTAL_SECRET_KEY (and PORTAL_SECRET_KEY_OLD for rotation) are set.`);
+      throw new Error(`${stillUnprotected} per-project secret row(s) remain unprotected after migration — refusing to start in production. Ensure PORTAL_SECRET_KEY (and PORTAL_SECRET_KEY_OLD for rotation) are set.`);
     }
   } else if (isProd) {
     // Mirror the sealing subsystem's production fail-closed for key material.
-    throw new Error('PORTAL_SECRET_KEY is not set — refusing to start in production (per-project Postgres passwords would be stored in cleartext).');
+    throw new Error('PORTAL_SECRET_KEY is not set — refusing to start in production (per-project secrets would be stored in cleartext).');
   } else {
-    console.warn('[projects] PORTAL_SECRET_KEY not set — postgres_password values remain in cleartext. Set the key to enable encryption at rest.');
+    console.warn('[projects] PORTAL_SECRET_KEY not set — per-project secrets remain in cleartext. Set the key to enable encryption at rest.');
   }
 }
 
@@ -429,6 +443,47 @@ export async function claimOrGetPostgresPassword(id: string, candidate: string):
 
 export async function clearPostgresPassword(id: string): Promise<void> {
   await pool.query('UPDATE projects SET postgres_password = NULL WHERE id = $1', [id]);
+}
+
+// Decrypt + parse a project's stored Garage credentials, or null if storage
+// has never been enabled (or the data was destroyed). Mirrors
+// decodePostgresPassword; the blob is encrypted JSON.
+export function decodeGarageCredentials(project: Pick<Project, 'garage_creds'>): GarageCredentials | null {
+  if (!project.garage_creds) return null;
+  return JSON.parse(decryptSecret(project.garage_creds)) as GarageCredentials;
+}
+
+// Atomically claim the project's Garage credentials, or read them back if
+// another caller already claimed. Same race-avoidance contract as
+// claimOrGetPostgresPassword: only one caller flips NULL → ciphertext, and
+// every other caller reads back the winner's value so the SealedSecret they
+// each (idempotently) write carries the same keys.
+export async function claimOrGetGarageCredentials(
+  id: string, candidate: GarageCredentials,
+): Promise<{ creds: GarageCredentials; claimed: boolean }> {
+  const claim = await pool.query<{ garage_creds: string }>(
+    `UPDATE projects
+     SET garage_creds = $1
+     WHERE id = $2 AND garage_creds IS NULL
+     RETURNING garage_creds`,
+    [encryptSecret(JSON.stringify(candidate)), id]
+  );
+  if (claim.rows.length > 0) {
+    return { creds: candidate, claimed: true };
+  }
+  const { rows } = await pool.query<{ garage_creds: string | null }>(
+    'SELECT garage_creds FROM projects WHERE id = $1',
+    [id]
+  );
+  const existing = rows[0]?.garage_creds;
+  if (!existing) {
+    throw new Error(`project ${id} not found or has no garage_creds`);
+  }
+  return { creds: JSON.parse(decryptSecret(existing)) as GarageCredentials, claimed: false };
+}
+
+export async function clearGarageCredentials(id: string): Promise<void> {
+  await pool.query('UPDATE projects SET garage_creds = NULL WHERE id = $1', [id]);
 }
 
 export async function setPinTokenHash(id: string, hash: string): Promise<void> {

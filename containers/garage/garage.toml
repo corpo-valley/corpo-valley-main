@@ -1,0 +1,40 @@
+# Garage v1.0 configuration (non-secret), baked into the image.
+# https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/
+#
+# This file deliberately contains NO secrets. The two cluster secrets —
+# rpc_secret and the admin API token — are supplied at runtime via the
+# environment variables GARAGE_RPC_SECRET and GARAGE_ADMIN_TOKEN.
+#
+# Garage v1.0 natively reads these env vars and uses them in place of the
+# corresponding config fields (rpc_secret / [admin].admin_token). Verified
+# against the v1.0 configuration reference: GARAGE_RPC_SECRET and
+# GARAGE_ADMIN_TOKEN (and *_FILE variants) override the file values. We
+# therefore do NOT need the *_file indirection or a runtime config rewrite —
+# the plain env vars are sufficient and are the documented mechanism.
+
+# All writable state lives under /data (the mounted PVC) so the rest of the
+# rootfs can be mounted read-only by the platform's admission policy.
+metadata_dir = "/data/meta"
+data_dir = "/data/blocks"
+
+# LMDB metadata engine (default + recommended for single-node in v1.0).
+db_engine = "lmdb"
+
+# Single-node, one-per-project deployment: no redundancy.
+replication_factor = 1
+
+# RPC is loopback-only in this single-node topology. Binding the public addr to
+# 127.0.0.1 keeps inter-node RPC off the network entirely (there are no peers).
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+
+[s3_api]
+api_bind_addr = "[::]:3900"
+s3_region = "garage"
+# Virtual-hosted-style bucket access: <bucket>.s3.garage
+root_domain = ".s3.garage"
+
+[admin]
+# Admin/metrics API (health checks, future ops). Bound on 3903.
+# admin_token is supplied via GARAGE_ADMIN_TOKEN at runtime (see header note).
+api_bind_addr = "[::]:3903"

@@ -16,7 +16,7 @@ export const TEMPLATE_GITEA_REPO = process.env.GITEA_TEMPLATE_REPO || 'community
 
 // The website capability is implicit and always present, so it isn't a
 // toggle. The optional capabilities are the ones the user checks on.
-export const OPTIONAL_CAPABILITIES = ['database', 'mcp'] as const;
+export const OPTIONAL_CAPABILITIES = ['database', 'storage', 'mcp'] as const;
 export type OptionalCapability = (typeof OPTIONAL_CAPABILITIES)[number];
 
 export interface Capabilities {
@@ -24,9 +24,12 @@ export interface Capabilities {
   // around without special-casing.
   website: true;
   database: boolean;
+  // Per-project Garage (S3-compatible object storage) + a /files API.
+  storage: boolean;
   mcp: boolean;
-  // "data/views are shared across users". Only meaningful when database or
-  // mcp is on; flips per-user isolation off (CV_SHARED=true in the manifest).
+  // "data/views are shared across users". Only meaningful when a data
+  // capability (database/storage/mcp) is on; flips per-user isolation off
+  // (CV_SHARED=true in the manifest).
   shared: boolean;
 }
 
@@ -48,6 +51,11 @@ export const CAPABILITY_CHECKBOXES: CapabilityDef[] = [
     description: 'Off by default, each person only sees their own data. On, everyone shares one view.',
   },
   {
+    key: 'storage',
+    label: 'file storage',
+    description: 'Adds a private S3-compatible object store and a /files endpoint so the app can save and serve uploads.',
+  },
+  {
     key: 'mcp',
     label: 'users can connect to this project via MCP',
     description: 'Exposes an MCP endpoint at /mcp so agents can use this project as a tool.',
@@ -55,7 +63,7 @@ export const CAPABILITY_CHECKBOXES: CapabilityDef[] = [
 ];
 
 export function defaultCapabilities(): Capabilities {
-  return { website: true, database: false, mcp: false, shared: false };
+  return { website: true, database: false, storage: false, mcp: false, shared: false };
 }
 
 // Parse a capability set from loose input (form body or MCP args). Accepts
@@ -65,10 +73,11 @@ export function parseCapabilities(input: unknown): Capabilities {
   const obj = (input && typeof input === 'object') ? (input as Record<string, unknown>) : {};
   const truthy = (v: unknown) => v === true || v === 'true' || v === 'on' || v === '1' || v === 1;
   const database = truthy(obj.database);
+  const storage = truthy(obj.storage);
   const mcp = truthy(obj.mcp);
   // Sharing only matters when there's user data to share.
-  const shared = (database || mcp) && truthy(obj.shared);
-  return { website: true, database, mcp, shared };
+  const shared = (database || storage || mcp) && truthy(obj.shared);
+  return { website: true, database, storage, mcp, shared };
 }
 
 // True when the project's Deployment expects a per-project Postgres to be

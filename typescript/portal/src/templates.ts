@@ -732,6 +732,9 @@ export interface ProjectRow {
   // True when k8s/postgres.yaml exists in the project repo — the Database
   // card uses this to choose the enable vs. remove control.
   postgresEnabled?: boolean;
+  // True when k8s/garage.yaml exists in the project repo — the Storage card
+  // uses this to choose the enable vs. remove control.
+  storageEnabled?: boolean;
 }
 
 // A project shared with the viewer via a grant, with their effective levels.
@@ -842,7 +845,7 @@ export function renderProjectCreate(
   isAdmin: boolean,
   csrf: string = '',
   errorMessage: string = '',
-  prefill: { slug?: string; name?: string; site_default_access?: string; repo_default_access?: string; visibility?: string; database?: boolean; mcp?: boolean } = {}
+  prefill: { slug?: string; name?: string; site_default_access?: string; repo_default_access?: string; visibility?: string; database?: boolean; storage?: boolean; mcp?: boolean } = {}
 ): string {
   const errorBanner = errorMessage
     ? `<div class="message error" style="margin-bottom:1rem;">${escapeHtml(errorMessage)}</div>`
@@ -911,6 +914,7 @@ export function renderProjectCreate(
           <div style="display:flex;flex-direction:column;gap:0.4rem;">
             ${capCheckbox('website', true, true, 'A website for people to view content', 'Always included. Served at the root of your URL.')}
             ${capCheckbox('database', !!prefill.database, false, 'Data/views are shared across users', 'Adds a private database and a /api endpoint so people can save and share data.')}
+            ${capCheckbox('storage', !!prefill.storage, false, 'File storage for uploads', 'Adds a private S3-compatible store and a /files endpoint so people can upload and download files.')}
             ${capCheckbox('mcp', !!prefill.mcp, false, 'Users can connect to this project via MCP', 'Adds an /mcp endpoint so AI agents can use this project as a tool.')}
           </div>
         </div>
@@ -1319,6 +1323,37 @@ claude`
     </div>
   `) : '';
 
+  // ── Storage card: per-project Garage (S3-compatible object store). Same
+  // toggle shape as the Database card — a commit to the user's repo that
+  // ArgoCD syncs; the self-bootstrapping image creates the bucket + key.
+  const storageCard = project.giteaRepo ? (project.storageEnabled ? `
+    <div class="app-card" style="margin-top:1.25rem;">
+      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">File storage</h3>
+      <p class="help" style="margin-bottom:0.85rem;">
+        <span class="badge badge-access" style="background:#3a5a36;color:#dff5d0;">Garage enabled</span>
+      </p>
+      <p class="help" style="margin-bottom:0.85rem;">Your <code>storage</code> container reads its S3 connection (<code>S3_ENDPOINT</code>, <code>S3_BUCKET</code>, <code>S3_ACCESS_KEY_ID</code>, …) from the in-cluster Secret <code>garage</code> (same namespace). If you hand-write your own Deployment, project those keys from the <code>garage</code> Secret — any S3 client works.</p>
+      <form method="POST" action="/projects/${escapeHtml(project.id)}/storage/disable"
+            data-confirm="Remove file storage from ${escapeHtml(project.slug)}? The Garage pod is removed by ArgoCD; the data volume stays unless you check &quot;also delete the data&quot; below.">
+        ${csrf}
+        <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem;font-size:0.85rem;color:#a89878;">
+          <input type="checkbox" name="destroy_data" value="true" />
+          Also delete the data volume (irreversible — drops the PVC and all stored files).
+        </label>
+        <button type="submit" class="btn btn-danger btn-sm">Remove file storage</button>
+      </form>
+    </div>
+  ` : `
+    <div class="app-card" style="margin-top:1.25rem;">
+      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">File storage</h3>
+      <p class="help" style="margin-bottom:0.85rem;">Add a per-project S3-compatible object store. The platform commits the manifest + sealed credentials to your repo and ArgoCD deploys a one-replica Garage pod in the <code>${escapeHtml(project.slug)}</code> namespace, reachable from your app at <code>garage:3900</code> (bucket <code>app</code>).</p>
+      <form method="POST" action="/projects/${escapeHtml(project.id)}/storage/enable">
+        ${csrf}
+        <button type="submit" class="btn btn-primary btn-sm">Add file storage</button>
+      </form>
+    </div>
+  `) : '';
+
   // ── Danger zone: deliberately small, last, and styled to feel separate
   // from the rest. A hover-confirm prompt still gates the destructive POST.
   const dangerCard = `
@@ -1339,6 +1374,7 @@ claude`
     ${getStartedCard}
     ${configureCard}
     ${dbCard}
+    ${storageCard}
     ${dangerCard}
   `;
   return dashboardLayout(`Project: ${project.name}`, body, email, isAdmin, 'projects');
