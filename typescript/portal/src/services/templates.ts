@@ -2,13 +2,14 @@
 //
 // A project is no longer "a template" — it's the Community Center template
 // repo plus a chosen set of capability modules. Every project gets the
-// website; database and MCP are optional. The capability set drives:
+// website; database, storage, and MCP are optional. The capability set drives:
 //   - which k8s containers/services/ingress paths the portal generates
 //     (see services/manifests.ts), and
-//   - whether per-project Postgres is auto-enabled (database ⇒ yes).
+//   - whether per-project Postgres (database ⇒ yes) and Garage (storage ⇒ yes)
+//     are auto-enabled.
 //
 // All projects generate from the single Gitea template repo
-// `corpo-valley/community-center`, which carries all three modules. Pushing
+// `corpo-valley/community-center`, which carries all the modules. Pushing
 // changes to that Gitea repo is done via scripts/sync-community-center-template.sh.
 
 export const TEMPLATE_GITEA_OWNER = process.env.GITEA_TEMPLATE_OWNER || 'corpo-valley';

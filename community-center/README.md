@@ -5,26 +5,27 @@ create a project in the portal, you get your own copy of this repo — already
 wired with a build pipeline, deploy manifests, and identity-gated access, so
 you can focus on building, not the infra.
 
-A project is composed from up to three **capability modules**. You pick them
+A project is composed from up to four **capability modules**. You pick them
 with checkboxes when you create the project (and can change them later):
 
 | Capability | Checkbox | Lives in | Served at |
 |------------|----------|----------|-----------|
 | **Website** | *a website for people to view content* (always on) | `static-site/` | `/` |
 | **Database** | *data/views shared across users* enables sharing on top of it | `database/` | `/api` |
+| **Storage** | *file storage for uploads* | `storage/` | `/files` |
 | **MCP** | *users can connect to this project via MCP* | `mcp/` | `/mcp` |
 
-The website is always present. Database and MCP are optional.
+The website is always present. Database, Storage, and MCP are optional.
 
 ## One language, one build
 
-All three modules are Node.js and share **one** `package.json`, **one**
+All modules are Node.js and share **one** `package.json`, **one**
 `Dockerfile`, and **one** build. The build produces a single image that
 carries every module; the Kubernetes Deployment runs one container per enabled
 capability (`node static-site/server.js`, `node database/server.js`,
-`node mcp/server.js`). The Ingress path-routes `/`, `/api`, and `/mcp` to the
-right container. Adding a capability doesn't add a build — it adds a container
-from the image you already build.
+`node storage/server.js`, `node mcp/server.js`). The Ingress path-routes `/`,
+`/api`, `/files`, and `/mcp` to the right container. Adding a capability doesn't
+add a build — it adds a container from the image you already build.
 
 ## Authorization is built in
 
@@ -45,6 +46,7 @@ them). The secure posture is the default; sharing is the explicit opt-in.
 |------|---------------|
 | `static-site/` | The website. Edit `static-site/public/`. |
 | `database/` | Postgres-backed JSON API at `/api`. Replace the `items` example with your tables. |
+| `storage/` | S3-compatible file API at `/files` (per-project Garage). Presigned upload/download; per-user isolation by default. |
 | `mcp/` | MCP server at `/mcp`. Add your tools to the registry in `mcp/server.js`. |
 | `package.json` / `Dockerfile` | Shared Node toolchain and the single image build. |
 | `k8s/` | **Platform-generated** Deployment + Services + Ingress. Don't hand-edit. |

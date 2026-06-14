@@ -19,8 +19,8 @@ and how to tune it; deeper specs are linked under [Documentation](#documentation
    Google Workspace login so members self-register).
 2. A **member** opens the portal and creates a project. The platform provisions
    a private Gitea repo from a template, a sealed Kubernetes namespace, an
-   auto-deploying site at `<slug>.<projects-domain>`, and (optionally) a database
-   and an MCP endpoint.
+   auto-deploying site at `<slug>.<projects-domain>`, and (optionally) a database,
+   file storage, and an MCP endpoint.
 3. The member points **Claude Code** at the project over MCP (or clones the
    repo) and builds. On every push, CI builds and scans the image and the new
    version rolls out automatically.
@@ -35,13 +35,14 @@ and how to tune it; deeper specs are linked under [Documentation](#documentation
 Every project is a private Gitea repo plus an auto-deployed website at
 `<slug>.<projects-domain>`. New repos are generated from the Community Center
 template (`community-center/`), so a project ships with a working build
-pipeline, a starter site, and Claude config from the first commit. Two
+pipeline, a starter site, and Claude config from the first commit. Three
 capabilities are opt-in per project:
 
 | Capability | What it adds |
 |---|---|
 | **website** | Always on — the deployed site. |
 | **database** | A per-project Postgres, password sealed at rest; the app gets a ready connection. |
+| **storage** | A per-project S3-compatible object store (Garage), credentials sealed at rest; an `/files` API and a ready S3 client connection. |
 | **mcp** | An `/mcp` endpoint so agents can use the project itself as a tool. |
 
 A `CV_SHARED` switch flips a capability between per-user isolation (the default —
@@ -125,7 +126,7 @@ posture.
             │               │              │
         Gitea           per-project     projects
      (repos + CI)        namespaces      ArgoCD
-                       (site/db/mcp)   (auto-deploy)
+                    (site/db/files/mcp) (auto-deploy)
             ▲               ▲
             └─ MCP gateway ─┘  (per-project /mcp OAuth reverse proxy)
 ```
@@ -149,7 +150,8 @@ and `values.schema.json` for the full, validated surface. The headline knobs:
 | `auth.google.enabled` / `auth.google.allowedDomains` | Google Workspace login and which domains may join. |
 | `mcp.enforceAudience` | RFC 8707 audience enforcement on MCP tokens. |
 | `mcp.denyClientIds` | OAuth clients whose tokens the MCP endpoints refuse (confused-deputy guard). |
-| `storage.className` | StorageClass for per-project Postgres volumes. |
+| `storage.className` | StorageClass for per-project Postgres and Garage (storage) volumes. |
+| `blob.garageImage` / `blob.storageMax` | The pinned Garage image for the storage capability and its per-project PVC cap. |
 | `scale.*`, `resources.*` | Replicas and limits for the platform components. |
 | `role` | Split a deployment into `platform` / `tenants` planes, or `all-in-one`. |
 

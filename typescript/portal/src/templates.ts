@@ -870,8 +870,8 @@ export function renderProjectCreate(
   `;
 
   // A project is its website plus any capabilities the user checks. The
-  // website is always on (shown checked + disabled); database and MCP are
-  // optional layers the platform composes into the repo.
+  // website is always on (shown checked + disabled); database, storage, and MCP
+  // are optional layers the platform composes into the repo.
   const capCheckbox = (name: string, checked: boolean, disabled: boolean, title: string, desc: string) => `
     <label class="visibility-option${checked ? ' selected' : ''}" data-cap="${name}">
       <input type="checkbox" name="${name}" value="on"${checked ? ' checked' : ''}${disabled ? ' disabled' : ''} style="margin-right:0.5rem;">

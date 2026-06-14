@@ -63,6 +63,9 @@ Rules of thumb:
 - The `database` capability's `CV_SHARED` env is orthogonal: it controls whether *reads* span all
   users' rows or only the caller's. Permission classes control *who may act*; `CV_SHARED`
   controls *what data a read returns*.
+- The `storage` capability follows the same rules: objects are keyed under `<userId>/`, `write`
+  callers create/delete only their own files, and `CV_SHARED` only widens *reads*/listings to span
+  all owners — cross-owner deletes still require `admin`.
 
 ## Local development
 

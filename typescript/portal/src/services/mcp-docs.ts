@@ -6,7 +6,7 @@
 // not internal architecture trivia. If you change platform behaviour, edit
 // the relevant topic here so an MCP-connected agent learns about it.
 
-export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'database';
+export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'database' | 'storage';
 
 import {
   PROJECTS_DOMAIN, BASE_DOMAIN, GITEA_PUBLIC_URL, CV_REGISTRY, PORTAL_INTERNAL_URL,
@@ -23,19 +23,21 @@ const TOPICS: Record<DocsTopic, string> = {
 
 Corpo Valley turns "I want to ship a web app" into a few clicks plus a
 conversation with you (the agent). Each user owns one or more **projects**.
-Each project is composed of up to three **capability modules**:
+Each project is composed of up to four **capability modules**:
 
 - **website** (always on) — a static/dynamic site served at \`/\`.
 - **database** — a Postgres-backed JSON API at \`/api\`, with per-user data
   isolation by default.
+- **storage** — an S3-compatible file API at \`/files\` backed by a per-project
+  Garage object store, with per-user isolation by default.
 - **mcp** — an MCP endpoint at \`/mcp\` so agents can use the project as a tool.
 
-All three are Node.js, share one \`package.json\` and one \`Dockerfile\`, and
+All are Node.js, share one \`package.json\` and one \`Dockerfile\`, and
 build into one image; the Deployment runs one container per enabled
 capability and the Ingress path-routes to them. Every project also gives them:
 
 - A Gitea repository (private by default), generated from the Community
-  Center template (which carries all three capability modules).
+  Center template (which carries all the capability modules).
 - A pre-baked CI pipeline (builds the container, runs semgrep and
   osv-scanner, blocks merges on findings).
 - An auto-deployed namespace + Ingress at
@@ -43,14 +45,14 @@ capability and the Ingress path-routes to them. Every project also gives them:
   session check. Every deployed site requires sign-in regardless of visibility.
 - Sealed Secrets the user manages through the portal.
 
-Identity: the edge gates every request on a valid Kratos session; the database
-and mcp modules re-validate the forwarded session cookie (shared helper) to
-identify the caller and scope data by it (per-user by default; \`shared\`
-opt-in).
+Identity: the edge gates every request on a valid Kratos session; the database,
+storage, and mcp modules re-validate the forwarded session cookie (shared
+helper) to identify the caller and scope data by it (per-user by default;
+\`shared\` opt-in).
 
 Your role as an MCP-connected agent: drive the code in their repo, ship
 features, use \`get_gitea_credentials\` to clone + push, \`set_capabilities\`
-to add/remove a database or mcp endpoint, and \`set_project_secret\` for
+to add/remove a database, file storage, or mcp endpoint, and \`set_project_secret\` for
 runtime API keys. \`list_projects\` / \`get_project\` show current state and
 enabled capabilities.
 
@@ -94,13 +96,14 @@ Each project has:
   site always requires a signed-in Kratos session — nothing here means
   public.
 
-Each project also has a **capability set** (website always on; \`database\`
-and \`mcp\` optional, plus a \`shared\` data flag). \`get_project\` returns the
-enabled capabilities; \`set_capabilities\` changes them (the platform
-enables/disables the per-project Postgres and regenerates the k8s manifests).
+Each project also has a **capability set** (website always on; \`database\`,
+\`storage\`, and \`mcp\` optional, plus a \`shared\` data flag). \`get_project\`
+returns the enabled capabilities; \`set_capabilities\` changes them (the platform
+enables/disables the per-project Postgres + Garage and regenerates the k8s
+manifests).
 
-Use \`create_project\` to add one — pass \`capabilities: { database, mcp,
-shared }\` to start with more than a website. The platform provisions the
+Use \`create_project\` to add one — pass \`capabilities: { database, storage,
+mcp, shared }\` to start with more than a website. The platform provisions the
 Gitea repo from the Community Center template (Dockerfile, build + scan
 workflows, all capability modules) and generates the k8s manifests for the
 chosen capabilities.
@@ -294,12 +297,62 @@ privileged / hostPath / host* anything. Edits to \`k8s/postgres.yaml\`
 that violate these get rejected at admission, so a hand-modified
 manifest can't widen the blast radius.
 `,
+  storage: `# Storage (S3-compatible object store)
+
+Each project can optionally have its own **Garage** object store — a single,
+self-bootstrapping \`corpo-valley-garage\` pod with a 5 GiB PVC, deployed into
+the project's namespace. Like the database it's one tier, no replicas, no HA,
+and strictly per-project so blast radius == the project namespace. Garage
+speaks the S3 API, so any S3 client (or \`@aws-sdk/client-s3\`) works.
+
+**Enable / disable:**
+- MCP: \`enable_storage(project_id_or_slug)\` (idempotent) or
+  \`disable_storage(project_id_or_slug, destroy_data?)\`.
+- Portal UI: the File storage card on the project detail page.
+
+Enable commits two files to the project repo as cvportal:
+- \`k8s/garage.yaml\` — StatefulSet + headless Service
+- \`k8s/secrets/garage.sealed.yaml\` — SealedSecret with the credentials
+
+ArgoCD picks them up within a minute; on first start the pod creates its
+bucket and imports the access key, then serves S3 on \`garage:3900\`.
+
+**Using it from your app.** The sealed Secret materialises as a regular
+Secret named \`garage\` in the project namespace with the keys
+\`S3_ENDPOINT\`, \`S3_REGION\`, \`S3_BUCKET\`, \`S3_FORCE_PATH_STYLE\`,
+\`S3_ACCESS_KEY_ID\`, and \`S3_SECRET_ACCESS_KEY\`. The platform-generated
+\`storage\` container already wires those six keys from it via
+\`valueFrom.secretKeyRef\`. If you hand-write your own Deployment, project
+them the same way and point any S3 client at \`S3_ENDPOINT\`
+(\`http://garage:3900\`, path-style, bucket \`app\`) — same-namespace traffic,
+no cross-namespace hops. The Secret also holds \`GARAGE_RPC_SECRET\` and
+\`GARAGE_ADMIN_TOKEN\`, which only the Garage pod itself consumes — don't
+project those into app containers.
+
+The \`storage\` module enforces the same X-CV-Perm access standard as the
+database: per-user isolation by default (objects keyed under \`<userId>/\`),
+\`read\` to list/download, \`write\` to upload/delete your own, \`admin\` to
+delete others' when \`shared\` is on.
+
+**Disable behaviour.** Calling \`disable_storage\` removes both files from the
+repo; ArgoCD prunes the StatefulSet, Service, and Secret on the next sync.
+The PVC is preserved by default — calling \`enable_storage\` again re-binds the
+same objects (and the same credentials, kept in the projects row across
+cycles). Pass \`destroy_data: true\` to also delete the PVC and clear the
+credentials; the next enable starts fresh.
+
+**Bounds.** A platform VAP (\`cv-projects-garage-bounds\`) constrains the
+StatefulSet that lands in the cluster: image must be the platform-pinned
+Garage image, replicas==1, storage <= 10 GiB, no privileged / hostPath /
+host* anything. Edits to \`k8s/garage.yaml\` that violate these are rejected at
+admission, so a hand-modified manifest can't widen the blast radius.
+`,
   deploy: `# Deploy
 
 The project's repo has three platform-generated k8s manifests in \`k8s/\`:
 \`deployment.yaml\` (one container per enabled capability), \`service.yaml\`
 (one Service per capability), and \`ingress.yaml\` (path-routed: \`/\`,
-\`/api\`, \`/mcp\`) — all wired to the project's namespace, the in-cluster
+\`/api\`, \`/files\`, \`/mcp\`) — all wired to the project's namespace, the in-cluster
 registry image path, and the \`<slug>.${PROJECTS_DOMAIN}\` Ingress host with the
 Kratos \`/sessions/whoami\` auth-url annotation. These are regenerated by
 \`set_capabilities\`; don't hand-edit them.
@@ -325,7 +378,7 @@ patching the Deployment template annotation does not. Optionally pass
 \`deployment: "<name>"\` to roll just one workload.
 
 Each capability container listens on its own port (website 8080, database
-3000, mcp 9000) and the generated Services target them by name. You don't
+3000, storage 7000, mcp 9000) and the generated Services target them by name. You don't
 manage ports — \`set_capabilities\` regenerates the manifests. Push code
 changes to a capability module and the single image rebuilds; all containers
 move to the new tag together.
