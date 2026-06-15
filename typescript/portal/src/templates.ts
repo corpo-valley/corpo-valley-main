@@ -723,15 +723,18 @@ export interface ProjectRow {
   id: string;
   slug: string;
   name: string;
-  // Default access every signed-in member gets, per area: none|read|write.
-  // Explicit grants layer on top (see renderProjectDetail's Access section).
-  siteDefault: string;
-  repoDefault: string;
+  // The project's org-wide `everyone` grant per area ('none' = private to the
+  // owner + explicit grantees). Drives the summary badge on the project card.
+  everyoneSite: string;
+  everyoneRepo: string;
   createdAt: string;
   giteaRepo?: string | null;
   // True when k8s/postgres.yaml exists in the project repo — the Database
   // card uses this to choose the enable vs. remove control.
   postgresEnabled?: boolean;
+  // True when k8s/garage.yaml exists in the project repo — the Storage card
+  // uses this to choose the enable vs. remove control.
+  storageEnabled?: boolean;
 }
 
 // A project shared with the viewer via a grant, with their effective levels.
@@ -793,7 +796,9 @@ export function renderProjects(
             <span class="app-card-name">${escapeHtml(p.name)}</span>
           </div>
           <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
-          <div class="app-card-sub" style="margin-top:0.4rem;">Members: site ${accessBadge(p.siteDefault)} &nbsp; repo ${accessBadge(p.repoDefault)}</div>
+          <div class="app-card-sub" style="margin-top:0.4rem;">${(p.everyoneSite === 'none' && p.everyoneRepo === 'none')
+            ? accessBadge('private')
+            : `Everyone: site ${accessBadge(p.everyoneSite)} &nbsp; repo ${accessBadge(p.everyoneRepo)}`}</div>
           <div class="app-card-actions">
             <a href="/projects/${escapeHtml(p.id)}" class="btn btn-secondary">Edit</a>
             ${p.giteaRepo
@@ -830,7 +835,9 @@ export function renderProjects(
   return dashboardLayout('Projects', body, email, isAdmin, 'projects');
 }
 
-const DEFAULT_ACCESS_OPTS = ['none', 'read', 'write'];
+// Grant levels for the SITE/PROJECT facet and the REPO facet. Both areas
+// support all three; the org-wide "Everyone" subject is capped at read/write
+// (enforced server-side) and is offered admin nowhere in the UI.
 const GRANT_LEVEL_OPTS = ['read', 'write', 'admin'];
 
 function selectOptions(opts: string[], selected: string): string {
@@ -842,21 +849,16 @@ export function renderProjectCreate(
   isAdmin: boolean,
   csrf: string = '',
   errorMessage: string = '',
-  prefill: { slug?: string; name?: string; site_default_access?: string; repo_default_access?: string; visibility?: string; database?: boolean; mcp?: boolean } = {}
+  prefill: { slug?: string; name?: string; visibility?: string; database?: boolean; storage?: boolean; mcp?: boolean } = {}
 ): string {
   const errorBanner = errorMessage
     ? `<div class="message error" style="margin-bottom:1rem;">${escapeHtml(errorMessage)}</div>`
     : '';
 
-  // Map prefill back to a visibility preset. Anything that doesn't fall
-  // into one of the two named presets re-opens the advanced section as Custom.
-  const preset = ((): string => {
-    const sa = prefill.site_default_access, ra = prefill.repo_default_access;
-    if (!sa && !ra) return prefill.visibility || 'private';
-    if (sa === 'none' && ra === 'none') return 'private';
-    if (sa === 'write' && ra === 'write') return 'internal';
-    return 'custom';
-  })();
+  // Two postures at create time: Private (owner-only) or Internal (org-wide
+  // write). Finer access — per-user/group grants, read-only org-wide — is
+  // managed from the project page after creation.
+  const preset = prefill.visibility === 'internal' ? 'internal' : 'private';
 
   const radio = (val: string, title: string, desc: string) => `
     <label class="visibility-option${preset === val ? ' selected' : ''}" data-value="${val}">
@@ -867,8 +869,8 @@ export function renderProjectCreate(
   `;
 
   // A project is its website plus any capabilities the user checks. The
-  // website is always on (shown checked + disabled); database and MCP are
-  // optional layers the platform composes into the repo.
+  // website is always on (shown checked + disabled); database, storage, and MCP
+  // are optional layers the platform composes into the repo.
   const capCheckbox = (name: string, checked: boolean, disabled: boolean, title: string, desc: string) => `
     <label class="visibility-option${checked ? ' selected' : ''}" data-cap="${name}">
       <input type="checkbox" name="${name}" value="on"${checked ? ' checked' : ''}${disabled ? ' disabled' : ''} style="margin-right:0.5rem;">
@@ -911,6 +913,7 @@ export function renderProjectCreate(
           <div style="display:flex;flex-direction:column;gap:0.4rem;">
             ${capCheckbox('website', true, true, 'A website for people to view content', 'Always included. Served at the root of your URL.')}
             ${capCheckbox('database', !!prefill.database, false, 'Data/views are shared across users', 'Adds a private database and a /api endpoint so people can save and share data.')}
+            ${capCheckbox('storage', !!prefill.storage, false, 'File storage for uploads', 'Adds a private S3-compatible store and a /files endpoint so people can upload and download files.')}
             ${capCheckbox('mcp', !!prefill.mcp, false, 'Users can connect to this project via MCP', 'Adds an /mcp endpoint so AI agents can use this project as a tool.')}
           </div>
         </div>
@@ -918,28 +921,11 @@ export function renderProjectCreate(
         <div class="field">
           <label>Who can see it?</label>
           <div id="cv-visibility-group" style="display:flex;flex-direction:column;gap:0.4rem;">
-            ${radio('private', 'Private', 'Only you. Grant individual members or groups access later from the project page.')}
-            ${radio('custom', 'Custom', 'Pick the site and repo defaults independently in the advanced section below.')}
+            ${radio('private', 'Private', 'Only you (and your bot). Grant individual members, groups, or everyone access later from the project page.')}
             ${radio('internal', 'Internal', 'Every Corpo Valley member can use the site and edit the repo. Still sign-in-gated — Corpo Valley does not publish projects publicly.')}
           </div>
+          <p class="help" style="margin-top:0.4rem;">You can fine-tune access — per-user/group grants, read-only org-wide, admins — from the project page once it exists.</p>
         </div>
-
-        <details style="margin:1rem 0;"${preset === 'custom' ? ' open' : ''}>
-          <summary style="cursor:pointer;color:#a89878;font-size:0.85rem;">Advanced: customise the member defaults</summary>
-          <div style="margin-top:0.6rem;padding-left:0.5rem;border-left:2px solid #5a4a36;">
-            <p class="help">The default every signed-in member gets, per area (none / read / write). Explicit user and group grants layer on top from the project page. If you set either select, it overrides the preset.</p>
-            <div class="form-row">
-              <div class="field">
-                <label for="site_default_access">Site default</label>
-                <select name="site_default_access" id="site_default_access"><option value="">(use preset)</option>${selectOptions(DEFAULT_ACCESS_OPTS, prefill.site_default_access || '')}</select>
-              </div>
-              <div class="field">
-                <label for="repo_default_access">Repo default</label>
-                <select name="repo_default_access" id="repo_default_access"><option value="">(use preset)</option>${selectOptions(DEFAULT_ACCESS_OPTS, prefill.repo_default_access || '')}</select>
-              </div>
-            </div>
-          </div>
-        </details>
 
         <button type="submit" class="btn btn-primary" style="width:auto;">Plant it</button>
       </form>
@@ -988,7 +974,6 @@ export function renderProjectCreate(
         update();
 
         var opts = document.querySelectorAll('.visibility-option');
-        var advanced = document.querySelector('details');
         opts.forEach(function(o){
           var r = o.querySelector('input[type=radio]');
           if (!r) return;
@@ -1004,7 +989,6 @@ export function renderProjectCreate(
               if (card) card.classList.remove('selected');
             });
             o.classList.add('selected');
-            if (advanced && r.name === 'visibility' && r.value === 'custom') advanced.open = true;
           });
           o.addEventListener('click', function(ev){
             if (ev.target.tagName === 'INPUT') return;
@@ -1177,6 +1161,63 @@ claude`
     </script>
   ` : '';
 
+  // ── Access section: two facets — Project (the deployed site's X-CV-Perm
+  // class) shown FIRST, then Repo (the Gitea permission) — each rendered as
+  // Read / Write / Admin rows listing the users, groups, and the virtual
+  // "Everyone" subject granted that level. Each facet has its own add form;
+  // "Everyone" is offered read/write only (admin filtered client-side, refused
+  // server-side). Each chip's × revokes that one facet for that subject.
+  const accessFacets = [
+    { key: 'site', title: 'Project Access', help: 'What a member can do on the deployed site — your code reads the <code>X-CV-Perm</code> header (read &lt; write &lt; admin; without read the request is blocked at the edge).' },
+    { key: 'repo', title: 'Repo Access', help: 'Permission on the project&rsquo;s Gitea repository (read &lt; write &lt; admin).' },
+  ];
+  const permFor = (g: ProjectGrantRow, facet: string) => (facet === 'site' ? g.site_perm : g.repo_perm);
+  const grantChip = (g: ProjectGrantRow, facet: string) => `
+    <span class="grant-chip">
+      ${escapeHtml(g.subject_name || '(unknown)')}<span class="grant-chip-type">${escapeHtml(g.subject_type)}</span>
+      <form method="POST" action="/projects/${escapeHtml(project.id)}/access/${escapeHtml(g.id)}/revoke" class="inline-form" style="display:inline;">
+        ${csrf}
+        <input type="hidden" name="facet" value="${escapeHtml(facet)}">
+        <button type="submit" class="grant-chip-x" title="Revoke">&times;</button>
+      </form>
+    </span>`;
+  const accessLevelRow = (facet: string, level: string) => {
+    const subjects = grants.filter((g) => permFor(g, facet) === level);
+    return `
+      <div class="grant-row">
+        <span class="grant-level-label">${escapeHtml(level)}</span>
+        <span class="grant-chips">${subjects.length ? subjects.map((g) => grantChip(g, facet)).join('') : '<span class="help" style="margin:0;">—</span>'}</span>
+      </div>`;
+  };
+  const accessFacetSection = (facet: string, title: string, help: string) => `
+    <h4 style="margin:1.1rem 0 0.2rem 0;color:#fdf6e8;font-size:0.95rem;">${escapeHtml(title)}</h4>
+    <p class="help" style="margin-bottom:0.5rem;">${help}</p>
+    <div class="grant-rows">
+      ${['read', 'write', 'admin'].map((l) => accessLevelRow(facet, l)).join('')}
+    </div>
+    <form method="POST" action="/projects/${escapeHtml(project.id)}/access" class="js-grant-add" style="display:flex;flex-wrap:wrap;gap:0.4rem;align-items:flex-end;margin-top:0.5rem;">
+      ${csrf}
+      <input type="hidden" name="facet" value="${escapeHtml(facet)}">
+      <div class="field" style="margin:0;">
+        <label>Subject</label>
+        <select name="subject_type" class="js-subject">
+          <option value="user">user</option>
+          <option value="group">group</option>
+          <option value="everyone">everyone</option>
+        </select>
+      </div>
+      <div class="field js-identifier-wrap" style="margin:0;flex:2;min-width:12rem;">
+        <label>Email / username / group</label>
+        <input type="text" name="identifier" class="js-identifier" placeholder="alice@example.com or platform-team">
+      </div>
+      <div class="field" style="margin:0;">
+        <label>Level</label>
+        <select name="level" class="js-level">${selectOptions(GRANT_LEVEL_OPTS, 'read')}</select>
+      </div>
+      <button type="submit" class="btn btn-primary btn-sm">Add</button>
+    </form>`;
+  const accessSection = accessFacets.map((f) => accessFacetSection(f.key, f.title, f.help)).join('');
+
   // ── Configure card: Sealed Secrets + Access settings, grouped because
   // both are "settings on the running project". Sub-sections inside the
   // card use `<h4>` so they're visually subordinate to the card header.
@@ -1210,79 +1251,51 @@ claude`
       <hr style="border:none;border-top:1px solid #5a4a36;margin:1.5rem 0 1rem 0;" />
 
       <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Access</h4>
-      <p class="help" style="margin-bottom:0.75rem;">
-        Two areas, three levels each. <strong>Site</strong> — what a visitor can do on the deployed
-        website (your code reads it from the <code>X-CV-Perm</code> header: read / write / admin;
-        no read = blocked before reaching your app). <strong>Repo</strong> — Gitea permission on the
-        project repository. Everyone gets the default below; grants add more; the highest wins.
-        You always have admin on both.
+      <p class="help" style="margin-bottom:0.5rem;">
+        <strong>Private by default</strong> — only you and your bot. Widen access by granting
+        users, groups, or <strong>Everyone</strong> (every signed-in member) below. Two areas:
+        <strong>Project</strong> (the deployed site) and <strong>Repo</strong> (the Gitea source).
+        The highest applicable level wins; you always have admin on both. &ldquo;Everyone&rdquo; can
+        be granted read or write, never admin.
       </p>
-      <form method="POST" action="/projects/${escapeHtml(project.id)}">
-        ${csrf}
-        <div class="form-row">
-          <div class="field">
-            <label for="site_default_access">Site default (all members)</label>
-            <select name="site_default_access" id="site_default_access">${selectOptions(DEFAULT_ACCESS_OPTS, project.siteDefault)}</select>
-          </div>
-          <div class="field">
-            <label for="repo_default_access">Repo default (all members)</label>
-            <select name="repo_default_access" id="repo_default_access">${selectOptions(DEFAULT_ACCESS_OPTS, project.repoDefault)}</select>
-          </div>
-        </div>
-        <button type="submit" class="btn btn-primary">Save defaults</button>
-      </form>
-
-      <h4 style="margin:1.25rem 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Grants</h4>
-      ${grants.length === 0
-        ? '<div class="message info">No user or group grants yet.</div>'
-        : `<div class="table-wrap"><table class="table">
-            <thead><tr><th>Who</th><th>Type</th><th>Site</th><th>Repo</th><th></th></tr></thead>
-            <tbody>
-            ${grants.map((g) => `
-              <tr>
-                <td>${escapeHtml(g.subject_name || '(unknown)')}</td>
-                <td>${accessBadge(g.subject_type)}</td>
-                <td>${g.site_perm ? accessBadge(g.site_perm) : '—'}</td>
-                <td>${g.repo_perm ? accessBadge(g.repo_perm) : '—'}</td>
-                <td>
-                  <form method="POST" action="/projects/${escapeHtml(project.id)}/grants/${escapeHtml(g.id)}/delete" class="inline-form">
-                    ${csrf}
-                    <button type="submit" class="btn btn-danger btn-sm">Revoke</button>
-                  </form>
-                </td>
-              </tr>
-            `).join('')}
-            </tbody></table></div>`}
-      <form method="POST" action="/projects/${escapeHtml(project.id)}/grants" style="margin-top:0.85rem;">
-        ${csrf}
-        <div class="form-row">
-          <div class="field">
-            <label for="grant_subject_type">Grant to</label>
-            <select name="subject_type" id="grant_subject_type">
-              <option value="user">user</option>
-              <option value="group">group</option>
-            </select>
-          </div>
-          <div class="field" style="flex:2;">
-            <label for="grant_identifier">Email / username / group name</label>
-            <input type="text" name="identifier" id="grant_identifier" required placeholder="alice@example.com or platform-team">
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="field">
-            <label for="grant_site_perm">Site permission</label>
-            <select name="site_perm" id="grant_site_perm"><option value="">(none)</option>${selectOptions(GRANT_LEVEL_OPTS, 'read')}</select>
-          </div>
-          <div class="field">
-            <label for="grant_repo_perm">Repo permission</label>
-            <select name="repo_perm" id="grant_repo_perm"><option value="" selected>(none)</option>${selectOptions(GRANT_LEVEL_OPTS, '')}</select>
-          </div>
-          <button type="submit" class="btn btn-primary">Add grant</button>
-        </div>
-        ${groups.length > 0
-          ? `<p class="help" style="margin-top:0.25rem;">Groups: ${groups.map((g) => `<code>${escapeHtml(g.name)}</code> (${g.memberCount})`).join(', ')} — manage under <a href="/groups" style="color:#e8b94a;">Groups</a>.</p>`
-          : `<p class="help" style="margin-top:0.25rem;">No groups exist yet — create one under <a href="/groups" style="color:#e8b94a;">Groups</a> to grant many members at once.</p>`}
-      </form>
+      ${accessSection}
+      ${groups.length > 0
+        ? `<p class="help" style="margin-top:0.7rem;">Groups: ${groups.map((g) => `<code>${escapeHtml(g.name)}</code> (${g.memberCount})`).join(', ')} — manage under <a href="/groups" style="color:#e8b94a;">Groups</a>.</p>`
+        : `<p class="help" style="margin-top:0.7rem;">No groups exist yet — create one under <a href="/groups" style="color:#e8b94a;">Groups</a> to grant many members at once.</p>`}
+      <style>
+        .grant-rows { display:flex; flex-direction:column; gap:0.3rem; }
+        .grant-row { display:flex; align-items:flex-start; gap:0.5rem; }
+        .grant-level-label { display:inline-block; min-width:3.5rem; padding-top:0.15rem; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.04em; color:#a89878; }
+        .grant-chips { display:flex; flex-wrap:wrap; gap:0.35rem; }
+        .grant-chip { display:inline-flex; align-items:center; gap:0.3rem; background:#3a3120; border:1px solid #5a4a36; border-radius:999px; padding:0.1rem 0.55rem; font-size:0.82rem; color:#fdf6e8; }
+        .grant-chip-type { font-size:0.66rem; color:#a89878; text-transform:uppercase; }
+        .grant-chip-x { background:none; border:none; color:#cc9988; cursor:pointer; font-size:1rem; line-height:1; padding:0; }
+        .grant-chip-x:hover { color:#e8b94a; }
+      </style>
+      <script nonce="${cspNonce()}">
+        (function(){
+          document.querySelectorAll('.js-grant-add').forEach(function(form){
+            var subj = form.querySelector('.js-subject');
+            var idWrap = form.querySelector('.js-identifier-wrap');
+            var id = form.querySelector('.js-identifier');
+            var level = form.querySelector('.js-level');
+            var adminOpt = level ? level.querySelector('option[value="admin"]') : null;
+            function sync(){
+              var everyone = subj.value === 'everyone';
+              // Everyone needs no identifier and cannot be granted admin.
+              if (idWrap) idWrap.style.display = everyone ? 'none' : '';
+              if (id) id.disabled = everyone;
+              if (adminOpt){
+                adminOpt.disabled = everyone;
+                adminOpt.hidden = everyone;
+                if (everyone && level.value === 'admin') level.value = 'write';
+              }
+            }
+            subj && subj.addEventListener('change', sync);
+            sync();
+          });
+        })();
+      </script>
     </div>
   `;
 
@@ -1319,6 +1332,37 @@ claude`
     </div>
   `) : '';
 
+  // ── Storage card: per-project Garage (S3-compatible object store). Same
+  // toggle shape as the Database card — a commit to the user's repo that
+  // ArgoCD syncs; the self-bootstrapping image creates the bucket + key.
+  const storageCard = project.giteaRepo ? (project.storageEnabled ? `
+    <div class="app-card" style="margin-top:1.25rem;">
+      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">File storage</h3>
+      <p class="help" style="margin-bottom:0.85rem;">
+        <span class="badge badge-access" style="background:#3a5a36;color:#dff5d0;">Garage enabled</span>
+      </p>
+      <p class="help" style="margin-bottom:0.85rem;">Your <code>storage</code> container reads its S3 connection (<code>S3_ENDPOINT</code>, <code>S3_BUCKET</code>, <code>S3_ACCESS_KEY_ID</code>, …) from the in-cluster Secret <code>garage</code> (same namespace). If you hand-write your own Deployment, project those keys from the <code>garage</code> Secret — any S3 client works.</p>
+      <form method="POST" action="/projects/${escapeHtml(project.id)}/storage/disable"
+            data-confirm="Remove file storage from ${escapeHtml(project.slug)}? The Garage pod is removed by ArgoCD; the data volume stays unless you check &quot;also delete the data&quot; below.">
+        ${csrf}
+        <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem;font-size:0.85rem;color:#a89878;">
+          <input type="checkbox" name="destroy_data" value="true" />
+          Also delete the data volume (irreversible — drops the PVC and all stored files).
+        </label>
+        <button type="submit" class="btn btn-danger btn-sm">Remove file storage</button>
+      </form>
+    </div>
+  ` : `
+    <div class="app-card" style="margin-top:1.25rem;">
+      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">File storage</h3>
+      <p class="help" style="margin-bottom:0.85rem;">Add a per-project S3-compatible object store. The platform commits the manifest + sealed credentials to your repo and ArgoCD deploys a one-replica Garage pod in the <code>${escapeHtml(project.slug)}</code> namespace, reachable from your app at <code>garage:3900</code> (bucket <code>app</code>).</p>
+      <form method="POST" action="/projects/${escapeHtml(project.id)}/storage/enable">
+        ${csrf}
+        <button type="submit" class="btn btn-primary btn-sm">Add file storage</button>
+      </form>
+    </div>
+  `) : '';
+
   // ── Danger zone: deliberately small, last, and styled to feel separate
   // from the rest. A hover-confirm prompt still gates the destructive POST.
   const dangerCard = `
@@ -1339,6 +1383,7 @@ claude`
     ${getStartedCard}
     ${configureCard}
     ${dbCard}
+    ${storageCard}
     ${dangerCard}
   `;
   return dashboardLayout(`Project: ${project.name}`, body, email, isAdmin, 'projects');

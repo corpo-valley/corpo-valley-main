@@ -119,6 +119,78 @@ spec:
               port: http-api
             initialDelaySeconds: 15
             periodSeconds: 30
+        - name: storage
+          image: {{CV_REGISTRY}}/{{OWNER}}/{{REPO}}:bootstrap
+          imagePullPolicy: IfNotPresent
+          command: ["node", "storage/server.js"]
+          ports:
+            - name: http-files
+              containerPort: 7000
+          env:
+            - name: PORT
+              value: "7000"
+            - name: CV_SHARED
+              value: "false"
+            # The platform projects the S3 connection + credentials from the
+            # per-project `garage` Secret (created when storage is enabled).
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ENDPOINT
+            - name: S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_REGION
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_BUCKET
+            - name: S3_FORCE_PATH_STYLE
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_FORCE_PATH_STYLE
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ACCESS_KEY_ID
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_SECRET_ACCESS_KEY
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+              subPath: storage
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-files
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-files
+            initialDelaySeconds: 15
+            periodSeconds: 30
         - name: mcp
           image: {{CV_REGISTRY}}/{{OWNER}}/{{REPO}}:bootstrap
           imagePullPolicy: IfNotPresent

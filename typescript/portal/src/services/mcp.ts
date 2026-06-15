@@ -14,16 +14,26 @@
 import * as crypto from 'crypto';
 import {
   createProject, getProjectById, listProjectsByOwner, deleteProject,
-  slugExists, isValidSlug, siteDefaultAccess, repoDefaultAccess,
+  slugExists, isValidSlug,
   setGiteaRepo, clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
+  clearGarageCredentials, claimOrGetGarageCredentials, decodeGarageCredentials,
   setPinTokenHash,
-  type Project, type DefaultAccess,
+  type Project, type GrantLevel,
 } from './projects';
+import {
+  upsertProjectGrant, getEveryoneGrants,
+  EVERYONE_SUBJECT_ID, EVERYONE_SUBJECT_NAME,
+} from './access';
+import { syncRepoAccess } from './repo-access';
 import {
   enablePostgres, disablePostgres, postgresEnabled,
   destroyPostgresPvc, generatePostgresPassword,
 } from './postgres';
+import {
+  enableGarage, disableGarage, garageEnabled,
+  destroyGaragePvc, generateGarageCredentials,
+} from './garage';
 import {
   parseCapabilities, requiresPostgres, capabilityList, defaultCapabilities,
   TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO,
@@ -132,12 +142,13 @@ const tools: Record<string, ToolDef> = {
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     async handler(ctx) {
       const rows = await listProjectsByOwner(ctx.userId);
-      return { projects: rows.map(toToolProject) };
+      const everyone = await getEveryoneGrants(rows.map((p) => p.id)).catch(() => new Map());
+      return { projects: rows.map((p) => toToolProject(p, everyone.get(p.id))) };
     },
   },
 
   get_project: {
-    description: 'Get the full record for a single project owned by the user, by uuid or slug. Includes the enabled `capabilities` (derived from the repo manifests) and `postgres.enabled`. Returns null if not found or not owned by the caller.',
+    description: 'Get the full record for a single project owned by the user, by uuid or slug. Includes the enabled `capabilities` (derived from the repo manifests), `postgres.enabled`, and `storage.enabled`. Returns null if not found or not owned by the caller.',
     inputSchema: {
       type: 'object',
       required: ['id_or_slug'],
@@ -148,30 +159,34 @@ const tools: Record<string, ToolDef> = {
       const p = await resolveOwnedProject(ctx, args.id_or_slug);
       if (!p) return null;
       let pgEnabled = false;
+      let storeEnabled = false;
       let caps = defaultCapabilities();
       if (p.gitea_repo) {
         const [o, r] = p.gitea_repo.split('/');
         pgEnabled = await postgresEnabled({ owner: o, repo: r }).catch(() => false);
+        storeEnabled = await garageEnabled({ owner: o, repo: r }).catch(() => false);
         caps = await detectCapabilities({ owner: o, repo: r }).catch(() => caps);
       }
-      return { ...toToolProject(p), capabilities: capabilityList(caps), postgres: { enabled: pgEnabled } };
+      const everyone = await getEveryoneGrants([p.id]).catch(() => new Map());
+      return { ...toToolProject(p, everyone.get(p.id)), capabilities: capabilityList(caps), postgres: { enabled: pgEnabled }, storage: { enabled: storeEnabled } };
     },
   },
 
   create_project: {
-    description: 'Plant a new Corpo Valley project. Every project gets a website. Pass `capabilities` to also add a Postgres-backed database (JSON API at /api) and/or an MCP endpoint (at /mcp). Provisions a Gitea repo from the Community Center template, seals the project namespace (Pod Security + default-deny egress NetworkPolicy + resource quota), generates the k8s manifests for the chosen capabilities (one container each, path-routed), auto-enables Postgres when the database capability is on, registers an ArgoCD Application, and sets branch protection. Returns the new project record (live URL, Gitea repo, capabilities, and `postgres.enabled`). Slug auto-derives from name when not provided.',
+    description: 'Plant a new Corpo Valley project. Every project gets a website. Pass `capabilities` to also add a Postgres-backed database (JSON API at /api), S3-compatible file storage (a /files API backed by a per-project Garage), and/or an MCP endpoint (at /mcp). Provisions a Gitea repo from the Community Center template, seals the project namespace (Pod Security + default-deny egress NetworkPolicy + resource quota), generates the k8s manifests for the chosen capabilities (one container each, path-routed), auto-enables Postgres/Garage when their capability is on, registers an ArgoCD Application, and sets branch protection. Returns the new project record (live URL, Gitea repo, capabilities, `postgres.enabled`, and `storage.enabled`). Slug auto-derives from name when not provided.',
     inputSchema: {
       type: 'object',
       required: ['name'],
       properties: {
         name: { type: 'string', minLength: 1, description: 'Human-readable name.' },
         slug: { type: 'string', pattern: '^[a-z0-9-]+$', maxLength: 63, description: 'Optional URL slug; derived from name when omitted.' },
-        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Member default access. `private` = owner only (site/repo default none); `internal` = every signed-in member gets write on the site and the repo. Defaults to private. Finer control (read-only defaults, per-user/group grants) lives in the portal project page. Corpo Valley does not publish projects publicly.' },
+        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Initial access posture. `private` (default) = owner-only. `internal` = every signed-in member gets read+write on BOTH the deployed site and the repo, seeded as the org-wide “everyone” grant. Finer access — per-user/group grants, read-only org-wide, and admins — is managed afterwards on the portal project page (the deployed project reads its caller’s level from `X-CV-Perm`). Corpo Valley never publishes projects unauthenticated.' },
         capabilities: {
           type: 'object',
           description: 'Which optional capabilities to enable. The website is always on.',
           properties: {
             database: { type: 'boolean', description: 'Add a Postgres-backed JSON API at /api. Auto-provisions a per-project Postgres.' },
+            storage: { type: 'boolean', description: 'Add an S3-compatible file API at /files. Auto-provisions a per-project Garage object store.' },
             mcp: { type: 'boolean', description: 'Add an MCP endpoint at /mcp so agents can connect to this project.' },
             shared: { type: 'boolean', description: 'Data/views are shared across users. Default false = each user only sees their own data.' },
           },
@@ -184,14 +199,7 @@ const tools: Record<string, ToolDef> = {
       requireVerified(ctx);
       const name = String(args.name || '').trim();
       if (!name) throw new ToolError('name is required');
-      const visibility = (args.visibility && ['private', 'internal'].includes(args.visibility)) ? args.visibility : 'private';
-      // Preset → default-access dials (none|read|write per area). Explicit
-      // user/group grants are managed from the portal's project page.
-      const presets: Record<string, { site: DefaultAccess; repo: DefaultAccess }> = {
-        private: { site: 'none', repo: 'none' },
-        internal: { site: 'write', repo: 'write' },
-      };
-      const preset = presets[visibility];
+      const visibility = (args.visibility === 'internal') ? 'internal' : 'private';
       const caps = parseCapabilities(args.capabilities);
       const sluggify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
       const slug = (typeof args.slug === 'string' && args.slug.trim()) ? args.slug.trim() : sluggify(name);
@@ -203,10 +211,21 @@ const tools: Record<string, ToolDef> = {
       // inherit the previous tenant's live namespace + secrets.
       if (await namespaceExists(slug)) throw new ToolError(`slug "${slug}" is not available (its namespace still exists).`);
 
-      const project = await createProject({
-        slug, name, ownerId: ctx.userId,
-        siteDefault: preset.site, repoDefault: preset.repo,
-      });
+      const project = await createProject({ slug, name, ownerId: ctx.userId });
+
+      // `internal` seeds the org-wide everyone grant (read+write both areas)
+      // before provisioning so the repo collaborator fan-out picks it up;
+      // `private` seeds nothing (owner-only). Finer grants are managed in the
+      // portal.
+      let everyone: { site: GrantLevel | null; repo: GrantLevel | null } | undefined;
+      if (visibility === 'internal') {
+        await upsertProjectGrant({
+          projectId: project.id, subjectType: 'everyone',
+          subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME,
+          sitePerm: 'write', repoPerm: 'write',
+        }).catch(() => {});
+        everyone = { site: 'write', repo: 'write' };
+      }
 
       // Unified provisioning (shared with the dashboard): seals the namespace
       // baseline, then provisions repo/postgres/manifests/argocd. Best-effort —
@@ -214,11 +233,15 @@ const tools: Record<string, ToolDef> = {
       const prov = await provisionProject(project, caps, {
         ownerUsername: ctx.preferredUsername, email: ctx.email, logTag: 'mcp',
       });
+      if (visibility === 'internal') {
+        syncRepoAccess(project).catch(() => {});
+      }
       return {
-        ...toToolProject(project),
+        ...toToolProject(project, everyone),
         application_registered: prov.argoRegistered,
         capabilities: capabilityList(caps),
         postgres: { enabled: prov.postgresEnabled },
+        storage: { enabled: prov.storageEnabled },
       };
     },
   },
@@ -323,14 +346,85 @@ const tools: Record<string, ToolDef> = {
     },
   },
 
+  enable_storage: {
+    description: 'Turn on per-project S3-compatible file storage. The platform commits a Garage StatefulSet + sealed credentials Secret (named `garage`) to the project repo as cvportal; ArgoCD deploys a one-replica, self-bootstrapping Garage pod in the project namespace within a minute (it auto-creates the bucket + access key on first start). The platform-generated `storage` container reads the S3 connection (`S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_FORCE_PATH_STYLE`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) from the `garage` Secret. If you hand-write your own Deployment instead, read those same keys from the `garage` Secret. Idempotent — calling on an already-enabled project just refreshes the manifest with the same credentials so existing objects keep working.',
+    inputSchema: {
+      type: 'object',
+      required: ['project_id_or_slug'],
+      properties: { project_id_or_slug: { type: 'string', description: 'Project uuid or slug.' } },
+      additionalProperties: false,
+    },
+    async handler(ctx, args) {
+      requireVerified(ctx);
+      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
+      if (!p) throw new ToolError('project not found or not owned by you.');
+      if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
+      const [owner, repo] = p.gitea_repo.split('/');
+      // Atomic claim: concurrent calls don't desync the DB credentials from
+      // the ones that end up sealed in the repo. See
+      // services/projects.ts:claimOrGetGarageCredentials.
+      const existing = decodeGarageCredentials(p);
+      const { creds } = existing
+        ? { creds: existing }
+        : await claimOrGetGarageCredentials(p.id, generateGarageCredentials());
+      const { secret_name, endpoint, bucket } = await enableGarage({ owner, repo, slug: p.slug, creds });
+      return {
+        ok: true,
+        slug: p.slug,
+        secret_name,
+        endpoint,
+        bucket,
+        usage: `The platform-generated storage container already reads the S3_* keys from the ${secret_name} Secret. If you hand-write your own Deployment, project S3_ENDPOINT/S3_BUCKET/S3_REGION/S3_FORCE_PATH_STYLE/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY from the ${secret_name} Secret (any S3 client; the bucket is "${bucket}").`,
+      };
+    },
+  },
+
+  disable_storage: {
+    description: 'Remove the per-project Garage object store. The manifest + sealed Secret are deleted from the repo (ArgoCD prunes the StatefulSet, Service, and Secret on next sync). The PVC is preserved by default so re-enabling restores the same objects; pass `destroy_data: true` to also delete the PVC and clear the stored credentials (irreversible — drops all stored files). Idempotent.',
+    inputSchema: {
+      type: 'object',
+      required: ['project_id_or_slug'],
+      properties: {
+        project_id_or_slug: { type: 'string' },
+        destroy_data: { type: 'boolean', default: false, description: 'Also delete the PVC and clear the stored credentials. Cannot be undone.' },
+      },
+      additionalProperties: false,
+    },
+    async handler(ctx, args) {
+      requireVerified(ctx);
+      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
+      if (!p) throw new ToolError('project not found or not owned by you.');
+      if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
+      const [owner, repo] = p.gitea_repo.split('/');
+      const result = await disableGarage({ owner, repo });
+      let pvcDeleted = false;
+      if (args.destroy_data) {
+        try { ({ deleted: pvcDeleted } = await destroyGaragePvc(p.slug)); }
+        catch (e: any) { /* swallow — caller can re-try; see note below */ console.warn('[mcp/disable_storage] PVC delete failed:', e?.message); }
+        await clearGarageCredentials(p.id);
+      }
+      return {
+        ok: true,
+        slug: p.slug,
+        removed_manifest: result.removed_manifest,
+        removed_secret: result.removed_secret,
+        pvc_deleted: pvcDeleted,
+        note: args.destroy_data
+          ? 'Data destruction requested. The PVC delete may be queued behind the StatefulSet pod terminating; re-call with the same args if pvc_deleted=false.'
+          : 'Data preserved. The PVC stays bound; re-enable with `enable_storage` to mount the same objects.',
+      };
+    },
+  },
+
   set_capabilities: {
-    description: 'Change which capabilities a project has. The website is always on; toggle `database` (Postgres-backed /api) and `mcp` (/mcp endpoint), and `shared` (per-user vs shared data). Only the fields you pass are changed; the rest keep their current state. The platform enables/disables the per-project Postgres as needed, regenerates k8s/deployment.yaml + Services + Ingress, and commits them — ArgoCD rolls out the change within a minute. Disabling the database preserves its data (the PVC stays) unless you also call disable_postgres with destroy_data. Returns the resulting capability set.',
+    description: 'Change which capabilities a project has. The website is always on; toggle `database` (Postgres-backed /api), `storage` (S3-compatible /files), and `mcp` (/mcp endpoint), and `shared` (per-user vs shared data). Only the fields you pass are changed; the rest keep their current state. The platform enables/disables the per-project Postgres as needed, regenerates k8s/deployment.yaml + Services + Ingress, and commits them — ArgoCD rolls out the change within a minute. Disabling the database preserves its data (the PVC stays) unless you also call disable_postgres with destroy_data. Returns the resulting capability set.',
     inputSchema: {
       type: 'object',
       required: ['project_id_or_slug'],
       properties: {
         project_id_or_slug: { type: 'string' },
         database: { type: 'boolean', description: 'Enable/disable the database capability (/api + per-project Postgres).' },
+        storage: { type: 'boolean', description: 'Enable/disable the storage capability (/files + per-project Garage).' },
         mcp: { type: 'boolean', description: 'Enable/disable the MCP capability (/mcp endpoint).' },
         shared: { type: 'boolean', description: 'Data/views shared across users (true) vs per-user isolation (false).' },
       },
@@ -346,11 +440,12 @@ const tools: Record<string, ToolDef> = {
       const next: Capabilities = {
         website: true,
         database: typeof args.database === 'boolean' ? args.database : current.database,
+        storage: typeof args.storage === 'boolean' ? args.storage : current.storage,
         mcp: typeof args.mcp === 'boolean' ? args.mcp : current.mcp,
         shared: typeof args.shared === 'boolean' ? args.shared : current.shared,
       };
       // Sharing only matters when there's user data; force it off otherwise.
-      if (!next.database && !next.mcp) next.shared = false;
+      if (!next.database && !next.storage && !next.mcp) next.shared = false;
 
       // Bring Postgres in line with the database capability BEFORE writing the
       // manifest, so the secret exists before the database container appears.
@@ -367,6 +462,20 @@ const tools: Record<string, ToolDef> = {
         postgresEnabledNow = false;
       }
 
+      // Same for Garage and the storage capability — secret before container.
+      let storageEnabledNow = current.storage;
+      if (next.storage && !current.storage) {
+        const existing = decodeGarageCredentials(p);
+        const { creds } = existing
+          ? { creds: existing }
+          : await claimOrGetGarageCredentials(p.id, generateGarageCredentials());
+        await enableGarage({ owner, repo, slug: p.slug, creds });
+        storageEnabledNow = true;
+      } else if (!next.storage && current.storage) {
+        await disableGarage({ owner, repo });
+        storageEnabledNow = false;
+      }
+
       await composeProjectManifests({ owner, repo, slug: p.slug, caps: next });
 
       // Bring the /mcp OAuth gateway routing in line with the mcp capability.
@@ -378,6 +487,7 @@ const tools: Record<string, ToolDef> = {
         slug: p.slug,
         capabilities: capabilityList(next),
         postgres: { enabled: postgresEnabledNow },
+        storage: { enabled: storageEnabledNow },
         note: 'Manifests committed. ArgoCD will roll out the change within a minute. Push code for any newly-enabled capability if you customised it.',
       };
     },
@@ -389,7 +499,7 @@ const tools: Record<string, ToolDef> = {
       type: 'object',
       required: ['capability'],
       properties: {
-        capability: { type: 'string', enum: ['static-site', 'database', 'mcp'], description: 'Which capability module to fetch.' },
+        capability: { type: 'string', enum: ['static-site', 'database', 'storage', 'mcp'], description: 'Which capability module to fetch.' },
       },
       additionalProperties: false,
     },
@@ -398,6 +508,7 @@ const tools: Record<string, ToolDef> = {
       const fileFor: Record<string, string> = {
         'static-site': 'static-site/server.js',
         'database': 'database/server.js',
+        'storage': 'storage/server.js',
         'mcp': 'mcp/server.js',
       };
       const filePath = fileFor[capability];
@@ -1079,16 +1190,21 @@ function rethrowK8s(err: unknown): never {
   throw err;
 }
 
-function toToolProject(p: Project) {
+function toToolProject(p: Project, everyone?: { site: GrantLevel | null; repo: GrantLevel | null }) {
+  // Org-wide access is the optional `everyone` grant (read|write, never admin).
+  // null `everyone_access` ⇒ the project is private to the owner + any explicit
+  // per-user/group grantees (managed in the portal). `visibility` is the
+  // create-time shorthand for the same thing.
+  const everyoneAccess = everyone && (everyone.site || everyone.repo)
+    ? { site: everyone.site ?? 'none', repo: everyone.repo ?? 'none' }
+    : null;
   return {
     id: p.id,
     slug: p.slug,
     name: p.name,
     url: `https://${p.slug}.${PROJECTS_DOMAIN}`,
-    // Default access every signed-in member gets, per area (none|read|write).
-    // Explicit per-user/group grants (managed in the portal UI) layer on top.
-    site_default_access: siteDefaultAccess(p),
-    repo_default_access: repoDefaultAccess(p),
+    visibility: everyoneAccess ? 'internal' : 'private',
+    everyone_access: everyoneAccess,
     created_at: p.created_at,
     gitea_repo: p.gitea_repo,
     gitea_url: p.gitea_repo ? `${GITEA_PUBLIC_URL}/${p.gitea_repo}` : null,

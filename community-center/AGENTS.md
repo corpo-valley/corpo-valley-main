@@ -7,7 +7,7 @@ wired up.
 
 ## Capabilities
 
-A project is built from up to three capability modules. Which ones are active
+A project is built from up to four capability modules. Which ones are active
 is decided by the project's settings in the portal and reflected by the
 directories present here and the containers in `k8s/deployment.yaml`:
 
@@ -16,14 +16,17 @@ directories present here and the containers in `k8s/deployment.yaml`:
   your site, or swap in a framework's build output.
 - **`database/`** — a Postgres-backed JSON API mounted at `/api`. Present when
   the database capability is on. Per-user data isolation is the default.
+- **`storage/`** — an S3-compatible file API mounted at `/files`, backed by a
+  per-project Garage object store. Present when the storage capability is on.
+  Per-user isolation is the default.
 - **`mcp/`** — a Model Context Protocol endpoint at `/mcp` so agents can
   connect to this project. Present when the MCP capability is on.
 
-All three share **one** `package.json`, **one** `Dockerfile`, and **one**
+All modules share **one** `package.json`, **one** `Dockerfile`, and **one**
 build — the image carries every module, and the Deployment runs one container
 per enabled capability (`node static-site/server.js`, `node database/server.js`,
-`node mcp/server.js`). The Ingress path-routes `/`, `/api`, and `/mcp` to the
-right container.
+`node storage/server.js`, `node mcp/server.js`). The Ingress path-routes `/`,
+`/api`, `/files`, and `/mcp` to the right container.
 
 ## Identity & authorization — already enforced
 
@@ -36,7 +39,7 @@ A workload in this namespace can't forge an identity — that needs a real
 session only the signed-in user holds.
 
 - Resolve the caller with `resolveUser(req)` from `lib/identity.js` (returns
-  `{ id, email }` or null). The `database` and `mcp` modules already do this.
+  `{ id, email }` or null). The `database`, `storage`, and `mcp` modules already do this.
 - Scope user data by that id. Rows are owned by their creator and a caller only
   sees their own, unless the project's "data is shared across users" setting is
   on (surfaced as the `CV_SHARED` env var). **Per-user isolation is the secure
@@ -91,6 +94,18 @@ The database capability auto-provisions a one-replica Postgres in your
 namespace and seals its credentials into a Secret named `postgres`. The
 `database` container reads `DATABASE_URL` from it. Add tables in
 `database/server.js`'s `ensureSchema()` (it runs on startup and is idempotent).
+
+## Storage
+
+The storage capability auto-provisions a one-replica Garage (S3-compatible)
+object store in your namespace and seals its connection into a Secret named
+`garage`. The `storage` container reads the `S3_*` keys from it and serves a
+presigned-URL file API at `/files`. Use any S3 client against `S3_ENDPOINT`
+(`http://garage:3900`, path-style, bucket `app`); objects are keyed under the
+caller's `<userId>/` prefix by default (per-user isolation), or shared when the
+project's "data is shared across users" setting is on. Don't read
+`GARAGE_RPC_SECRET` / `GARAGE_ADMIN_TOKEN` from the Secret — those are the
+daemon's, not the app's.
 
 ## Keeping CI green
 

@@ -11,10 +11,15 @@
 // retry from later.
 
 import type { Project } from './projects';
-import { claimOrGetPostgresPassword, decodePostgresPassword, setGiteaRepo, setPinTokenHash } from './projects';
+import {
+  claimOrGetPostgresPassword, decodePostgresPassword,
+  claimOrGetGarageCredentials, decodeGarageCredentials,
+  setGiteaRepo, setPinTokenHash,
+} from './projects';
 import { syncRepoAccess } from './repo-access';
 import { type Capabilities, requiresPostgres, TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO } from './templates';
 import { enablePostgres, generatePostgresPassword } from './postgres';
+import { enableGarage, generateGarageCredentials } from './garage';
 import { composeProjectManifests } from './manifests';
 import {
   ensureUser, generateFromTemplate, setBranchProtection, setActionsSecret, giteaEnabled,
@@ -37,6 +42,7 @@ export interface ProvisionContext {
 export interface ProvisionResult {
   namespaceSealed: boolean;
   postgresEnabled: boolean;
+  storageEnabled: boolean;
   argoRegistered: boolean;
 }
 
@@ -47,7 +53,7 @@ export async function provisionProject(
 ): Promise<ProvisionResult> {
   const tag = ctx.logTag || 'provision';
   const slug = project.slug;
-  const result: ProvisionResult = { namespaceSealed: false, postgresEnabled: false, argoRegistered: false };
+  const result: ProvisionResult = { namespaceSealed: false, postgresEnabled: false, storageEnabled: false, argoRegistered: false };
 
   // 1. Seal the namespace FIRST — PSA labels + default-deny egress + quota +
   //    limits — so the box is locked before any tenant workload can land.
@@ -92,6 +98,21 @@ export async function provisionProject(
           result.postgresEnabled = true;
         } catch (e: any) {
           console.error(`[${tag}] auto-enable postgres failed for ${slug}:`, e?.message);
+        }
+      }
+
+      // Garage BEFORE manifests too, for the same reason — the storage
+      // container's Secret must exist before ArgoCD first syncs it.
+      if (caps.storage) {
+        try {
+          const existing = decodeGarageCredentials(project);
+          const { creds } = existing
+            ? { creds: existing }
+            : await claimOrGetGarageCredentials(project.id, generateGarageCredentials());
+          await enableGarage({ owner: ownerUsername, repo: slug, slug, creds });
+          result.storageEnabled = true;
+        } catch (e: any) {
+          console.error(`[${tag}] auto-enable garage failed for ${slug}:`, e?.message);
         }
       }
 

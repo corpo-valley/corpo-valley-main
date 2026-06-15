@@ -32,6 +32,19 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  name: {{SLUG}}-files
+  namespace: {{SLUG}}
+spec:
+  selector:
+    app: {{SLUG}}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http-files
+---
+apiVersion: v1
+kind: Service
+metadata:
   name: {{SLUG}}-mcp
   namespace: {{SLUG}}
 spec:

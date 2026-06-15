@@ -85,3 +85,16 @@ export const POSTGRES_STORAGE_CLASS: string | undefined =
   process.env.CV_STORAGE_CLASS === undefined
     ? 'microk8s-hostpath'
     : (process.env.CV_STORAGE_CLASS || undefined);
+
+// StorageClass for per-project Garage PVCs — the same dial as Postgres, so a
+// deployment's object-storage volumes bind on the same backend as its
+// databases. Kept as its own export for readability at the call site.
+export const GARAGE_STORAGE_CLASS: string | undefined = POSTGRES_STORAGE_CLASS;
+
+// The self-bootstrapping Garage image the platform deploys for the storage
+// capability (built from corpo-valley-main containers/garage). MUST match the
+// image the chart's cv-projects-garage-bounds VAP pins, or the generated
+// StatefulSet is rejected at admission. The chart injects this from
+// `blob.garageImage`; the default reproduces the pinned upstream version.
+export const GARAGE_IMAGE =
+  process.env.CV_GARAGE_IMAGE || 'ghcr.io/corpo-valley/corpo-valley-garage:v1.0.1';

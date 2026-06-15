@@ -5,9 +5,11 @@ containers. You don't implement login, sessions, or an access check — you read
 
 ## The three classes
 
-The project owner controls who gets which class (portal → your project → Access): a default for
-all signed-in members (`none`/`read`/`write`), plus per-user and per-group grants
-(`read`/`write`/`admin`). The highest applicable level wins; the owner is always `admin`.
+The project owner controls who gets which class (portal → your project → Access). A project is
+**private by default** (owner-only); the owner widens the **Project** area with grants to
+individual users, to groups, or to **everyone** (the virtual org-wide subject — every signed-in
+member, capped at `read`/`write`). The highest applicable level wins; the owner is always `admin`.
+(The same model governs the **Repo** area, mapped onto Gitea collaborator permissions.)
 
 | `X-CV-Perm` | Meaning (the convention your code should follow) |
 |-------------|--------------------------------------------------|
@@ -63,6 +65,9 @@ Rules of thumb:
 - The `database` capability's `CV_SHARED` env is orthogonal: it controls whether *reads* span all
   users' rows or only the caller's. Permission classes control *who may act*; `CV_SHARED`
   controls *what data a read returns*.
+- The `storage` capability follows the same rules: objects are keyed under `<userId>/`, `write`
+  callers create/delete only their own files, and `CV_SHARED` only widens *reads*/listings to span
+  all owners — cross-owner deletes still require `admin`.
 
 ## Local development
 
