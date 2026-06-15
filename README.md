@@ -56,12 +56,19 @@ namespace. Branch protection gates outside contributors behind scanned PRs.
 
 ### Access control
 
-Access is per-project and per-area (the **site** and the **repo**), composed
-from three inputs — the highest wins, and the owner is always `admin`:
+A project is **private by default** — only the owner (and their bot) can reach
+it. Access is per-area — **Project** (the deployed site) and **Repo** (the Gitea
+repository) — and widened purely by explicit grants. The highest applicable
+grant wins, and the owner is always `admin`:
 
-- a **default dial** for every signed-in member (`none` / `read` / `write`),
-- **per-user grants** (`read` / `write` / `admin`),
-- **group grants** — groups are member-created and self-serve.
+- **per-user** and **per-group grants** (`read` / `write` / `admin`); groups are
+  member-created and self-serve,
+- an **`everyone` grant** — the virtual org-wide subject covering every
+  signed-in member, for org-wide `read` or `write` (never `admin`).
+
+Both areas support all three levels (repo levels map onto Gitea collaborator
+permissions). Owners manage this on the project page: a **Project Access**
+section, then a **Repo Access** section, each with Read / Write / Admin rows.
 
 The deployed site is gated **at the edge**: ingress asks the portal whether a
 visitor may see the project, anonymous visitors bounce to login, and members

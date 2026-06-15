@@ -77,24 +77,18 @@ Each project has:
 - An ArgoCD Application in the \`${PROJECTS_ARGOCD_NS}\` namespace deploying
   the repo's \`k8s/\` path to a namespace named after the slug.
 - A live URL \`https://<slug>.${PROJECTS_DOMAIN}\`.
-- A visibility setting:
-  * \`private\`  — repo private, service requires Kratos session (default)
-  * \`internal\` — repo visible to other CV members, service still requires
-                   Kratos session
-  Corpo Valley intentionally has no public tier; both the repo and the
-  deployed site are always behind authentication.
-
-  \`visibility\` is the create-time shorthand; the project RECORD that
-  \`list_projects\` / \`get_project\` return stores it as two fields, which is
-  what you'll actually see:
-  * \`service_access\`: \`private\` or \`shared\`. \`private\` also makes the
-    project's Gitea repo private at provisioning time.
-  * \`repo_access\`: \`private-edit\` or \`shared-edit\` — the intended repo
-    collaboration level.
-  \`visibility: private\` ⇒ \`private\` + \`private-edit\`; \`visibility:
-  internal\` ⇒ \`shared\` + \`shared-edit\`. Whatever the values, the deployed
-  site always requires a signed-in Kratos session — nothing here means
-  public.
+- Access (see the \`access\` topic for the full model). A project is PRIVATE by
+  default — only the owner (and their bot) can reach it. \`create_project\`'s
+  \`visibility\` is a shorthand: \`private\` (owner-only) or \`internal\` (seeds
+  an org-wide "everyone" grant of read+write on both the site and the repo).
+  The record that \`list_projects\` / \`get_project\` return carries:
+  * \`visibility\`: \`private\` or \`internal\`.
+  * \`everyone_access\`: the org-wide grant — \`{ site, repo }\`, each
+    \`read\`|\`write\`, or \`null\` when private. (The "everyone" subject is
+    never admin.)
+  Per-user and per-group grants layer on top and are managed on the portal
+  project page. Corpo Valley has no public tier; the repo is always private and
+  the deployed site always requires a signed-in Kratos session.
 
 Each project also has a **capability set** (website always on; \`database\`,
 \`storage\`, and \`mcp\` optional, plus a \`shared\` data flag). \`get_project\`
@@ -389,23 +383,40 @@ The portal is gated by Ory Kratos sessions. Cookies are scoped to
 \`${BASE_DOMAIN}\` so the same session covers \`portal\`, \`auth\`,
 \`oauth\`, \`gitea\`, and every \`<slug>.${PROJECTS_DOMAIN}\`.
 
-Project Ingresses carry an \`auth-url\` annotation pointing at Kratos's
-\`/sessions/whoami\`. nginx-ingress forwards the request cookies; a valid
-session → 200, no session → 401 → redirect to portal login. The forwarded
-Kratos cookie also reaches the backend containers, where the database/mcp
-capabilities re-validate it against Kratos to identify the caller (per-user
-data scoping). A workload can't forge an identity — it needs a real session.
+Project Ingresses carry an \`auth-url\` annotation pointing at the portal's
+site-access subrequest. nginx forwards the request cookies; the portal resolves
+the Kratos session and computes the visitor's effective permission, then either
+blocks the request or lets it through with trusted identity headers the project
+code may trust blind: \`X-CV-User-Id\`, \`X-CV-User-Email\`, and \`X-CV-Perm\`
+(\`read\` | \`write\` | \`admin\`). No session → 401 → portal login; signed in
+but no \`read\` → 403 at the edge (the app never sees it). There is no \`open\`
+(unauthenticated) tier — a VAP rejects any project Ingress lacking the auth
+annotation. (The per-project \`database\` / \`mcp\` capability containers
+additionally re-validate the forwarded session against Kratos for per-user data
+scoping.)
 
-There is no \`open\` (unauthenticated) visibility tier — the ingress-bounds
-VAP rejects any project Ingress that lacks the platform auth-url
-annotation, so a deployed site can never be reached without a Kratos
-session.
+## Two role systems
 
-Roles are simple: every account is a regular **user**; **admins**
-additionally manage users, services, and the project template via the
-portal's Admin pages. The admin role is an Ory Keto grant, issued from
-Admin → Users (or bootstrap-admin.sh for the first admin). There are no
-other tiers.
+1. **Platform role** (Ory Keto). Every account is a regular **user**; **admins**
+   additionally manage users, services, and the project template via the
+   portal's Admin pages. Issued from Admin → Users (or bootstrap-admin.sh for
+   the first admin).
+
+2. **Per-project access** (the common case). A project is PRIVATE by default —
+   only the owner (and their bot) can reach it. The owner widens access with
+   grants across two independent areas:
+   * **Project** — the deployed site. Levels \`read\` / \`write\` / \`admin\`
+     are surfaced to the project code via \`X-CV-Perm\`; the code decides what
+     each level may do (the templates and the Postgres/Garage capabilities ship
+     sensible defaults).
+   * **Repo** — the Gitea repository. Levels \`read\` / \`write\` / \`admin\`
+     map 1:1 onto Gitea collaborator permissions.
+   A grant targets a **user**, a **group**, or **everyone** — the virtual
+   org-wide subject covering every signed-in member. \`everyone\` may be granted
+   read or write, never admin. The effective level is the max of all applicable
+   grants; the project owner is always admin on both areas. Grants are managed
+   on the portal project page; \`create_project\`'s \`visibility\` seeds the
+   initial posture (\`private\` = no grant, \`internal\` = everyone read+write).
 `,
 };
 
