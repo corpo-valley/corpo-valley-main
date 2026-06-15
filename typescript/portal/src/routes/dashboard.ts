@@ -5,24 +5,25 @@ import { csrfHiddenField } from '../middleware/csrf';
 import { isUserAdmin } from '../services/keto';
 import { createApiKey, listUserApiKeys, isKeyOwnedBy, deleteClient } from '../services/hydra-admin';
 import {
-  listProjectsByOwner, getProjectById, getProjectBySlug, createProject, updateProjectDefaults,
-  deleteProject, slugExists, isValidSlug, isDefaultAccess, isGrantLevel,
-  siteDefaultAccess, repoDefaultAccess,
+  listProjectsByOwner, getProjectById, getProjectBySlug, createProject,
+  deleteProject, slugExists, isValidSlug, isGrantLevel,
   setGiteaRepo,
   clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
   clearGarageCredentials, claimOrGetGarageCredentials, decodeGarageCredentials,
   setPinTokenHash,
-  DefaultAccess, GrantLevel,
+  GrantLevel,
 } from '../services/projects';
 import {
-  listProjectGrants, upsertProjectGrant, getGrantById, deleteGrant,
+  listProjectGrants, upsertProjectGrant, getGrantById,
+  setGrantFacet, revokeGrantFacet, getEveryoneGrants,
   getGroupByName, listGroups, listProjectsSharedWith,
+  EVERYONE_SUBJECT_ID, EVERYONE_SUBJECT_NAME,
+  SubjectType, GrantFacet,
 } from '../services/access';
 import { syncRepoAccess, giteaUsernameForIdentity } from '../services/repo-access';
 import { findIdentityByEmail, findIdentityByUsername } from '../services/kratos-admin';
 import { ensureProvisionedLazy } from '../services/provisioning';
-import { detectCapabilities } from '../services/manifests';
 import { generatePinToken, hashPinToken } from '../services/pin-token';
 import {
   enablePostgres as enableProjectPostgres,
@@ -42,7 +43,6 @@ import {
   parseCapabilities, requiresPostgres, capabilityList,
   TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO,
 } from '../services/templates';
-import { composeProjectManifests } from '../services/manifests';
 import { provisionProject } from '../services/provisionProject';
 import {
   generateFromTemplate, ensureUser, giteaEnabled,
@@ -93,17 +93,20 @@ function projectSlugFromHost(url: string): string | null {
 const hydraPublicUrl = process.env.HYDRA_PUBLIC_URL || 'http://localhost:4444';
 
 function toProjectRow(p: {
-  id: string; slug: string; name: string;
-  service_access: string; repo_access: string; created_at: string;
-  site_default_access?: string | null; repo_default_access?: string | null;
+  id: string; slug: string; name: string; created_at: string;
   gitea_repo?: string | null;
-}, extras: { postgresEnabled?: boolean; storageEnabled?: boolean } = {}): ProjectRow {
+}, extras: {
+  postgresEnabled?: boolean; storageEnabled?: boolean;
+  // The project's org-wide `everyone` grant levels, for the summary badge
+  // ('none' when the project is private to the owner + explicit grantees).
+  everyoneSite?: string; everyoneRepo?: string;
+} = {}): ProjectRow {
   return {
     id: p.id,
     slug: p.slug,
     name: p.name,
-    siteDefault: siteDefaultAccess(p as any),
-    repoDefault: repoDefaultAccess(p as any),
+    everyoneSite: extras.everyoneSite ?? 'none',
+    everyoneRepo: extras.everyoneRepo ?? 'none',
     createdAt: p.created_at ? new Date(p.created_at).toLocaleDateString() : '—',
     giteaRepo: p.gitea_repo ?? null,
     postgresEnabled: extras.postgresEnabled ?? false,
@@ -144,9 +147,13 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
     const isAdmin = await isUserAdmin(session.id);
     const projects = await listProjectsByOwner(session.id);
     const shared = await listProjectsSharedWith(session.id).catch(() => []);
+    const everyone = await getEveryoneGrants(projects.map((p) => p.id)).catch(() => new Map());
     res.send(renderProjects(
       session.email,
-      projects.map((p) => toProjectRow(p)),
+      projects.map((p) => {
+        const e = everyone.get(p.id);
+        return toProjectRow(p, { everyoneSite: e?.site ?? 'none', everyoneRepo: e?.repo ?? 'none' });
+      }),
       isAdmin,
       shared.map((p) => ({ ...toProjectRow(p), sitePerm: p.site_perm, repoPerm: p.repo_perm })),
     ));
@@ -171,13 +178,13 @@ router.get('/projects/new', requireSession, async (req: Request, res: Response) 
   }
 });
 
-// POST /projects — create a project owned by the logged-in user.
-// New form sends `name` + `visibility`; legacy `slug` / `service_access` /
-// `repo_access` are still accepted (advanced override). Slug derives from
-// name when not provided.
+// POST /projects — create a project owned by the logged-in user. The form
+// sends `name`, an optional `slug` (derived from name when absent), and a
+// `visibility` preset (`private` | `internal`); `internal` seeds the org-wide
+// `everyone` grant. Finer access is managed on the project page after creation.
 router.post('/projects', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
-  const { slug: rawSlug, name, site_default_access, repo_default_access, visibility } = req.body || {};
+  const { slug: rawSlug, name, visibility } = req.body || {};
 
   const isAdmin = await isUserAdmin(session.id).catch(() => false);
   const fail = (msg: string, status = 400) => {
@@ -210,31 +217,13 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
     return fail('Slug must be lowercase letters, digits, and hyphens (max 63 chars). Edit the slug if your project name has special characters.');
   }
 
-  // Visibility preset → default-access dials (none|read|write per area).
-  // `custom` means the user set the advanced selects explicitly; private /
-  // internal map to the two canonical postures. Explicit user/group grants
-  // are added on the project page after creation. Corpo Valley intentionally
-  // has no `public` preset — neither repo nor deployed site can be exposed
-  // unauthenticated.
-  const presets: Record<string, { site: DefaultAccess; repo: DefaultAccess } | null> = {
-    private:  { site: 'none',  repo: 'none'  },
-    internal: { site: 'write', repo: 'write' },
-    custom:   null,
-  };
-  const v = typeof visibility === 'string' && visibility in presets ? visibility : 'private';
-  const preset = presets[v];
-  // For `custom`, the user MUST supply both advanced fields; for the named
-  // presets, advanced fields override individual axes if provided.
-  const siteDefault = (site_default_access && typeof site_default_access === 'string' && site_default_access.trim())
-    ? site_default_access : preset?.site;
-  const repoDefault = (repo_default_access && typeof repo_default_access === 'string' && repo_default_access.trim())
-    ? repo_default_access : preset?.repo;
-  if (!siteDefault || !isDefaultAccess(siteDefault)) {
-    return fail('Site default access must be none, read, or write.');
-  }
-  if (!repoDefault || !isDefaultAccess(repoDefault)) {
-    return fail('Repo default access must be none, read, or write.');
-  }
+  // Visibility preset → the project's initial org-wide `everyone` grant.
+  // `private` (default) seeds nothing — owner-only. `internal` grants every
+  // signed-in member write on both the site and the repo. Finer access is
+  // managed afterwards as explicit user/group/everyone grants on the project
+  // page. Corpo Valley has no `public` preset — neither repo nor deployed site
+  // can be exposed unauthenticated.
+  const visible = visibility === 'internal' ? 'internal' : 'private';
 
   try {
     if (await slugExists(slug)) {
@@ -247,13 +236,16 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
     if (await namespaceExists(slug)) {
       return fail(`Slug "${slug}" is not available (its namespace still exists).`, 409);
     }
-    const project = await createProject({
-      slug,
-      name,
-      ownerId: session.id,
-      siteDefault,
-      repoDefault,
-    });
+    const project = await createProject({ slug, name, ownerId: session.id });
+    // Seed the org-wide grant before provisioning so the repo collaborator
+    // fan-out picks it up; private projects seed nothing (owner-only).
+    if (visible === 'internal') {
+      await upsertProjectGrant({
+        projectId: project.id, subjectType: 'everyone',
+        subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME,
+        sitePerm: 'write', repoPerm: 'write',
+      }).catch((e: any) => console.error('[dashboard] seed everyone grant failed:', e?.message));
+    }
     if (!session.preferredUsername) {
       console.warn('Project provisioning limited: no preferred_username for', session.id);
     }
@@ -264,6 +256,12 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
     await provisionProject(project, caps, {
       ownerUsername: session.preferredUsername, email: session.email, logTag: 'dashboard',
     });
+    // Converge the repo collaborator set for the seeded org-wide grant (the
+    // repo only exists after provisioning).
+    if (visible === 'internal') {
+      syncRepoAccess(project).catch((e: any) =>
+        console.error(`[dashboard] repo access sync failed for ${project.slug}:`, e?.message));
+    }
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
     // Unique-violation race: another request grabbed the slug first.
@@ -295,10 +293,14 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       storageEnabledNow = await projectGarageEnabled({ owner: pgOwner, repo: pgRepo }).catch(() => false);
     }
     const grants = await listProjectGrants(project.id).catch(() => []);
+    const everyoneGrant = grants.find((g) => g.subject_type === 'everyone');
     const groups = await listGroups().catch(() => []);
     res.send(renderProjectDetail(
       session.email, isAdmin,
-      toProjectRow(project, { postgresEnabled: postgresEnabledNow, storageEnabled: storageEnabledNow }),
+      toProjectRow(project, {
+        postgresEnabled: postgresEnabledNow, storageEnabled: storageEnabledNow,
+        everyoneSite: everyoneGrant?.site_perm ?? 'none', everyoneRepo: everyoneGrant?.repo_perm ?? 'none',
+      }),
       csrf, secrets, null,
       grants, groups.map((g) => ({ name: g.name, memberCount: g.member_count })),
     ));
@@ -626,80 +628,65 @@ router.post('/projects/:id/storage/disable', requireSession, requireVerifiedEmai
   }
 });
 
-// POST /projects/:id — update default-access dials (owner only). Site access
-// takes effect immediately (the edge auth endpoint reads the DB live); the
-// repo side converges Gitea (visibility + collaborator fan-out), and the
-// project manifests are re-committed so pre-grants projects pick up the
-// header-injecting ingress on their first access change.
-router.post('/projects/:id', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
+// POST /projects/:id/access — grant a subject (user, group, or everyone) a
+// level on ONE area (owner only). Form: `facet` ('site'|'repo'), `level`
+// ('read'|'write'|'admin'), `subject_type` ('user'|'group'|'everyone'),
+// `identifier` (email/username or group name; unused for everyone). The two
+// areas are edited independently — a grant the subject already holds on the
+// OTHER area is preserved. Site access takes effect within seconds (the edge
+// auth endpoint reads the DB live); repo grants converge Gitea collaborators.
+router.post('/projects/:id/access', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
-  const { site_default_access, repo_default_access } = req.body || {};
   try {
     const project = await getProjectById(req.params.id);
     if (!project || project.owner_id !== session.id) {
       res.status(404).send(renderError('Not Found', 'Project not found.'));
       return;
     }
-    if (!isDefaultAccess(site_default_access) || !isDefaultAccess(repo_default_access)) {
-      res.status(400).send(renderError('Invalid Input', 'Access defaults must be none, read, or write.'));
+    const facet: GrantFacet = req.body?.facet === 'repo' ? 'repo' : 'site';
+    const rawLevel = String(req.body?.level || '');
+    if (!isGrantLevel(rawLevel)) {
+      res.status(400).send(renderError('Invalid Input', 'Level must be read, write, or admin.'));
       return;
     }
-    const updated = await updateProjectDefaults(project.id, site_default_access, repo_default_access);
-    if (updated) {
-      // Best-effort converges; the DB row is the source of truth either way.
-      syncRepoAccess(updated).catch((e: any) =>
-        console.error(`[dashboard] repo access sync failed for ${updated.slug}:`, e?.message));
-      if (updated.gitea_repo) {
-        const [owner, repo] = updated.gitea_repo.split('/');
-        detectCapabilities({ owner, repo })
-          .then((caps) => composeProjectManifests({ owner, repo, slug: updated.slug, caps }))
-          .catch((e: any) => console.error(`[dashboard] manifest refresh failed for ${updated.slug}:`, e?.message));
+    const level: GrantLevel = rawLevel;
+    const rawSubject = req.body?.subject_type;
+    const subjectType: SubjectType =
+      rawSubject === 'group' ? 'group' : rawSubject === 'everyone' ? 'everyone' : 'user';
+
+    // The org-wide `everyone` subject is capped at read/write on both areas.
+    if (subjectType === 'everyone' && level === 'admin') {
+      res.status(400).send(renderError('Invalid Input', '“Everyone” cannot be granted Admin — use read or write for org-wide access.'));
+      return;
+    }
+
+    if (subjectType === 'everyone') {
+      await setGrantFacet({
+        projectId: project.id, subjectType: 'everyone',
+        subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME,
+        facet, level,
+      });
+    } else if (subjectType === 'group') {
+      const identifier = String(req.body?.identifier || '').trim();
+      if (!identifier) {
+        res.status(400).send(renderError('Invalid Input', 'Provide a group name.'));
+        return;
       }
-    }
-    res.redirect(`/projects/${project.id}`);
-  } catch (err: any) {
-    console.error('Project update error:', err.message);
-    res.status(500).send(renderError('Error', 'Failed to update project.'));
-  }
-});
-
-// POST /projects/:id/grants — grant a user or group access (owner only).
-// Form: subject_type (user|group), identifier (email/username, or group
-// name), site_perm + repo_perm ('' = no grant for that area).
-router.post('/projects/:id/grants', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
-  const session = req.portalSession!;
-  try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
-    const subjectType = req.body?.subject_type === 'group' ? 'group' : 'user';
-    const identifier = String(req.body?.identifier || '').trim();
-    const rawSite = String(req.body?.site_perm || '');
-    const rawRepo = String(req.body?.repo_perm || '');
-    const sitePerm: GrantLevel | null = isGrantLevel(rawSite) ? rawSite : null;
-    const repoPerm: GrantLevel | null = isGrantLevel(rawRepo) ? rawRepo : null;
-    if (!identifier || identifier.length > 254) {
-      res.status(400).send(renderError('Invalid Input', 'Provide a user email/username or a group name.'));
-      return;
-    }
-    if (!sitePerm && !repoPerm) {
-      res.status(400).send(renderError('Invalid Input', 'Pick a site and/or repo permission for the grant.'));
-      return;
-    }
-
-    if (subjectType === 'group') {
       const group = await getGroupByName(identifier.toLowerCase());
       if (!group) {
         res.status(404).send(renderError('Not Found', `No group named "${identifier}". Create it under Groups first.`));
         return;
       }
-      await upsertProjectGrant({
+      await setGrantFacet({
         projectId: project.id, subjectType: 'group', subjectId: group.id,
-        subjectName: group.name, sitePerm, repoPerm,
+        subjectName: group.name, facet, level,
       });
     } else {
+      const identifier = String(req.body?.identifier || '').trim();
+      if (!identifier || identifier.length > 254) {
+        res.status(400).send(renderError('Invalid Input', 'Provide a user email or username.'));
+        return;
+      }
       const identity = identifier.includes('@')
         ? await findIdentityByEmail(identifier)
         : await findIdentityByUsername(identifier);
@@ -717,15 +704,15 @@ router.post('/projects/:id/grants', requireSession, requireVerifiedEmail, async 
         return;
       }
       const traits = (identity.traits ?? {}) as Record<string, any>;
-      await upsertProjectGrant({
+      await setGrantFacet({
         projectId: project.id, subjectType: 'user', subjectId: identity.id,
         subjectName: traits.email || traits.preferred_username || identity.id,
         giteaUsername: giteaUsernameForIdentity(identity),
-        sitePerm, repoPerm,
+        facet, level,
       });
     }
 
-    if (repoPerm) {
+    if (facet === 'repo') {
       const fresh = await getProjectById(project.id);
       if (fresh) {
         syncRepoAccess(fresh).catch((e: any) =>
@@ -734,13 +721,15 @@ router.post('/projects/:id/grants', requireSession, requireVerifiedEmail, async 
     }
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
-    console.error('Grant create error:', err?.message);
-    res.status(500).send(renderError('Error', 'Failed to add the grant.'));
+    console.error('Access grant error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to update access.'));
   }
 });
 
-// POST /projects/:id/grants/:grantId/delete — revoke a grant (owner only).
-router.post('/projects/:id/grants/:grantId/delete', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
+// POST /projects/:id/access/:grantId/revoke — remove a subject's level on ONE
+// area (owner only). Form: `facet` ('site'|'repo'). When the subject is left
+// with no grant on either area the grant row is deleted entirely.
+router.post('/projects/:id/access/:grantId/revoke', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const project = await getProjectById(req.params.id);
@@ -748,18 +737,20 @@ router.post('/projects/:id/grants/:grantId/delete', requireSession, requireVerif
       res.status(404).send(renderError('Not Found', 'Project not found.'));
       return;
     }
+    const facet: GrantFacet = req.body?.facet === 'repo' ? 'repo' : 'site';
     const grant = await getGrantById(req.params.grantId);
     if (grant && grant.project_id === project.id) {
-      await deleteGrant(grant.id);
-      if (grant.repo_perm) {
+      const hadRepo = !!grant.repo_perm;
+      await revokeGrantFacet(grant.id, facet);
+      if (facet === 'repo' && hadRepo) {
         syncRepoAccess(project).catch((e: any) =>
           console.error(`[dashboard] repo access sync failed for ${project.slug}:`, e?.message));
       }
     }
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
-    console.error('Grant delete error:', err?.message);
-    res.status(500).send(renderError('Error', 'Failed to remove the grant.'));
+    console.error('Access revoke error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to remove access.'));
   }
 });
 

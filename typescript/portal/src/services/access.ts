@@ -17,10 +17,19 @@
 
 import {
   pool, Project, GrantLevel, EffectivePerm, maxPerm,
-  siteDefaultAccess, repoDefaultAccess,
 } from './projects';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// The virtual org-wide subject. A single `everyone` grant per project widens
+// access to every signed-in member (the replacement for the old default-access
+// dial). It is capped at read/write — never admin — enforced here and by a DB
+// CHECK (services/projects.ts migrate()). `everyone` is also a RESERVED group
+// name below, so it can never collide with a real group.
+export const EVERYONE_SUBJECT_ID = 'everyone';
+export const EVERYONE_SUBJECT_NAME = 'Everyone';
+export type SubjectType = 'user' | 'group' | 'everyone';
+export type GrantFacet = 'site' | 'repo';
 
 // Group names share a page with project/user names in pickers; keep them
 // slug-ish so they render and compare predictably. Reserved names that imply
@@ -50,7 +59,7 @@ export interface GroupMember {
 export interface ProjectGrant {
   id: string;
   project_id: string;
-  subject_type: 'user' | 'group';
+  subject_type: SubjectType;
   subject_id: string;
   // Display name: the user's email/username, or the group name.
   subject_name: string | null;
@@ -175,7 +184,7 @@ export async function getGrantById(id: string): Promise<ProjectGrant | null> {
 // erroring, which is what an owner adjusting access expects.
 export async function upsertProjectGrant(grant: {
   projectId: string;
-  subjectType: 'user' | 'group';
+  subjectType: SubjectType;
   subjectId: string;
   subjectName?: string | null;
   giteaUsername?: string | null;
@@ -195,8 +204,74 @@ export async function upsertProjectGrant(grant: {
   return rows[0];
 }
 
+// Set ONE area's level for a subject, preserving the other area. This is what
+// the two-section UI (Project Access / Repo Access) posts: a subject is added
+// to one facet at a time, and may already hold a grant on the other facet.
+// Caller is responsible for refusing admin on the `everyone` subject (the DB
+// CHECK is the backstop). gitea_username is only ever set, never cleared, so
+// editing the site facet of a user grant keeps the repo reconciler's login.
+export async function setGrantFacet(input: {
+  projectId: string;
+  subjectType: SubjectType;
+  subjectId: string;
+  subjectName?: string | null;
+  giteaUsername?: string | null;
+  facet: GrantFacet;
+  level: GrantLevel;
+}): Promise<ProjectGrant> {
+  const col = input.facet === 'site' ? 'site_perm' : 'repo_perm';
+  const { rows } = await pool.query<ProjectGrant>(
+    `INSERT INTO project_grants (project_id, subject_type, subject_id, subject_name, gitea_username, ${col})
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (project_id, subject_type, subject_id)
+     DO UPDATE SET subject_name = EXCLUDED.subject_name,
+                   gitea_username = COALESCE(EXCLUDED.gitea_username, project_grants.gitea_username),
+                   ${col} = EXCLUDED.${col}
+     RETURNING *`,
+    [input.projectId, input.subjectType, input.subjectId, input.subjectName ?? null,
+     input.giteaUsername ?? null, input.level]
+  );
+  return rows[0];
+}
+
+// Revoke ONE area's level from a grant. When both areas end up empty the grant
+// row is removed entirely (an all-NULL grant is meaningless).
+export async function revokeGrantFacet(grantId: string, facet: GrantFacet): Promise<void> {
+  const col = facet === 'site' ? 'site_perm' : 'repo_perm';
+  await pool.query(`UPDATE project_grants SET ${col} = NULL WHERE id = $1`, [grantId]);
+  await pool.query('DELETE FROM project_grants WHERE id = $1 AND site_perm IS NULL AND repo_perm IS NULL', [grantId]);
+}
+
 export async function deleteGrant(id: string): Promise<void> {
   await pool.query('DELETE FROM project_grants WHERE id = $1', [id]);
+}
+
+// The `everyone` (org-wide) grant for a set of projects, for list/summary
+// rendering. Keyed by project_id; absent projects are private.
+export async function getEveryoneGrants(
+  projectIds: string[],
+): Promise<Map<string, { site: GrantLevel | null; repo: GrantLevel | null }>> {
+  const map = new Map<string, { site: GrantLevel | null; repo: GrantLevel | null }>();
+  if (projectIds.length === 0) return map;
+  const { rows } = await pool.query<{ project_id: string; site_perm: GrantLevel | null; repo_perm: GrantLevel | null }>(
+    `SELECT project_id, site_perm, repo_perm FROM project_grants
+     WHERE subject_type = 'everyone' AND project_id = ANY($1)`,
+    [projectIds]
+  );
+  for (const r of rows) map.set(r.project_id, { site: r.site_perm, repo: r.repo_perm });
+  return map;
+}
+
+// Projects whose `everyone` grant shares the repo with every member (`read` or
+// `write`) — the Gitea collaborator fan-out set a newly provisioned user must
+// be added to (services/repo-access.ts).
+export async function listProjectsWithEveryoneRepoGrant(): Promise<Array<Project & { everyone_repo_perm: GrantLevel }>> {
+  const { rows } = await pool.query<Project & { everyone_repo_perm: GrantLevel }>(
+    `SELECT p.*, g.repo_perm AS everyone_repo_perm
+     FROM projects p JOIN project_grants g ON g.project_id = p.id
+     WHERE g.subject_type = 'everyone' AND g.repo_perm IN ('read', 'write')`
+  );
+  return rows;
 }
 
 // Projects shared with a user via a direct or group grant (any area) — the
@@ -226,14 +301,16 @@ export async function listProjectsSharedWith(userId: string): Promise<Array<Proj
 // ── Effective permission resolution ────────────────────────────────────────
 
 // All grant levels that apply to (project, user) in one query: direct user
-// grants plus grants to any group the user belongs to.
+// grants, grants to any group the user belongs to, and the project's org-wide
+// `everyone` grant (which applies to every signed-in member).
 async function grantLevelsFor(projectId: string, userId: string): Promise<Array<{ site_perm: GrantLevel | null; repo_perm: GrantLevel | null }>> {
   const { rows } = await pool.query<{ site_perm: GrantLevel | null; repo_perm: GrantLevel | null }>(
     `SELECT g.site_perm, g.repo_perm
      FROM project_grants g
      LEFT JOIN group_members m ON g.subject_type = 'group' AND m.group_id::text = g.subject_id
      WHERE g.project_id = $1
-       AND ((g.subject_type = 'user' AND g.subject_id = $2)
+       AND (g.subject_type = 'everyone'
+         OR (g.subject_type = 'user' AND g.subject_id = $2)
          OR (g.subject_type = 'group' AND m.user_id = $2))`,
     [projectId, userId]
   );
@@ -241,12 +318,14 @@ async function grantLevelsFor(projectId: string, userId: string): Promise<Array<
 }
 
 // The caller's effective permission on the project's SITE area. Owner is
-// always admin; otherwise max(default dial, applicable grants). This is what
-// the ingress auth subrequest (routes/site-access.ts) stamps into X-CV-Perm.
+// always admin; otherwise max over applicable grants (direct, group, and
+// `everyone`). A project with no matching grant resolves to `none` — private.
+// This is what the ingress auth subrequest (routes/site-access.ts) stamps into
+// X-CV-Perm.
 export async function effectiveSitePerm(project: Project, userId: string): Promise<EffectivePerm> {
   if (project.owner_id === userId) return 'admin';
   const grants = await grantLevelsFor(project.id, userId);
-  return maxPerm(siteDefaultAccess(project), ...grants.map((g) => g.site_perm));
+  return maxPerm(...grants.map((g) => g.site_perm));
 }
 
 // The caller's effective permission on the project's REPO area. Informational
@@ -254,5 +333,5 @@ export async function effectiveSitePerm(project: Project, userId: string): Promi
 export async function effectiveRepoPerm(project: Project, userId: string): Promise<EffectivePerm> {
   if (project.owner_id === userId) return 'admin';
   const grants = await grantLevelsFor(project.id, userId);
-  return maxPerm(repoDefaultAccess(project), ...grants.map((g) => g.repo_perm));
+  return maxPerm(...grants.map((g) => g.repo_perm));
 }

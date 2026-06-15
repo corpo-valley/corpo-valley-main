@@ -14,13 +14,18 @@
 import * as crypto from 'crypto';
 import {
   createProject, getProjectById, listProjectsByOwner, deleteProject,
-  slugExists, isValidSlug, siteDefaultAccess, repoDefaultAccess,
+  slugExists, isValidSlug,
   setGiteaRepo, clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
   clearGarageCredentials, claimOrGetGarageCredentials, decodeGarageCredentials,
   setPinTokenHash,
-  type Project, type DefaultAccess,
+  type Project, type GrantLevel,
 } from './projects';
+import {
+  upsertProjectGrant, getEveryoneGrants,
+  EVERYONE_SUBJECT_ID, EVERYONE_SUBJECT_NAME,
+} from './access';
+import { syncRepoAccess } from './repo-access';
 import {
   enablePostgres, disablePostgres, postgresEnabled,
   destroyPostgresPvc, generatePostgresPassword,
@@ -137,7 +142,8 @@ const tools: Record<string, ToolDef> = {
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     async handler(ctx) {
       const rows = await listProjectsByOwner(ctx.userId);
-      return { projects: rows.map(toToolProject) };
+      const everyone = await getEveryoneGrants(rows.map((p) => p.id)).catch(() => new Map());
+      return { projects: rows.map((p) => toToolProject(p, everyone.get(p.id))) };
     },
   },
 
@@ -161,7 +167,8 @@ const tools: Record<string, ToolDef> = {
         storeEnabled = await garageEnabled({ owner: o, repo: r }).catch(() => false);
         caps = await detectCapabilities({ owner: o, repo: r }).catch(() => caps);
       }
-      return { ...toToolProject(p), capabilities: capabilityList(caps), postgres: { enabled: pgEnabled }, storage: { enabled: storeEnabled } };
+      const everyone = await getEveryoneGrants([p.id]).catch(() => new Map());
+      return { ...toToolProject(p, everyone.get(p.id)), capabilities: capabilityList(caps), postgres: { enabled: pgEnabled }, storage: { enabled: storeEnabled } };
     },
   },
 
@@ -173,7 +180,7 @@ const tools: Record<string, ToolDef> = {
       properties: {
         name: { type: 'string', minLength: 1, description: 'Human-readable name.' },
         slug: { type: 'string', pattern: '^[a-z0-9-]+$', maxLength: 63, description: 'Optional URL slug; derived from name when omitted.' },
-        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Member default access. `private` = owner only (site/repo default none); `internal` = every signed-in member gets write on the site and the repo. Defaults to private. Finer control (read-only defaults, per-user/group grants) lives in the portal project page. Corpo Valley does not publish projects publicly.' },
+        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Initial access posture. `private` (default) = owner-only. `internal` = every signed-in member gets read+write on BOTH the deployed site and the repo, seeded as the org-wide “everyone” grant. Finer access — per-user/group grants, read-only org-wide, and admins — is managed afterwards on the portal project page (the deployed project reads its caller’s level from `X-CV-Perm`). Corpo Valley never publishes projects unauthenticated.' },
         capabilities: {
           type: 'object',
           description: 'Which optional capabilities to enable. The website is always on.',
@@ -192,14 +199,7 @@ const tools: Record<string, ToolDef> = {
       requireVerified(ctx);
       const name = String(args.name || '').trim();
       if (!name) throw new ToolError('name is required');
-      const visibility = (args.visibility && ['private', 'internal'].includes(args.visibility)) ? args.visibility : 'private';
-      // Preset → default-access dials (none|read|write per area). Explicit
-      // user/group grants are managed from the portal's project page.
-      const presets: Record<string, { site: DefaultAccess; repo: DefaultAccess }> = {
-        private: { site: 'none', repo: 'none' },
-        internal: { site: 'write', repo: 'write' },
-      };
-      const preset = presets[visibility];
+      const visibility = (args.visibility === 'internal') ? 'internal' : 'private';
       const caps = parseCapabilities(args.capabilities);
       const sluggify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
       const slug = (typeof args.slug === 'string' && args.slug.trim()) ? args.slug.trim() : sluggify(name);
@@ -211,10 +211,21 @@ const tools: Record<string, ToolDef> = {
       // inherit the previous tenant's live namespace + secrets.
       if (await namespaceExists(slug)) throw new ToolError(`slug "${slug}" is not available (its namespace still exists).`);
 
-      const project = await createProject({
-        slug, name, ownerId: ctx.userId,
-        siteDefault: preset.site, repoDefault: preset.repo,
-      });
+      const project = await createProject({ slug, name, ownerId: ctx.userId });
+
+      // `internal` seeds the org-wide everyone grant (read+write both areas)
+      // before provisioning so the repo collaborator fan-out picks it up;
+      // `private` seeds nothing (owner-only). Finer grants are managed in the
+      // portal.
+      let everyone: { site: GrantLevel | null; repo: GrantLevel | null } | undefined;
+      if (visibility === 'internal') {
+        await upsertProjectGrant({
+          projectId: project.id, subjectType: 'everyone',
+          subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME,
+          sitePerm: 'write', repoPerm: 'write',
+        }).catch(() => {});
+        everyone = { site: 'write', repo: 'write' };
+      }
 
       // Unified provisioning (shared with the dashboard): seals the namespace
       // baseline, then provisions repo/postgres/manifests/argocd. Best-effort —
@@ -222,8 +233,11 @@ const tools: Record<string, ToolDef> = {
       const prov = await provisionProject(project, caps, {
         ownerUsername: ctx.preferredUsername, email: ctx.email, logTag: 'mcp',
       });
+      if (visibility === 'internal') {
+        syncRepoAccess(project).catch(() => {});
+      }
       return {
-        ...toToolProject(project),
+        ...toToolProject(project, everyone),
         application_registered: prov.argoRegistered,
         capabilities: capabilityList(caps),
         postgres: { enabled: prov.postgresEnabled },
@@ -1176,16 +1190,21 @@ function rethrowK8s(err: unknown): never {
   throw err;
 }
 
-function toToolProject(p: Project) {
+function toToolProject(p: Project, everyone?: { site: GrantLevel | null; repo: GrantLevel | null }) {
+  // Org-wide access is the optional `everyone` grant (read|write, never admin).
+  // null `everyone_access` ⇒ the project is private to the owner + any explicit
+  // per-user/group grantees (managed in the portal). `visibility` is the
+  // create-time shorthand for the same thing.
+  const everyoneAccess = everyone && (everyone.site || everyone.repo)
+    ? { site: everyone.site ?? 'none', repo: everyone.repo ?? 'none' }
+    : null;
   return {
     id: p.id,
     slug: p.slug,
     name: p.name,
     url: `https://${p.slug}.${PROJECTS_DOMAIN}`,
-    // Default access every signed-in member gets, per area (none|read|write).
-    // Explicit per-user/group grants (managed in the portal UI) layer on top.
-    site_default_access: siteDefaultAccess(p),
-    repo_default_access: repoDefaultAccess(p),
+    visibility: everyoneAccess ? 'internal' : 'private',
+    everyone_access: everyoneAccess,
     created_at: p.created_at,
     gitea_repo: p.gitea_repo,
     gitea_url: p.gitea_repo ? `${GITEA_PUBLIC_URL}/${p.gitea_repo}` : null,

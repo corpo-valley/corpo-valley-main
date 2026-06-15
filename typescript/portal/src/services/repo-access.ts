@@ -22,11 +22,11 @@
 // that fails transiently is retried here and re-attempted by the periodic
 // reconcile sweep (reconcileAllProjects), so stale write access self-heals.
 
+import { Project, GrantLevel, listAllProjects } from './projects';
 import {
-  Project, GrantLevel, DefaultAccess, repoDefaultAccess,
-  listProjectsWithSharedRepoDefault, listAllProjects,
-} from './projects';
-import { listProjectGrants, listGroupMembers, listProjectsGrantedToGroup } from './access';
+  listProjectGrants, listGroupMembers, listProjectsGrantedToGroup,
+  listProjectsWithEveryoneRepoGrant,
+} from './access';
 import {
   giteaEnabled, listCollaborators, setCollaborator, removeCollaborator,
   setRepoVisibility, GiteaRepoPermission,
@@ -67,22 +67,20 @@ async function desiredCollaborators(project: Project): Promise<Map<string, Gitea
     if (!grant.repo_perm) continue;
     if (grant.subject_type === 'user') {
       bump(grant.gitea_username, grant.repo_perm);
-    } else {
+    } else if (grant.subject_type === 'group') {
       for (const member of await listGroupMembers(grant.subject_id)) {
         bump(member.username, grant.repo_perm);
       }
-    }
-  }
-
-  // Default `read`/`write` → every provisioned member gets that level (repos
-  // are always private, so even `read` sharing must be a collaborator). O(members)
-  // Gitea calls on first converge; subsequent reconciles only touch the delta.
-  const repoDefault = repoDefaultAccess(project);
-  if (repoDefault === 'read' || repoDefault === 'write') {
-    const identities = await listAllHumanIdentities();
-    for (const identity of identities) {
-      if (identity.id === project.owner_id) continue;
-      bump(giteaUsernameForIdentity(identity), repoDefault);
+    } else {
+      // `everyone`: fan the org-wide repo grant out to every provisioned
+      // member as a collaborator (repos are always private, so even `read`
+      // sharing must be an explicit collaborator). O(members) Gitea calls on
+      // first converge; subsequent reconciles only touch the delta.
+      const identities = await listAllHumanIdentities();
+      for (const identity of identities) {
+        if (identity.id === project.owner_id) continue;
+        bump(giteaUsernameForIdentity(identity), grant.repo_perm);
+      }
     }
   }
 
@@ -172,21 +170,20 @@ export async function syncProjectsForGroup(groupId: string): Promise<void> {
 }
 
 // Give a newly provisioned member collaborator access to every repo whose
-// default is `read` or `write`, at that default's level. Called from identity
-// provisioning; best-effort.
+// org-wide `everyone` grant shares the repo (`read`/`write`), at that grant's
+// level. Called from identity provisioning; best-effort.
 export async function addMemberToDefaultAccessRepos(username: string, userId: string): Promise<void> {
   if (!giteaEnabled()) return;
   if (!isValidUsername(username) || isReservedUsername(username)) return;
-  let projects: Project[];
-  try { projects = await listProjectsWithSharedRepoDefault(); }
-  catch (e: any) { console.error('[repo-access] shared-default listing failed:', e?.message); return; }
+  let projects: Array<Project & { everyone_repo_perm: GrantLevel }>;
+  try { projects = await listProjectsWithEveryoneRepoGrant(); }
+  catch (e: any) { console.error('[repo-access] everyone-repo-grant listing failed:', e?.message); return; }
   for (const project of projects) {
     if (!project.gitea_repo || project.owner_id === userId) continue;
-    const level: DefaultAccess = repoDefaultAccess(project);
-    if (level !== 'read' && level !== 'write') continue;
+    const level = project.everyone_repo_perm;
     const [owner, repo] = project.gitea_repo.split('/');
     try { await setCollaborator({ owner, repo, username, permission: level }); }
-    catch (e: any) { console.warn(`[repo-access] default-${level} add ${username} → ${project.slug} failed:`, e?.message); }
+    catch (e: any) { console.warn(`[repo-access] everyone-${level} add ${username} → ${project.slug} failed:`, e?.message); }
   }
 }
 
