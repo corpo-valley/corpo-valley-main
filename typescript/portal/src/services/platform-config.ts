@@ -98,3 +98,48 @@ export const GARAGE_STORAGE_CLASS: string | undefined = POSTGRES_STORAGE_CLASS;
 // `blob.garageImage`; the default reproduces the pinned upstream version.
 export const GARAGE_IMAGE =
   process.env.CV_GARAGE_IMAGE || 'ghcr.io/corpo-valley/corpo-valley-garage:v1.0.1';
+
+// A Kubernetes resource "quantity": digits with an optional decimal/exponent
+// and one of the canonical unit suffixes (e.g. 64Mi, 2Gi, 250m, 2). Anchored,
+// and length-capped to keep a pathological input from reaching the regex.
+// Used to validate BOTH operator-supplied env values below AND the untrusted
+// resource values the manifest generator reads back from a project's
+// hand-editable k8s/deployment.yaml — only a string that passes this is ever
+// interpolated into generated YAML or a k8s API object.
+const QUANTITY_RE =
+  /^[+]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/;
+
+export function isQuantity(s: string | undefined | null): s is string {
+  return typeof s === 'string' && s.length > 0 && s.length <= 32 && QUANTITY_RE.test(s);
+}
+
+// Read a memory/CPU quantity from the env, falling back (with no throw) to the
+// baked default if the operator left it unset or supplied a non-quantity — a
+// bad chart value must not produce a broken ResourceQuota/LimitRange or a
+// deployment.yaml the apiserver rejects.
+function quantityEnv(name: string, fallback: string): string {
+  const v = process.env[name];
+  return isQuantity(v) ? v : fallback;
+}
+
+// ── Per-project memory budget (operator-owned ceilings) ─────────────────────
+//
+// The chart injects these; the portal stamps them onto every tenant namespace
+// as a ResourceQuota (per-project totals) + LimitRange (per-container bounds
+// and the defaults applied to containers that declare nothing). Project owners
+// tune their pods' `resources:` within these ceilings and the apiserver
+// enforces them — see k8s.ts (tenantResourceQuotaObject / tenantLimitRangeObject)
+// and manifests.ts (the default stamped into a newly added capability). The
+// defaults reproduce the original corpo-valley.com deployment.
+
+// ResourceQuota limits.memory — the headline per-project max memory usage.
+export const TENANT_MAX_MEMORY = quantityEnv('CV_MAX_MEMORY', '4Gi');
+// ResourceQuota requests.memory — the per-project scheduled floor.
+export const TENANT_MAX_MEMORY_REQUESTS = quantityEnv('CV_MAX_MEMORY_REQUESTS', '2Gi');
+// LimitRange max.memory — ceiling any single container may request.
+export const TENANT_MAX_MEMORY_PER_CONTAINER = quantityEnv('CV_MAX_MEMORY_PER_CONTAINER', '2Gi');
+// Stamped into a freshly added capability container, and the LimitRange
+// `default` (limit) for containers that declare no memory limit.
+export const TENANT_DEFAULT_MEMORY = quantityEnv('CV_DEFAULT_MEMORY', '256Mi');
+// The LimitRange `defaultRequest` and the request stamped into a new container.
+export const TENANT_DEFAULT_MEMORY_REQUEST = quantityEnv('CV_DEFAULT_MEMORY_REQUEST', '64Mi');

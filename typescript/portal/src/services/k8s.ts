@@ -10,7 +10,11 @@
 // e.g. local dev outside the cluster.
 import * as https from 'https';
 import * as fs from 'fs';
-import { KRATOS_NAMESPACE, PROJECTS_DOMAIN } from './platform-config';
+import {
+  KRATOS_NAMESPACE, PROJECTS_DOMAIN,
+  TENANT_MAX_MEMORY, TENANT_MAX_MEMORY_REQUESTS, TENANT_MAX_MEMORY_PER_CONTAINER,
+  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
+} from './platform-config';
 
 const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
 const TOKEN_FILE = `${SA_DIR}/token`;
@@ -482,7 +486,9 @@ function tenantResourceQuotaObject(slug: string) {
       labels: { 'corpo-valley.com/managed': 'baseline' } },
     spec: { hard: {
       'requests.cpu': '2', 'limits.cpu': '4',
-      'requests.memory': '2Gi', 'limits.memory': '4Gi',
+      // Per-project memory budget — operator-tunable via the chart
+      // (tenant.memory.max / .maxRequests → CV_MAX_MEMORY[_REQUESTS]).
+      'requests.memory': TENANT_MAX_MEMORY_REQUESTS, 'limits.memory': TENANT_MAX_MEMORY,
       'pods': '12', 'persistentvolumeclaims': '3',
       'services.loadbalancers': '0', 'services.nodeports': '0',
     } },
@@ -496,9 +502,11 @@ function tenantLimitRangeObject(slug: string) {
       labels: { 'corpo-valley.com/managed': 'baseline' } },
     spec: { limits: [{
       type: 'Container',
-      defaultRequest: { cpu: '50m', memory: '64Mi' },
-      default: { cpu: '500m', memory: '256Mi' },
-      max: { cpu: '2', memory: '2Gi' },
+      // Memory defaults/ceiling are operator-tunable via the chart
+      // (tenant.memory.* → CV_DEFAULT_MEMORY[_REQUEST] / CV_MAX_MEMORY_PER_CONTAINER).
+      defaultRequest: { cpu: '50m', memory: TENANT_DEFAULT_MEMORY_REQUEST },
+      default: { cpu: '500m', memory: TENANT_DEFAULT_MEMORY },
+      max: { cpu: '2', memory: TENANT_MAX_MEMORY_PER_CONTAINER },
     }] },
   };
 }
