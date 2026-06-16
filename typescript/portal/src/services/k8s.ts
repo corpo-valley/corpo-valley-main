@@ -479,7 +479,20 @@ function tenantEgressPolicyObject(slug: string) {
   };
 }
 
-function tenantResourceQuotaObject(slug: string) {
+// Per-project memory overrides an admin may pass to reconcileTenantResources to
+// patch ONE project above/below the chart defaults. Every field is optional;
+// an omitted field falls back to the chart-configured value. Callers MUST have
+// validated each supplied value with isQuantity (platform-config) first — these
+// flow into a k8s API object, so a bad value would be rejected by the apiserver.
+export interface TenantMemoryOverrides {
+  max?: string;
+  maxRequests?: string;
+  maxPerContainer?: string;
+  default?: string;
+  defaultRequest?: string;
+}
+
+function tenantResourceQuotaObject(slug: string, mem: TenantMemoryOverrides = {}) {
   return {
     apiVersion: 'v1', kind: 'ResourceQuota',
     metadata: { name: 'cv-tenant-quota', namespace: slug,
@@ -487,15 +500,17 @@ function tenantResourceQuotaObject(slug: string) {
     spec: { hard: {
       'requests.cpu': '2', 'limits.cpu': '4',
       // Per-project memory budget — operator-tunable via the chart
-      // (tenant.memory.max / .maxRequests → CV_MAX_MEMORY[_REQUESTS]).
-      'requests.memory': TENANT_MAX_MEMORY_REQUESTS, 'limits.memory': TENANT_MAX_MEMORY,
+      // (tenant.memory.max / .maxRequests → CV_MAX_MEMORY[_REQUESTS]), and
+      // per-project overridable by an admin via reconcileTenantResources.
+      'requests.memory': mem.maxRequests ?? TENANT_MAX_MEMORY_REQUESTS,
+      'limits.memory': mem.max ?? TENANT_MAX_MEMORY,
       'pods': '12', 'persistentvolumeclaims': '3',
       'services.loadbalancers': '0', 'services.nodeports': '0',
     } },
   };
 }
 
-function tenantLimitRangeObject(slug: string) {
+function tenantLimitRangeObject(slug: string, mem: TenantMemoryOverrides = {}) {
   return {
     apiVersion: 'v1', kind: 'LimitRange',
     metadata: { name: 'cv-tenant-limits', namespace: slug,
@@ -503,10 +518,11 @@ function tenantLimitRangeObject(slug: string) {
     spec: { limits: [{
       type: 'Container',
       // Memory defaults/ceiling are operator-tunable via the chart
-      // (tenant.memory.* → CV_DEFAULT_MEMORY[_REQUEST] / CV_MAX_MEMORY_PER_CONTAINER).
-      defaultRequest: { cpu: '50m', memory: TENANT_DEFAULT_MEMORY_REQUEST },
-      default: { cpu: '500m', memory: TENANT_DEFAULT_MEMORY },
-      max: { cpu: '2', memory: TENANT_MAX_MEMORY_PER_CONTAINER },
+      // (tenant.memory.* → CV_DEFAULT_MEMORY[_REQUEST] / CV_MAX_MEMORY_PER_CONTAINER),
+      // and per-project overridable by an admin via reconcileTenantResources.
+      defaultRequest: { cpu: '50m', memory: mem.defaultRequest ?? TENANT_DEFAULT_MEMORY_REQUEST },
+      default: { cpu: '500m', memory: mem.default ?? TENANT_DEFAULT_MEMORY },
+      max: { cpu: '2', memory: mem.maxPerContainer ?? TENANT_MAX_MEMORY_PER_CONTAINER },
     }] },
   };
 }
@@ -520,6 +536,53 @@ async function createOrIgnore(path: string, body: unknown): Promise<void> {
     if (err instanceof K8sApiError && err.status === 409) return;
     throw err;
   }
+}
+
+// Merge-patch a named resource into its desired state; if it doesn't exist yet,
+// create it. Unlike createOrIgnore (write-once), this UPDATES an existing
+// object — used to push a changed budget onto a project whose baseline objects
+// were already created. `collection` is the list path (…/resourcequotas);
+// `name` is the object's metadata.name.
+async function patchOrCreate(collection: string, name: string, body: unknown): Promise<'patched' | 'created'> {
+  try {
+    await call({
+      method: 'PATCH',
+      path: `${collection}/${encodeURIComponent(name)}`,
+      body,
+      contentType: 'application/merge-patch+json',
+    });
+    return 'patched';
+  } catch (err) {
+    if (err instanceof K8sApiError && err.status === 404) {
+      await call({ method: 'POST', path: collection, body });
+      return 'created';
+    }
+    throw err;
+  }
+}
+
+// Reconcile ONE project's ResourceQuota + LimitRange to the current memory
+// budget — the chart-configured defaults, optionally overridden per field for
+// this project. Because applyNamespaceBaseline creates these write-once, a
+// changed chart ceiling (or an admin's per-project bump) only reaches an
+// existing namespace through this call. Admin-triggered; see routes/admin.ts.
+// Returns null when the k8s client is disabled (local dev). Throws (404)
+// if the namespace doesn't exist — the caller validates the project first.
+export async function reconcileTenantResources(
+  slug: string,
+  mem: TenantMemoryOverrides = {},
+): Promise<{ quota: 'patched' | 'created'; limits: 'patched' | 'created' } | null> {
+  if (!k8sEnabled()) return null;
+  const ns = encodeURIComponent(slug);
+  const quota = await patchOrCreate(
+    `/api/v1/namespaces/${ns}/resourcequotas`, 'cv-tenant-quota',
+    tenantResourceQuotaObject(slug, mem),
+  );
+  const limits = await patchOrCreate(
+    `/api/v1/namespaces/${ns}/limitranges`, 'cv-tenant-limits',
+    tenantLimitRangeObject(slug, mem),
+  );
+  return { quota, limits };
 }
 
 // The PSA + tenant labels every project namespace must carry. Kept here so the

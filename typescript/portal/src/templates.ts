@@ -647,6 +647,7 @@ function dashboardLayout(
       <a href="/admin/users"${activeNav === 'users' ? ' class="active"' : ''}>Users</a>
       <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>Services</a>
       <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
+      <a href="/admin/projects/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Project Resources</a>
     `;
   }
 
@@ -2100,6 +2101,73 @@ export function renderAdminTemplate(
   }
 
   return dashboardLayout('Project Template', body, email, true, 'template');
+}
+
+// ── Project Resources (per-project memory budget) ──────────
+
+export interface TenantMemoryDefaultsView {
+  max: string;
+  maxRequests: string;
+  maxPerContainer: string;
+  default: string;
+  defaultRequest: string;
+}
+
+export interface ProjectResourcesResultView {
+  ok: boolean;
+  slug: string;
+  message: string;
+}
+
+export function renderAdminProjectResources(
+  defaults: TenantMemoryDefaultsView,
+  result: ProjectResourcesResultView | null,
+  email: string,
+  csrf: string = '',
+  form: Record<string, string> = {},
+): string {
+  let body = '';
+
+  if (result) {
+    const color = result.ok ? '#84a25a' : '#d9734a';
+    const bg = result.ok ? 'rgba(132,162,90,0.12)' : 'rgba(217,115,74,0.12)';
+    body += `<div style="margin-bottom:1rem; padding:0.75rem 1rem; border:1px solid ${color}; border-radius:4px; background:${bg};">`
+      + `${result.ok ? '✓' : '✗'} <strong>${escapeHtml(result.slug)}</strong> — ${escapeHtml(result.message)}</div>`;
+  }
+
+  body += `<p>Push a memory budget onto one project's namespace (its
+    <code>ResourceQuota</code> + <code>LimitRange</code>). The platform applies
+    these once at project creation, so a changed platform default — or a
+    per-project bump — only reaches an existing project through here. Leave a
+    field blank to use the current platform default (shown as the placeholder).
+    Values are Kubernetes memory quantities, e.g. <code>512Mi</code>,
+    <code>4Gi</code>.</p>`;
+
+  const field = (name: string, label: string, ph: string, help: string) => `
+      <div class="field">
+        <label>${escapeHtml(label)}</label>
+        <input type="text" name="${name}" value="${escapeHtml(form[name] || '')}"
+               placeholder="${escapeHtml(ph)}" autocomplete="off" spellcheck="false">
+        <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">${help}</div>
+      </div>`;
+
+  body += `
+    <form method="POST" action="/admin/projects/resources" style="max-width:34rem;">
+      ${csrf}
+      <div class="field">
+        <label>Project slug</label>
+        <input type="text" name="slug" value="${escapeHtml(form.slug || '')}" required
+               placeholder="my-project" autocomplete="off" spellcheck="false">
+      </div>
+      ${field('max', 'Per-project max memory (ResourceQuota limits.memory)', defaults.max, 'Total memory across all the project\'s pods.')}
+      ${field('maxRequests', 'Per-project request budget (requests.memory)', defaults.maxRequests, 'Sum of pod memory requests.')}
+      ${field('maxPerContainer', 'Per-container ceiling (LimitRange max)', defaults.maxPerContainer, 'Most any single container may request.')}
+      ${field('default', 'Default container limit (LimitRange default)', defaults.default, 'Applied to a container that declares no memory limit.')}
+      ${field('defaultRequest', 'Default container request (LimitRange defaultRequest)', defaults.defaultRequest, 'Applied to a container that declares no memory request.')}
+      <button type="submit" class="btn">Apply to project</button>
+    </form>`;
+
+  return dashboardLayout('Project Resources', body, email, true, 'resources');
 }
 
 export function renderAdminRegisterForm(email: string, csrf: string = ''): string {

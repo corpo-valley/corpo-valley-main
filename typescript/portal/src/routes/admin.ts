@@ -15,12 +15,19 @@ import {
   renderAdminUsers, renderAdminUserDetail, renderAdminUserCreate,
   renderAdminRecoveryResult, renderAdminApps,
   renderAdminRegisterForm, renderAdminRegisterResult, renderAdminTemplate,
-  renderError,
-  UserRow, AppRow,
+  renderAdminProjectResources, renderError,
+  UserRow, AppRow, TenantMemoryDefaultsView, ProjectResourcesResultView,
 } from '../templates';
 import {
   seedCommunityCenterTemplate, communityCenterTemplateStatus,
 } from '../services/template-seed';
+import { reconcileTenantResources, TenantMemoryOverrides } from '../services/k8s';
+import { getProjectBySlug } from '../services/projects';
+import {
+  isQuantity,
+  TENANT_MAX_MEMORY, TENANT_MAX_MEMORY_REQUESTS, TENANT_MAX_MEMORY_PER_CONTAINER,
+  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
+} from '../services/platform-config';
 
 const router = Router();
 
@@ -430,6 +437,93 @@ router.post('/template/reset', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Admin template reset error:', err?.message);
     res.status(500).send(renderError('Error', 'Template reset failed — see portal logs.'));
+  }
+});
+
+// ── Project Resources (per-project memory budget) ──────────
+//
+// Baseline ResourceQuota/LimitRange are created write-once at project creation,
+// so a changed platform default — or a one-off per-project bump — only reaches
+// an existing project when an admin applies it here. Patch is per-project on
+// request; we never sweep every namespace.
+
+// The five memory fields the form accepts, in object-key → label order.
+const MEMORY_FIELDS = [
+  'max', 'maxRequests', 'maxPerContainer', 'default', 'defaultRequest',
+] as const;
+
+function memoryDefaultsView(): TenantMemoryDefaultsView {
+  return {
+    max: TENANT_MAX_MEMORY,
+    maxRequests: TENANT_MAX_MEMORY_REQUESTS,
+    maxPerContainer: TENANT_MAX_MEMORY_PER_CONTAINER,
+    default: TENANT_DEFAULT_MEMORY,
+    defaultRequest: TENANT_DEFAULT_MEMORY_REQUEST,
+  };
+}
+
+router.get('/projects/resources', (req: Request, res: Response) => {
+  res.send(renderAdminProjectResources(
+    memoryDefaultsView(), null, req.portalSession!.email, csrfHiddenField(req, res),
+  ));
+});
+
+router.post('/projects/resources', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const csrf = csrfHiddenField(req, res);
+  // Keep the admin's raw input so the form re-renders with what they typed.
+  const form: Record<string, string> = {};
+  for (const k of ['slug', ...MEMORY_FIELDS]) {
+    const v = body[k];
+    if (typeof v === 'string') form[k] = v;
+  }
+
+  const fail = (slug: string, message: string, status = 400) =>
+    res.status(status).send(renderAdminProjectResources(
+      memoryDefaultsView(),
+      { ok: false, slug, message } as ProjectResourcesResultView,
+      session.email, csrf, form,
+    ));
+
+  const slug = typeof body.slug === 'string' ? body.slug.trim() : '';
+  if (!slug) { fail('', 'Project slug is required.'); return; }
+
+  // Only patch a real project — and use its canonical slug as the namespace.
+  const project = await getProjectBySlug(slug).catch(() => null);
+  if (!project) { fail(slug, 'No project with that slug.', 404); return; }
+
+  // Build overrides from the supplied fields. Blank → omit (keep the platform
+  // default). Any non-blank value MUST be a valid k8s quantity before it goes
+  // near the apiserver; reject the whole request otherwise so the admin gets a
+  // clear error instead of a half-applied patch.
+  const overrides: TenantMemoryOverrides = {};
+  for (const k of MEMORY_FIELDS) {
+    const raw = body[k];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== 'string') { fail(slug, `Invalid value for "${k}".`); return; }
+    const v = raw.trim();
+    if (v === '') continue;
+    if (!isQuantity(v)) { fail(slug, `"${v}" is not a valid memory quantity for "${k}" (e.g. 512Mi, 4Gi).`); return; }
+    overrides[k] = v;
+  }
+
+  try {
+    const result = await reconcileTenantResources(project.slug, overrides);
+    if (result === null) { fail(project.slug, 'Kubernetes integration is disabled on this deployment.', 503); return; }
+    const applied = Object.keys(overrides).length
+      ? `custom budget (${MEMORY_FIELDS.filter((k) => overrides[k]).map((k) => `${k}=${overrides[k]}`).join(', ')})`
+      : 'current platform defaults';
+    console.log(`[admin] reconcile resources for ${project.slug} by ${session.email}: `
+      + `quota ${result.quota}, limits ${result.limits}; ${applied}`);
+    res.send(renderAdminProjectResources(
+      memoryDefaultsView(),
+      { ok: true, slug: project.slug, message: `Applied ${applied} — ResourceQuota ${result.quota}, LimitRange ${result.limits}.` },
+      session.email, csrf, form,
+    ));
+  } catch (err: any) {
+    console.error('Reconcile project resources error:', err?.message);
+    fail(project.slug, 'Failed to apply — see portal logs.', 500);
   }
 });
 
