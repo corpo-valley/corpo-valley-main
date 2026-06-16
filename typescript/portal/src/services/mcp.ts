@@ -278,7 +278,7 @@ const tools: Record<string, ToolDef> = {
   },
 
   enable_postgres: {
-    description: 'Turn on a per-project Postgres database. The platform commits a StatefulSet + sealed credentials Secret (named `postgres`) to the project repo as cvportal; ArgoCD deploys a one-replica postgres pod in the project namespace within a minute. The platform-generated `database` container reads the connection string from `DATABASE_URL`, projected from the `postgres` Secret via `valueFrom.secretKeyRef`. If you hand-write your own Deployment instead, read `DATABASE_URL` (or the components POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB) from the same `postgres` Secret. Idempotent — calling on an already-enabled project just refreshes the manifest with the same password so existing data keeps working.',
+    description: 'Turn on the per-project Postgres database capability — a convenience shortcut for `set_capabilities({ database: true })`. Provisions a one-replica Postgres StatefulSet + sealed `postgres` Secret AND regenerates k8s/deployment.yaml (every container in the pod gets `DATABASE_URL` via valueFrom.secretKeyRef — so any capability, e.g. `storage` recording a download, can reach Postgres) + the /api Service + Ingress, committed for ArgoCD. If you hand-write your own Deployment instead, read `DATABASE_URL` (or POSTGRES_USER/PASSWORD/DB) from the `postgres` Secret. Idempotent.',
     inputSchema: {
       type: 'object',
       required: ['project_id_or_slug'],
@@ -290,27 +290,19 @@ const tools: Record<string, ToolDef> = {
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
-      const [owner, repo] = p.gitea_repo.split('/');
-      // Atomic claim: concurrent calls don't desync the DB password
-      // from the password that ends up sealed in the repo. See
-      // services/projects.ts:claimOrGetPostgresPassword.
-      const existingPw = decodePostgresPassword(p);
-      const { password } = existingPw
-        ? { password: existingPw }
-        : await claimOrGetPostgresPassword(p.id, generatePostgresPassword());
-      const { secret_name, env_var } = await enablePostgres({ owner, repo, slug: p.slug, password });
+      const { next, postgresEnabledNow } = await applyCapabilities(p, { database: true });
       return {
         ok: true,
         slug: p.slug,
-        secret_name,
-        env_var,
-        usage: `The platform-generated database container already reads ${env_var} from the ${secret_name} Secret via valueFrom.secretKeyRef. If you hand-write your own Deployment, project ${env_var} from the ${secret_name} Secret (valueFrom.secretKeyRef, or envFrom for all keys).`,
+        capabilities: capabilityList(next),
+        postgres: { enabled: postgresEnabledNow },
+        usage: 'Every container in the project pod reads DATABASE_URL from the `postgres` Secret (valueFrom.secretKeyRef). If you hand-write your own Deployment, project DATABASE_URL from that Secret (or envFrom for all keys).',
       };
     },
   },
 
   disable_postgres: {
-    description: 'Remove the per-project Postgres deployment. The manifest + sealed Secret are deleted from the repo (ArgoCD prunes the StatefulSet, Service, and Secret on next sync). The PVC is preserved by default so re-enabling restores the same data; pass `destroy_data: true` to also delete the PVC and clear the stored password (irreversible — drops all data). Idempotent.',
+    description: 'Turn off the per-project database capability — a convenience shortcut for `set_capabilities({ database: false })`. Removes the Postgres StatefulSet + sealed Secret AND regenerates k8s/deployment.yaml (drops the database container) + Service + Ingress (ArgoCD prunes on next sync). The PVC is preserved by default so re-enabling restores the same data; pass `destroy_data: true` to also delete the PVC and clear the stored password (irreversible — drops all data). Idempotent.',
     inputSchema: {
       type: 'object',
       required: ['project_id_or_slug'],
@@ -325,19 +317,17 @@ const tools: Record<string, ToolDef> = {
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
-      const [owner, repo] = p.gitea_repo.split('/');
-      const result = await disablePostgres({ owner, repo });
+      const { next } = await applyCapabilities(p, { database: false });
       let pvcDeleted = false;
       if (args.destroy_data) {
         try { ({ deleted: pvcDeleted } = await destroyPostgresPvc(p.slug)); }
-        catch (e: any) { /* swallow — caller can re-try; see warning below */ console.warn('[mcp/disable_postgres] PVC delete failed:', e?.message); }
+        catch (e: any) { /* swallow — caller can re-try; see note below */ console.warn('[mcp/disable_postgres] PVC delete failed:', e?.message); }
         await clearPostgresPassword(p.id);
       }
       return {
         ok: true,
         slug: p.slug,
-        removed_manifest: result.removed_manifest,
-        removed_secret: result.removed_secret,
+        capabilities: capabilityList(next),
         pvc_deleted: pvcDeleted,
         note: args.destroy_data
           ? 'Data destruction requested. The PVC delete may be queued behind the StatefulSet pod terminating; re-call with the same args if pvc_deleted=false.'
@@ -347,7 +337,7 @@ const tools: Record<string, ToolDef> = {
   },
 
   enable_storage: {
-    description: 'Turn on per-project S3-compatible file storage. The platform commits a Garage StatefulSet + sealed credentials Secret (named `garage`) to the project repo as cvportal; ArgoCD deploys a one-replica, self-bootstrapping Garage pod in the project namespace within a minute (it auto-creates the bucket + access key on first start). The platform-generated `storage` container reads the S3 connection (`S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_FORCE_PATH_STYLE`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) from the `garage` Secret. If you hand-write your own Deployment instead, read those same keys from the `garage` Secret. Idempotent — calling on an already-enabled project just refreshes the manifest with the same credentials so existing objects keep working.',
+    description: 'Turn on the per-project S3-compatible file storage capability — a convenience shortcut for `set_capabilities({ storage: true })`. Provisions a one-replica, self-bootstrapping Garage StatefulSet + sealed `garage` Secret AND regenerates k8s/deployment.yaml (every container in the pod gets the six S3_* keys from the `garage` Secret) + the /files Service + Ingress, committed for ArgoCD. If you hand-write your own Deployment instead, read S3_ENDPOINT/S3_BUCKET/S3_REGION/S3_FORCE_PATH_STYLE/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY from the `garage` Secret (bucket is "app"). Idempotent.',
     inputSchema: {
       type: 'object',
       required: ['project_id_or_slug'],
@@ -359,28 +349,19 @@ const tools: Record<string, ToolDef> = {
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
-      const [owner, repo] = p.gitea_repo.split('/');
-      // Atomic claim: concurrent calls don't desync the DB credentials from
-      // the ones that end up sealed in the repo. See
-      // services/projects.ts:claimOrGetGarageCredentials.
-      const existing = decodeGarageCredentials(p);
-      const { creds } = existing
-        ? { creds: existing }
-        : await claimOrGetGarageCredentials(p.id, generateGarageCredentials());
-      const { secret_name, endpoint, bucket } = await enableGarage({ owner, repo, slug: p.slug, creds });
+      const { next, storageEnabledNow } = await applyCapabilities(p, { storage: true });
       return {
         ok: true,
         slug: p.slug,
-        secret_name,
-        endpoint,
-        bucket,
-        usage: `The platform-generated storage container already reads the S3_* keys from the ${secret_name} Secret. If you hand-write your own Deployment, project S3_ENDPOINT/S3_BUCKET/S3_REGION/S3_FORCE_PATH_STYLE/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY from the ${secret_name} Secret (any S3 client; the bucket is "${bucket}").`,
+        capabilities: capabilityList(next),
+        storage: { enabled: storageEnabledNow },
+        usage: 'Every container in the project pod reads the S3_* keys from the `garage` Secret. If you hand-write your own Deployment, project S3_ENDPOINT/S3_BUCKET/S3_REGION/S3_FORCE_PATH_STYLE/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY from it (any S3 client; the bucket is "app").',
       };
     },
   },
 
   disable_storage: {
-    description: 'Remove the per-project Garage object store. The manifest + sealed Secret are deleted from the repo (ArgoCD prunes the StatefulSet, Service, and Secret on next sync). The PVC is preserved by default so re-enabling restores the same objects; pass `destroy_data: true` to also delete the PVC and clear the stored credentials (irreversible — drops all stored files). Idempotent.',
+    description: 'Turn off the per-project storage capability — a convenience shortcut for `set_capabilities({ storage: false })`. Removes the Garage StatefulSet + sealed Secret AND regenerates k8s/deployment.yaml (drops the storage container) + Service + Ingress (ArgoCD prunes on next sync). The PVC is preserved by default so re-enabling restores the same objects; pass `destroy_data: true` to also delete the PVC and clear the stored credentials (irreversible — drops all stored files). Idempotent.',
     inputSchema: {
       type: 'object',
       required: ['project_id_or_slug'],
@@ -395,8 +376,7 @@ const tools: Record<string, ToolDef> = {
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
-      const [owner, repo] = p.gitea_repo.split('/');
-      const result = await disableGarage({ owner, repo });
+      const { next } = await applyCapabilities(p, { storage: false });
       let pvcDeleted = false;
       if (args.destroy_data) {
         try { ({ deleted: pvcDeleted } = await destroyGaragePvc(p.slug)); }
@@ -406,8 +386,7 @@ const tools: Record<string, ToolDef> = {
       return {
         ok: true,
         slug: p.slug,
-        removed_manifest: result.removed_manifest,
-        removed_secret: result.removed_secret,
+        capabilities: capabilityList(next),
         pvc_deleted: pvcDeleted,
         note: args.destroy_data
           ? 'Data destruction requested. The PVC delete may be queued behind the StatefulSet pod terminating; re-call with the same args if pvc_deleted=false.'
@@ -435,52 +414,9 @@ const tools: Record<string, ToolDef> = {
       const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
       if (!p) throw new ToolError('project not found or not owned by you.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
-      const [owner, repo] = p.gitea_repo.split('/');
-      const current = await detectCapabilities({ owner, repo });
-      const next: Capabilities = {
-        website: true,
-        database: typeof args.database === 'boolean' ? args.database : current.database,
-        storage: typeof args.storage === 'boolean' ? args.storage : current.storage,
-        mcp: typeof args.mcp === 'boolean' ? args.mcp : current.mcp,
-        shared: typeof args.shared === 'boolean' ? args.shared : current.shared,
-      };
-      // Sharing only matters when there's user data; force it off otherwise.
-      if (!next.database && !next.storage && !next.mcp) next.shared = false;
-
-      // Bring Postgres in line with the database capability BEFORE writing the
-      // manifest, so the secret exists before the database container appears.
-      let postgresEnabledNow = current.database;
-      if (next.database && !current.database) {
-        const existingPw = decodePostgresPassword(p);
-        const { password } = existingPw
-          ? { password: existingPw }
-          : await claimOrGetPostgresPassword(p.id, generatePostgresPassword());
-        await enablePostgres({ owner, repo, slug: p.slug, password });
-        postgresEnabledNow = true;
-      } else if (!next.database && current.database) {
-        await disablePostgres({ owner, repo });
-        postgresEnabledNow = false;
-      }
-
-      // Same for Garage and the storage capability — secret before container.
-      let storageEnabledNow = current.storage;
-      if (next.storage && !current.storage) {
-        const existing = decodeGarageCredentials(p);
-        const { creds } = existing
-          ? { creds: existing }
-          : await claimOrGetGarageCredentials(p.id, generateGarageCredentials());
-        await enableGarage({ owner, repo, slug: p.slug, creds });
-        storageEnabledNow = true;
-      } else if (!next.storage && current.storage) {
-        await disableGarage({ owner, repo });
-        storageEnabledNow = false;
-      }
-
-      await composeProjectManifests({ owner, repo, slug: p.slug, caps: next });
-
-      // Bring the /mcp OAuth gateway routing in line with the mcp capability.
-      if (next.mcp && !current.mcp) await applyMcpGateway(p.slug);
-      else if (!next.mcp && current.mcp) await removeMcpGateway(p.slug);
+      const { next, postgresEnabledNow, storageEnabledNow } = await applyCapabilities(p, {
+        database: args.database, storage: args.storage, mcp: args.mcp, shared: args.shared,
+      });
 
       return {
         ok: true,
@@ -1209,6 +1145,69 @@ function toToolProject(p: Project, everyone?: { site: GrantLevel | null; repo: G
     gitea_repo: p.gitea_repo,
     gitea_url: p.gitea_repo ? `${GITEA_PUBLIC_URL}/${p.gitea_repo}` : null,
   };
+}
+
+// The single source of truth for changing a project's capability set. Brings
+// the per-project Postgres/Garage backends in line with the requested caps
+// (secret BEFORE the container that references it), regenerates
+// k8s/deployment.yaml + Services + Ingress, and wires the /mcp gateway. Only
+// the fields supplied in `partial` change; the rest keep their detected state.
+// set_capabilities and the enable_*/disable_* convenience shortcuts all funnel
+// through here so there's exactly one code path (the shortcuts used to skip the
+// manifest regen, leaving the capability half-applied). Data destruction
+// (PVC delete) is NOT done here — the disable_* wrappers add it.
+async function applyCapabilities(
+  p: Project,
+  partial: Partial<Capabilities>,
+): Promise<{ next: Capabilities; postgresEnabledNow: boolean; storageEnabledNow: boolean }> {
+  const [owner, repo] = p.gitea_repo!.split('/');
+  const current = await detectCapabilities({ owner, repo });
+  const next: Capabilities = {
+    website: true,
+    database: typeof partial.database === 'boolean' ? partial.database : current.database,
+    storage: typeof partial.storage === 'boolean' ? partial.storage : current.storage,
+    mcp: typeof partial.mcp === 'boolean' ? partial.mcp : current.mcp,
+    shared: typeof partial.shared === 'boolean' ? partial.shared : current.shared,
+  };
+  // Sharing only matters when there's user data; force it off otherwise.
+  if (!next.database && !next.storage && !next.mcp) next.shared = false;
+
+  // Bring Postgres in line with the database capability BEFORE writing the
+  // manifest, so the secret exists before the database container appears.
+  let postgresEnabledNow = current.database;
+  if (next.database && !current.database) {
+    const existingPw = decodePostgresPassword(p);
+    const { password } = existingPw
+      ? { password: existingPw }
+      : await claimOrGetPostgresPassword(p.id, generatePostgresPassword());
+    await enablePostgres({ owner, repo, slug: p.slug, password });
+    postgresEnabledNow = true;
+  } else if (!next.database && current.database) {
+    await disablePostgres({ owner, repo });
+    postgresEnabledNow = false;
+  }
+
+  // Same for Garage and the storage capability — secret before container.
+  let storageEnabledNow = current.storage;
+  if (next.storage && !current.storage) {
+    const existing = decodeGarageCredentials(p);
+    const { creds } = existing
+      ? { creds: existing }
+      : await claimOrGetGarageCredentials(p.id, generateGarageCredentials());
+    await enableGarage({ owner, repo, slug: p.slug, creds });
+    storageEnabledNow = true;
+  } else if (!next.storage && current.storage) {
+    await disableGarage({ owner, repo });
+    storageEnabledNow = false;
+  }
+
+  await composeProjectManifests({ owner, repo, slug: p.slug, caps: next });
+
+  // Bring the /mcp OAuth gateway routing in line with the mcp capability.
+  if (next.mcp && !current.mcp) await applyMcpGateway(p.slug);
+  else if (!next.mcp && current.mcp) await removeMcpGateway(p.slug);
+
+  return { next, postgresEnabledNow, storageEnabledNow };
 }
 
 // Resolve id-or-slug to a Project the caller owns. Returns null when not

@@ -91,16 +91,19 @@ namespace; reference it via `envFrom` / `valueFrom.secretKeyRef`.
 ## Database
 
 The database capability auto-provisions a one-replica Postgres in your
-namespace and seals its credentials into a Secret named `postgres`. The
-`database` container reads `DATABASE_URL` from it. Add tables in
+namespace and seals its credentials into a Secret named `postgres`. **Every**
+container in the pod gets `DATABASE_URL` from it (not just `database`), so your
+`static-site`, `storage`, or `mcp` code can reach Postgres too — e.g. the
+storage server recording a download into the DB. Add tables in
 `database/server.js`'s `ensureSchema()` (it runs on startup and is idempotent).
 
 ## Storage
 
 The storage capability auto-provisions a one-replica Garage (S3-compatible)
 object store in your namespace and seals its connection into a Secret named
-`garage`. The `storage` container reads the `S3_*` keys from it and serves a
-presigned-URL file API at `/files`. Use any S3 client against `S3_ENDPOINT`
+`garage`. Every container in the pod gets the six `S3_*` keys from it (not just
+`storage`), and the `storage` container serves a file API at `/files`. Use any
+S3 client against `S3_ENDPOINT`
 (`http://garage:3900`, path-style, bucket `app`); objects are keyed under the
 caller's `<userId>/` prefix by default (per-user isolation), or shared when the
 project's "data is shared across users" setting is on. Don't read
