@@ -218,11 +218,38 @@ export function buildDeploymentYaml(opts: ManifestOpts): string {
   // manifest; a container that isn't there yet (newly enabled capability, or a
   // brand-new project) gets undefined → the chart defaults.
   const prior = extractContainerResources(opts.existingDeployment);
+
+  // Cross-capability credentials: EVERY container in the pod gets the creds for
+  // ALL enabled stateful capabilities, not just the one it serves. These
+  // containers are the same project image, in one pod, written by one author,
+  // so per-capability cred siloing blocked legitimate cross-capability app
+  // logic (e.g. the storage server recording a download into the database) for
+  // negligible blast-radius gain. A cred is only projected when its capability
+  // is enabled — so the referenced Secret (postgres / garage) always exists.
+  const sharedCreds: Array<{ name: string; value?: string; secret?: { name: string; key: string } }> = [];
+  if (opts.caps.database) {
+    sharedCreds.push({ name: 'DATABASE_URL', secret: { name: 'postgres', key: 'DATABASE_URL' } });
+  }
+  if (opts.caps.storage) {
+    // S3 connection + credentials from the per-project `garage` Secret
+    // (services/garage.ts seals it); all six keys projected individually.
+    for (const key of ['S3_ENDPOINT', 'S3_REGION', 'S3_BUCKET', 'S3_FORCE_PATH_STYLE', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY']) {
+      sharedCreds.push({ name: key, secret: { name: 'garage', key } });
+    }
+  }
+  // Per-container env = its own PORT + the shared data-mode flag + every
+  // enabled capability's creds.
+  const envFor = (port: number) => [
+    { name: 'PORT', value: String(port) },
+    { name: 'CV_SHARED', value: sharedVal },
+    ...sharedCreds,
+  ];
+
   const containers: string[] = [
     containerBlock({
       name: 'static-site', image: img, command: 'static-site/server.js',
       portName: 'http-site', port: PORTS.website,
-      env: [{ name: 'PORT', value: String(PORTS.website) }],
+      env: envFor(PORTS.website),
       resources: prior.get('static-site'),
     }),
   ];
@@ -230,31 +257,15 @@ export function buildDeploymentYaml(opts: ManifestOpts): string {
     containers.push(containerBlock({
       name: 'database', image: img, command: 'database/server.js',
       portName: 'http-api', port: PORTS.database,
-      env: [
-        { name: 'PORT', value: String(PORTS.database) },
-        { name: 'CV_SHARED', value: sharedVal },
-        { name: 'DATABASE_URL', secret: { name: 'postgres', key: 'DATABASE_URL' } },
-      ],
+      env: envFor(PORTS.database),
       resources: prior.get('database'),
     }));
   }
   if (opts.caps.storage) {
-    // The storage container reads its S3 connection + credentials from the
-    // per-project `garage` Secret (services/garage.ts seals it). All six keys
-    // are projected individually so only what the app needs is in its environ.
     containers.push(containerBlock({
       name: 'storage', image: img, command: 'storage/server.js',
       portName: 'http-files', port: PORTS.storage,
-      env: [
-        { name: 'PORT', value: String(PORTS.storage) },
-        { name: 'CV_SHARED', value: sharedVal },
-        { name: 'S3_ENDPOINT', secret: { name: 'garage', key: 'S3_ENDPOINT' } },
-        { name: 'S3_REGION', secret: { name: 'garage', key: 'S3_REGION' } },
-        { name: 'S3_BUCKET', secret: { name: 'garage', key: 'S3_BUCKET' } },
-        { name: 'S3_FORCE_PATH_STYLE', secret: { name: 'garage', key: 'S3_FORCE_PATH_STYLE' } },
-        { name: 'S3_ACCESS_KEY_ID', secret: { name: 'garage', key: 'S3_ACCESS_KEY_ID' } },
-        { name: 'S3_SECRET_ACCESS_KEY', secret: { name: 'garage', key: 'S3_SECRET_ACCESS_KEY' } },
-      ],
+      env: envFor(PORTS.storage),
       resources: prior.get('storage'),
     }));
   }
@@ -262,10 +273,7 @@ export function buildDeploymentYaml(opts: ManifestOpts): string {
     containers.push(containerBlock({
       name: 'mcp', image: img, command: 'mcp/server.js',
       portName: 'http-mcp', port: PORTS.mcp,
-      env: [
-        { name: 'PORT', value: String(PORTS.mcp) },
-        { name: 'CV_SHARED', value: sharedVal },
-      ],
+      env: envFor(PORTS.mcp),
       resources: prior.get('mcp'),
     }));
   }
