@@ -6,7 +6,7 @@
 // not internal architecture trivia. If you change platform behaviour, edit
 // the relevant topic here so an MCP-connected agent learns about it.
 
-export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'database' | 'storage';
+export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'resources' | 'database' | 'storage';
 
 import {
   PROJECTS_DOMAIN, BASE_DOMAIN, GITEA_PUBLIC_URL, CV_REGISTRY, PORTAL_INTERNAL_URL,
@@ -238,6 +238,34 @@ Common debugging recipe:
 4. If the pod is up but the app is broken, \`kube_logs\` on the pod.
 `,
 
+  resources: `# Resource budgets & limits
+
+Every project namespace gets a **ResourceQuota** + **LimitRange** the platform
+stamps at creation — the ceiling your workloads run within:
+
+- **Memory / CPU** — a per-project total (ResourceQuota) plus a per-container
+  default and ceiling (LimitRange). A container that declares no
+  requests/limits inherits the defaults.
+- **Pods / PersistentVolumeClaims** — a count cap per namespace (the PVC count
+  includes any volumes you add via your own repo).
+- **Storage** — each capability's data volume (Postgres / Garage) is created at
+  a default size, bounded by a per-volume cap, and the namespace has a
+  total-storage quota (the sum of all PVCs).
+
+**Tuning within the budget.** Edit \`resources:\` on any container in
+\`k8s/deployment.yaml\` to set cpu/memory — the platform PRESERVES your edits
+when it regenerates the file on a capability change (only a freshly added
+capability container gets the default). The apiserver enforces the quota +
+LimitRange, so you can't exceed the ceiling.
+
+**Need more than the defaults?** The budgets are operator-owned. A platform
+admin can raise a single project above the defaults (memory, cpu, pods, PVCs,
+total storage) and **grow** its data volumes from the portal's Project
+Resources page — overrides are up-only. Volume growth is admin-mediated: a
+StatefulSet's volumeClaimTemplate is immutable, so editing the size in your
+manifest won't grow a live volume. Ask your operator if you're hitting a wall.
+`,
+
   database: `# Database
 
 Each project can optionally have its own Postgres database — a single
@@ -260,9 +288,11 @@ ArgoCD picks them up within a minute and the kubelet starts the pod.
 **Using it from your app.** The sealed Secret materialises as a regular
 Secret named \`postgres\` in the project namespace with the keys
 \`POSTGRES_USER\`, \`POSTGRES_PASSWORD\`, \`POSTGRES_DB\`, and
-\`DATABASE_URL\`. The platform-generated \`database\` container already wires
-\`DATABASE_URL\` from it via \`valueFrom.secretKeyRef\`. If you hand-write your
-own Deployment, project it the same way:
+\`DATABASE_URL\`. The platform wires \`DATABASE_URL\` into **every** container
+in the pod (not just \`database\`) whenever the database capability is on — so
+your \`static-site\`, \`storage\`, or \`mcp\` code can reach Postgres directly too
+(e.g. the storage server recording a download into the DB). If you hand-write
+your own Deployment, project it the same way:
 
 \`\`\`yaml
 env:
@@ -285,16 +315,19 @@ projects row across cycles). Pass \`destroy_data: true\` to also delete
 the PVC and clear the password; the next enable starts fresh.
 
 **Bounds.** A platform VAP (\`cv-projects-postgres-bounds\`) constrains
-the StatefulSet that lands in the cluster: image must be one of the
-two approved postgres images, replicas==1, storage <= 10 GiB, no
-privileged / hostPath / host* anything. Edits to \`k8s/postgres.yaml\`
+the StatefulSet that lands in the cluster: image must be the
+platform-pinned Postgres image, replicas==1, the data volume must stay
+within the per-volume storage cap (default 10 GiB, operator-configurable),
+no privileged / hostPath / host* anything. Edits to \`k8s/postgres.yaml\`
 that violate these get rejected at admission, so a hand-modified
-manifest can't widen the blast radius.
+manifest can't widen the blast radius. See the \`resources\` topic for the
+per-project budgets.
 `,
   storage: `# Storage (S3-compatible object store)
 
 Each project can optionally have its own **Garage** object store — a single,
-self-bootstrapping \`corpo-valley-garage\` pod with a 5 GiB PVC, deployed into
+self-bootstrapping \`corpo-valley-garage\` pod with a 5 GiB PVC by default
+(operator-configurable, and an admin can grow it later), deployed into
 the project's namespace. Like the database it's one tier, no replicas, no HA,
 and strictly per-project so blast radius == the project namespace. Garage
 speaks the S3 API, so any S3 client (or \`@aws-sdk/client-s3\`) works.
@@ -314,8 +347,9 @@ bucket and imports the access key, then serves S3 on \`garage:3900\`.
 **Using it from your app.** The sealed Secret materialises as a regular
 Secret named \`garage\` in the project namespace with the keys
 \`S3_ENDPOINT\`, \`S3_REGION\`, \`S3_BUCKET\`, \`S3_FORCE_PATH_STYLE\`,
-\`S3_ACCESS_KEY_ID\`, and \`S3_SECRET_ACCESS_KEY\`. The platform-generated
-\`storage\` container already wires those six keys from it via
+\`S3_ACCESS_KEY_ID\`, and \`S3_SECRET_ACCESS_KEY\`. The platform wires those six
+keys into **every** container in the pod (not just \`storage\`) whenever the
+storage capability is on, so any container can use the object store via
 \`valueFrom.secretKeyRef\`. If you hand-write your own Deployment, project
 them the same way and point any S3 client at \`S3_ENDPOINT\`
 (\`http://garage:3900\`, path-style, bucket \`app\`) — same-namespace traffic,
@@ -337,9 +371,13 @@ credentials; the next enable starts fresh.
 
 **Bounds.** A platform VAP (\`cv-projects-garage-bounds\`) constrains the
 StatefulSet that lands in the cluster: image must be the platform-pinned
-Garage image, replicas==1, storage <= 10 GiB, no privileged / hostPath /
-host* anything. Edits to \`k8s/garage.yaml\` that violate these are rejected at
-admission, so a hand-modified manifest can't widen the blast radius.
+Garage image, replicas==1, the data volume must stay within the per-volume
+storage cap (default 10 GiB, operator-configurable), no privileged /
+hostPath / host* anything. Growing the volume is admin-mediated (an operator
+raises it via the portal, up to this cap) — the StatefulSet's
+volumeClaimTemplate is immutable, so a hand edit to \`k8s/garage.yaml\` can't
+grow a live volume; manifests that violate the bounds are rejected at
+admission. See the \`resources\` topic for the budgets.
 `,
   deploy: `# Deploy
 

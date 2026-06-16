@@ -24,7 +24,7 @@ import {
 } from './gitea';
 import { buildSealedSecretYaml } from './seal';
 import { k8sDeleteNamespaced, k8sEnabled } from './k8s';
-import { POSTGRES_STORAGE_CLASS } from './platform-config';
+import { POSTGRES_STORAGE_CLASS, TENANT_DEFAULT_STORAGE, POSTGRES_IMAGE } from './platform-config';
 
 // Workflow file path inside a project repo. Used both by the postgres
 // flow (no direct touch) and by the pin-token backfill which refreshes
@@ -34,8 +34,6 @@ export const PROJECT_BUILD_WORKFLOW_PATH = '.gitea/workflows/build.yaml';
 const POSTGRES_MANIFEST_PATH = 'k8s/postgres.yaml';
 const POSTGRES_SEALED_PATH = 'k8s/secrets/postgres.sealed.yaml';
 const POSTGRES_SECRET_NAME = 'postgres';
-// Approved postgres images. Keep the list short — the VAP pins to the same set.
-export const POSTGRES_IMAGE = 'postgres:16-alpine';
 
 export function generatePostgresPassword(): string {
   // 24 random bytes → 32-char base64url. URL-safe so it round-trips through
@@ -161,7 +159,7 @@ spec:
         accessModes: ["ReadWriteOnce"]
 ${POSTGRES_STORAGE_CLASS !== undefined ? `        storageClassName: ${POSTGRES_STORAGE_CLASS}\n` : ''}        resources:
           requests:
-            storage: 5Gi
+            storage: ${TENANT_DEFAULT_STORAGE}
 `;
 }
 

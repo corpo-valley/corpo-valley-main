@@ -10,7 +10,15 @@
 // e.g. local dev outside the cluster.
 import * as https from 'https';
 import * as fs from 'fs';
-import { KRATOS_NAMESPACE, PROJECTS_DOMAIN } from './platform-config';
+import {
+  KRATOS_NAMESPACE, PROJECTS_DOMAIN,
+  TENANT_MAX_MEMORY, TENANT_MAX_MEMORY_REQUESTS, TENANT_MAX_MEMORY_PER_CONTAINER,
+  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
+  TENANT_MAX_CPU, TENANT_MAX_CPU_REQUESTS, TENANT_MAX_CPU_PER_CONTAINER,
+  TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST,
+  TENANT_MAX_STORAGE, TENANT_MAX_PODS, TENANT_MAX_PVCS,
+  quantityToNumber, isQuantity,
+} from './platform-config';
 
 const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
 const TOKEN_FILE = `${SA_DIR}/token`;
@@ -475,30 +483,90 @@ function tenantEgressPolicyObject(slug: string) {
   };
 }
 
-function tenantResourceQuotaObject(slug: string) {
+// Per-project resource overrides an admin may pass to reconcileTenantResources
+// to raise ONE project above the chart defaults (overrides are up-only; the
+// route enforces that). Every field is optional; an omitted field falls back to
+// the chart-configured value. Callers MUST have validated each supplied value
+// (isQuantity / isCount, platform-config) first — these flow into a k8s API
+// object, so a bad value would be rejected by the apiserver. The memory field
+// names are kept short (`max`, `default`, …) for back-compat; cpu/storage/count
+// fields are prefixed.
+export interface TenantResourceOverrides {
+  // memory (ResourceQuota + LimitRange)
+  max?: string;
+  maxRequests?: string;
+  maxPerContainer?: string;
+  default?: string;
+  defaultRequest?: string;
+  // cpu (ResourceQuota + LimitRange)
+  cpuMax?: string;
+  cpuMaxRequests?: string;
+  cpuMaxPerContainer?: string;
+  cpuDefault?: string;
+  cpuDefaultRequest?: string;
+  // ResourceQuota requests.storage (total of all PVCs) + object counts
+  maxStorage?: string;
+  maxPods?: string;
+  maxPvcs?: string;
+}
+
+// Resolve the desired value of a field: an admin override wins; otherwise keep
+// the project's CURRENT live value; otherwise the chart default. So a field the
+// admin left blank stays UNCHANGED rather than being reset to the chart default
+// (which would clobber an earlier per-project bump). `cur` is the live object's
+// value, read by reconcileTenantResources; empty on the write-once create path.
+function tenantResourceQuotaObject(
+  slug: string, o: TenantResourceOverrides = {}, curHard: Record<string, string> = {},
+) {
+  const pick = (ov: string | undefined, key: string, def: string) => ov ?? curHard[key] ?? def;
   return {
     apiVersion: 'v1', kind: 'ResourceQuota',
     metadata: { name: 'cv-tenant-quota', namespace: slug,
       labels: { 'corpo-valley.com/managed': 'baseline' } },
+    // Each field: operator-tunable via the chart (tenant.* → CV_*), per-project
+    // raisable by an admin, and preserved-as-is when neither is supplied.
     spec: { hard: {
-      'requests.cpu': '2', 'limits.cpu': '4',
-      'requests.memory': '2Gi', 'limits.memory': '4Gi',
-      'pods': '12', 'persistentvolumeclaims': '3',
+      'requests.cpu': pick(o.cpuMaxRequests, 'requests.cpu', TENANT_MAX_CPU_REQUESTS),
+      'limits.cpu': pick(o.cpuMax, 'limits.cpu', TENANT_MAX_CPU),
+      'requests.memory': pick(o.maxRequests, 'requests.memory', TENANT_MAX_MEMORY_REQUESTS),
+      'limits.memory': pick(o.max, 'limits.memory', TENANT_MAX_MEMORY),
+      'requests.storage': pick(o.maxStorage, 'requests.storage', TENANT_MAX_STORAGE),
+      'pods': pick(o.maxPods, 'pods', TENANT_MAX_PODS),
+      'persistentvolumeclaims': pick(o.maxPvcs, 'persistentvolumeclaims', TENANT_MAX_PVCS),
+      // Deliberate hardening — always RE-ASSERTED (never preserved from live, so
+      // a tampered quota can't keep a nonzero LB/NodePort allowance).
       'services.loadbalancers': '0', 'services.nodeports': '0',
     } },
   };
 }
 
-function tenantLimitRangeObject(slug: string) {
+function tenantLimitRangeObject(
+  slug: string, o: TenantResourceOverrides = {}, curLimit: any = undefined,
+) {
+  // Same precedence as the quota: override → current live value → chart default.
+  // The LimitRange `limits` is an array (JSON merge-patch replaces it wholesale),
+  // so we must emit the COMPLETE entry — hence reading each current sub-field.
+  const curReq = curLimit?.defaultRequest || {};
+  const curDef = curLimit?.default || {};
+  const curMax = curLimit?.max || {};
   return {
     apiVersion: 'v1', kind: 'LimitRange',
     metadata: { name: 'cv-tenant-limits', namespace: slug,
       labels: { 'corpo-valley.com/managed': 'baseline' } },
     spec: { limits: [{
       type: 'Container',
-      defaultRequest: { cpu: '50m', memory: '64Mi' },
-      default: { cpu: '500m', memory: '256Mi' },
-      max: { cpu: '2', memory: '2Gi' },
+      defaultRequest: {
+        cpu: o.cpuDefaultRequest ?? curReq.cpu ?? TENANT_DEFAULT_CPU_REQUEST,
+        memory: o.defaultRequest ?? curReq.memory ?? TENANT_DEFAULT_MEMORY_REQUEST,
+      },
+      default: {
+        cpu: o.cpuDefault ?? curDef.cpu ?? TENANT_DEFAULT_CPU,
+        memory: o.default ?? curDef.memory ?? TENANT_DEFAULT_MEMORY,
+      },
+      max: {
+        cpu: o.cpuMaxPerContainer ?? curMax.cpu ?? TENANT_MAX_CPU_PER_CONTAINER,
+        memory: o.maxPerContainer ?? curMax.memory ?? TENANT_MAX_MEMORY_PER_CONTAINER,
+      },
     }] },
   };
 }
@@ -512,6 +580,198 @@ async function createOrIgnore(path: string, body: unknown): Promise<void> {
     if (err instanceof K8sApiError && err.status === 409) return;
     throw err;
   }
+}
+
+// Merge-patch a named resource into its desired state; if it doesn't exist yet,
+// create it. Unlike createOrIgnore (write-once), this UPDATES an existing
+// object — used to push a changed budget onto a project whose baseline objects
+// were already created. `collection` is the list path (…/resourcequotas);
+// `name` is the object's metadata.name.
+async function patchOrCreate(collection: string, name: string, body: unknown): Promise<'patched' | 'created'> {
+  try {
+    await call({
+      method: 'PATCH',
+      path: `${collection}/${encodeURIComponent(name)}`,
+      body,
+      contentType: 'application/merge-patch+json',
+    });
+    return 'patched';
+  } catch (err) {
+    if (err instanceof K8sApiError && err.status === 404) {
+      await call({ method: 'POST', path: collection, body });
+      return 'created';
+    }
+    throw err;
+  }
+}
+
+// GET a named object, returning null on 404 (rather than throwing) so callers
+// can branch on existence. Other errors propagate.
+async function getNamespacedOrNull(path: string): Promise<any | null> {
+  try {
+    return await call<any>({ method: 'GET', path });
+  } catch (err) {
+    if (err instanceof K8sApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// Reconcile ONE project's ResourceQuota + LimitRange. We GET the live objects
+// FIRST and resolve each field as override → current live value → chart default,
+// so an admin's partial edit changes ONLY the fields they supplied and leaves
+// the rest untouched (a blank form field = unchanged). Because
+// applyNamespaceBaseline creates these write-once, an admin's per-project bump
+// only reaches an existing namespace through this call. Admin-triggered; see
+// routes/admin.ts. Returns null when the k8s client is disabled (local dev).
+// Throws (404) if the namespace doesn't exist — the caller validates first.
+export async function reconcileTenantResources(
+  slug: string,
+  o: TenantResourceOverrides = {},
+): Promise<{ quota: 'patched' | 'created'; limits: 'patched' | 'created' } | null> {
+  if (!k8sEnabled()) return null;
+  const ns = encodeURIComponent(slug);
+  const quotaColl = `/api/v1/namespaces/${ns}/resourcequotas`;
+  const limitsColl = `/api/v1/namespaces/${ns}/limitranges`;
+  // Read current state first so unspecified fields are preserved, not reset.
+  const curQuota = await getNamespacedOrNull(`${quotaColl}/cv-tenant-quota`);
+  const curLimits = await getNamespacedOrNull(`${limitsColl}/cv-tenant-limits`);
+  const quota = await patchOrCreate(
+    quotaColl, 'cv-tenant-quota',
+    tenantResourceQuotaObject(slug, o, curQuota?.spec?.hard),
+  );
+  const limits = await patchOrCreate(
+    limitsColl, 'cv-tenant-limits',
+    tenantLimitRangeObject(slug, o, curLimits?.spec?.limits?.[0]),
+  );
+  return { quota, limits };
+}
+
+// The project data volumes the platform manages, and the StatefulSet that owns
+// each. PVC name follows the volumeClaimTemplate convention `<vct>-<sts>-<ord>`;
+// both use vct `data`, single replica → ordinal 0. (postgres.ts / garage.ts.)
+const MANAGED_PVCS = [
+  { pvc: 'data-postgres-0', sts: 'postgres', capability: 'database' },
+  { pvc: 'data-garage-0', sts: 'garage', capability: 'storage' },
+] as const;
+
+// Is this StorageClass online-expandable? A PVC can only be grown when its class
+// has `allowVolumeExpansion: true`; otherwise k8s rejects the size patch. An
+// absent class name (the cluster default, which the provisioner stamps onto the
+// PVC anyway) or any read error → treat as not expandable, so the caller falls
+// back to the manual-migration help page rather than attempting a doomed patch.
+async function storageClassAllowsExpansion(name: string | undefined): Promise<boolean> {
+  if (!name) return false;
+  try {
+    const sc = await call<any>({
+      method: 'GET',
+      path: `/apis/storage.k8s.io/v1/storageclasses/${encodeURIComponent(name)}`,
+    });
+    return sc?.allowVolumeExpansion === true;
+  } catch {
+    return false;
+  }
+}
+
+// kubectl-rollout-restart equivalent: stamp a pod-template annotation so the
+// StatefulSet controller recreates the pod, letting the kubelet finish an
+// online filesystem resize that came back `FileSystemResizePending`.
+async function restartStatefulSet(slug: string, name: string): Promise<void> {
+  await call({
+    method: 'PATCH',
+    path: `/apis/apps/v1/namespaces/${encodeURIComponent(slug)}/statefulsets/${encodeURIComponent(name)}`,
+    contentType: 'application/strategic-merge-patch+json',
+    body: { spec: { template: { metadata: { annotations: {
+      'corpo-valley.com/restartedAt': new Date().toISOString(),
+    } } } } },
+  });
+}
+
+export interface StorageReconcileEntry {
+  pvc: string;
+  capability: string;
+  from?: string;
+  to: string;
+  // expanded: PVC grown (restarted true if a pod bounce was needed to finish).
+  // unsupported: StorageClass can't expand — admin must migrate (help page).
+  // noop: requested size ≤ current. absent: capability not enabled here.
+  // error: the patch itself failed (e.g. quota too low) — see `note`.
+  result: 'expanded' | 'unsupported' | 'noop' | 'absent' | 'error';
+  restarted?: boolean;
+  note?: string;
+}
+
+// Grow ONE project's managed data volumes (Postgres/Garage PVCs) to `size`,
+// up-only. Raise the ResourceQuota `requests.storage` ceiling FIRST (caller
+// passes it via reconcileTenantResources) or the apiserver rejects the PVC
+// patch. Each PVC is handled independently and reported; a class that can't
+// expand yields `unsupported` (→ help page) rather than failing the request.
+// Returns null when the k8s client is disabled (local dev).
+export async function reconcileTenantStorage(
+  slug: string,
+  size: string,
+): Promise<StorageReconcileEntry[] | null> {
+  if (!k8sEnabled()) return null;
+  // Defensive: callers (routes/admin.ts) validate `size`, but this is exported —
+  // never let an unvalidated value reach a PVC patch (NaN comparisons would slip
+  // past the up-only/noop checks below).
+  if (!isQuantity(size)) throw new Error(`reconcileTenantStorage: invalid size ${JSON.stringify(size)}`);
+  const ns = encodeURIComponent(slug);
+  const want = quantityToNumber(size);
+  const out: StorageReconcileEntry[] = [];
+
+  for (const { pvc, capability } of MANAGED_PVCS) {
+    const collection = `/api/v1/namespaces/${ns}/persistentvolumeclaims`;
+    let current: any;
+    try {
+      current = await call<any>({ method: 'GET', path: `${collection}/${encodeURIComponent(pvc)}` });
+    } catch (err) {
+      if (err instanceof K8sApiError && err.status === 404) {
+        out.push({ pvc, capability, to: size, result: 'absent' });
+        continue;
+      }
+      throw err;
+    }
+
+    const from: string | undefined = current?.spec?.resources?.requests?.storage;
+    if (from !== undefined && quantityToNumber(from) >= want) {
+      out.push({ pvc, capability, from, to: size, result: 'noop' });
+      continue;
+    }
+
+    if (!(await storageClassAllowsExpansion(current?.spec?.storageClassName))) {
+      out.push({ pvc, capability, from, to: size, result: 'unsupported' });
+      continue;
+    }
+
+    try {
+      await call({
+        method: 'PATCH',
+        path: `${collection}/${encodeURIComponent(pvc)}`,
+        contentType: 'application/merge-patch+json',
+        body: { spec: { resources: { requests: { storage: size } } } },
+      });
+    } catch (err: any) {
+      out.push({ pvc, capability, from, to: size, result: 'error', note: err?.message });
+      continue;
+    }
+
+    // Many CSI drivers expand the volume online but need the pod recreated to
+    // grow the filesystem; surfaced as a FileSystemResizePending condition.
+    let restarted = false;
+    try {
+      const after = await call<any>({ method: 'GET', path: `${collection}/${encodeURIComponent(pvc)}` });
+      const pending = (after?.status?.conditions || []).some(
+        (c: any) => c?.type === 'FileSystemResizePending',
+      );
+      if (pending) {
+        await restartStatefulSet(slug, MANAGED_PVCS.find((m) => m.pvc === pvc)!.sts);
+        restarted = true;
+      }
+    } catch { /* best-effort: the resize still completes once the pod cycles */ }
+
+    out.push({ pvc, capability, from, to: size, result: 'expanded', restarted });
+  }
+  return out;
 }
 
 // The PSA + tenant labels every project namespace must carry. Kept here so the

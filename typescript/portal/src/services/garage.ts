@@ -33,7 +33,7 @@ import {
 } from './gitea';
 import { buildSealedSecretYaml } from './seal';
 import { k8sDeleteNamespaced, k8sEnabled } from './k8s';
-import { GARAGE_IMAGE, GARAGE_STORAGE_CLASS } from './platform-config';
+import { GARAGE_IMAGE, GARAGE_STORAGE_CLASS, TENANT_DEFAULT_STORAGE } from './platform-config';
 
 const GARAGE_MANIFEST_PATH = 'k8s/garage.yaml';
 const GARAGE_SEALED_PATH = 'k8s/secrets/garage.sealed.yaml';
@@ -184,7 +184,7 @@ spec:
         accessModes: ["ReadWriteOnce"]
 ${GARAGE_STORAGE_CLASS !== undefined ? `        storageClassName: ${GARAGE_STORAGE_CLASS}\n` : ''}        resources:
           requests:
-            storage: 5Gi
+            storage: ${TENANT_DEFAULT_STORAGE}
 `;
 }
 

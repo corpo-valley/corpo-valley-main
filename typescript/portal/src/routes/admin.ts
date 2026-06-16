@@ -15,12 +15,26 @@ import {
   renderAdminUsers, renderAdminUserDetail, renderAdminUserCreate,
   renderAdminRecoveryResult, renderAdminApps,
   renderAdminRegisterForm, renderAdminRegisterResult, renderAdminTemplate,
-  renderError,
-  UserRow, AppRow,
+  renderAdminProjectResources, renderStorageHelp, renderError,
+  UserRow, AppRow, ResourceGroupView, ProjectResourcesResultView,
 } from '../templates';
 import {
   seedCommunityCenterTemplate, communityCenterTemplateStatus,
 } from '../services/template-seed';
+import {
+  reconcileTenantResources, reconcileTenantStorage,
+  TenantResourceOverrides, StorageReconcileEntry,
+} from '../services/k8s';
+import { getProjectBySlug } from '../services/projects';
+import {
+  isQuantity, isCount, quantityToNumber,
+  TENANT_MAX_MEMORY, TENANT_MAX_MEMORY_REQUESTS, TENANT_MAX_MEMORY_PER_CONTAINER,
+  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
+  TENANT_MAX_CPU, TENANT_MAX_CPU_REQUESTS, TENANT_MAX_CPU_PER_CONTAINER,
+  TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST,
+  TENANT_MAX_STORAGE, TENANT_DEFAULT_STORAGE, TENANT_MAX_PVC_SIZE,
+  TENANT_MAX_PODS, TENANT_MAX_PVCS,
+} from '../services/platform-config';
 
 const router = Router();
 
@@ -431,6 +445,198 @@ router.post('/template/reset', async (req: Request, res: Response) => {
     console.error('Admin template reset error:', err?.message);
     res.status(500).send(renderError('Error', 'Template reset failed — see portal logs.'));
   }
+});
+
+// ── Project Resources (per-project resource budget) ────────
+//
+// Baseline ResourceQuota/LimitRange are created write-once at project creation,
+// so a changed platform default — or a one-off per-project bump — only reaches
+// an existing project when an admin applies it here. Patch is per-project on
+// request; we never sweep every namespace. Overrides are UP-ONLY: an admin may
+// raise a project above the platform default but not restrict it below.
+
+type FieldKind = 'quantity' | 'count';
+interface ResourceFieldSpec {
+  key: keyof TenantResourceOverrides;
+  group: string;
+  label: string;
+  def: string;   // chart default — shown as placeholder and the up-only floor
+  kind: FieldKind;
+  help: string;
+}
+
+// Every ResourceQuota/LimitRange field, in display order. PVC *size* is handled
+// separately (it grows volumes, not the quota) — see PVC_SIZE below.
+const RESOURCE_FIELDS: ResourceFieldSpec[] = [
+  { key: 'max', group: 'Memory', label: 'Max memory (ResourceQuota limits.memory)', def: TENANT_MAX_MEMORY, kind: 'quantity', help: 'Total memory across all the project\'s pods.' },
+  { key: 'maxRequests', group: 'Memory', label: 'Memory request budget (requests.memory)', def: TENANT_MAX_MEMORY_REQUESTS, kind: 'quantity', help: 'Sum of pod memory requests.' },
+  { key: 'maxPerContainer', group: 'Memory', label: 'Per-container memory ceiling (LimitRange max)', def: TENANT_MAX_MEMORY_PER_CONTAINER, kind: 'quantity', help: 'Most any single container may request.' },
+  { key: 'default', group: 'Memory', label: 'Default container memory limit', def: TENANT_DEFAULT_MEMORY, kind: 'quantity', help: 'Applied to a container that declares no memory limit.' },
+  { key: 'defaultRequest', group: 'Memory', label: 'Default container memory request', def: TENANT_DEFAULT_MEMORY_REQUEST, kind: 'quantity', help: 'Applied to a container that declares no memory request.' },
+  { key: 'cpuMax', group: 'CPU', label: 'Max CPU (ResourceQuota limits.cpu)', def: TENANT_MAX_CPU, kind: 'quantity', help: 'Total CPU across all pods, in cores (4) or millicores (500m).' },
+  { key: 'cpuMaxRequests', group: 'CPU', label: 'CPU request budget (requests.cpu)', def: TENANT_MAX_CPU_REQUESTS, kind: 'quantity', help: 'Sum of pod CPU requests.' },
+  { key: 'cpuMaxPerContainer', group: 'CPU', label: 'Per-container CPU ceiling (LimitRange max)', def: TENANT_MAX_CPU_PER_CONTAINER, kind: 'quantity', help: 'Most any single container may request.' },
+  { key: 'cpuDefault', group: 'CPU', label: 'Default container CPU limit', def: TENANT_DEFAULT_CPU, kind: 'quantity', help: 'Applied to a container that declares no CPU limit.' },
+  { key: 'cpuDefaultRequest', group: 'CPU', label: 'Default container CPU request', def: TENANT_DEFAULT_CPU_REQUEST, kind: 'quantity', help: 'Applied to a container that declares no CPU request.' },
+  { key: 'maxPods', group: 'Counts & storage', label: 'Max pods', def: TENANT_MAX_PODS, kind: 'count', help: 'Integer. Caps total pods in the namespace.' },
+  { key: 'maxPvcs', group: 'Counts & storage', label: 'Max PersistentVolumeClaims', def: TENANT_MAX_PVCS, kind: 'count', help: 'Integer. Caps total PVCs, including any added via the project repo.' },
+  { key: 'maxStorage', group: 'Counts & storage', label: 'Max total storage (requests.storage)', def: TENANT_MAX_STORAGE, kind: 'quantity', help: 'Sum of every PVC in the namespace. Raise this before growing a volume.' },
+];
+
+// The grow-volumes control. Distinct key (not a TenantResourceOverrides field)
+// because it patches the PVCs, not the quota.
+const PVC_SIZE = {
+  key: 'pvcSize', group: 'Counts & storage',
+  label: 'Grow data volumes to', def: TENANT_DEFAULT_STORAGE,
+  help: 'Resize the Postgres/Garage PVCs (grow-only; needs an expandable StorageClass — otherwise see the storage help page).',
+};
+
+const ALL_FORM_KEYS = ['slug', ...RESOURCE_FIELDS.map((f) => f.key), PVC_SIZE.key];
+
+// Group the field specs into the view the template renders, threading the
+// admin's raw input back into each input's value.
+function resourceGroups(form: Record<string, string>): ResourceGroupView[] {
+  const order = ['Memory', 'CPU', 'Counts & storage'];
+  const specs = [...RESOURCE_FIELDS, PVC_SIZE];
+  return order.map((title) => ({
+    title,
+    fields: specs.filter((f) => f.group === title).map((f) => ({
+      key: f.key, label: f.label, placeholder: f.def, help: f.help,
+      value: form[f.key] || '',
+    })),
+  }));
+}
+
+// Render a one-line summary of what a storage grow did, per volume.
+function storageDetail(e: StorageReconcileEntry): string {
+  switch (e.result) {
+    case 'expanded': return `${e.capability} volume grown ${e.from ?? '?'} → ${e.to}`
+      + (e.restarted ? ' (pod restarted to finish the filesystem resize)' : '');
+    case 'noop': return `${e.capability} volume already ≥ ${e.to}, unchanged`;
+    case 'absent': return `${e.capability} not enabled on this project, skipped`;
+    case 'unsupported': return `${e.capability} volume: StorageClass does not support expansion — manual migration required`;
+    case 'error': return `${e.capability} volume: could not grow (${e.note || 'see portal logs'})`;
+  }
+}
+
+router.get('/projects/resources', (req: Request, res: Response) => {
+  res.send(renderAdminProjectResources(
+    resourceGroups({}), null, req.portalSession!.email, csrfHiddenField(req, res),
+  ));
+});
+
+router.post('/projects/resources', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const csrf = csrfHiddenField(req, res);
+  // Keep the admin's raw input so the form re-renders with what they typed.
+  const form: Record<string, string> = {};
+  for (const k of ALL_FORM_KEYS) {
+    const v = body[k];
+    if (typeof v === 'string') form[k] = v;
+  }
+
+  const fail = (slug: string, message: string, status = 400) =>
+    res.status(status).send(renderAdminProjectResources(
+      resourceGroups(form),
+      { ok: false, slug, message } as ProjectResourcesResultView,
+      session.email, csrf, form.slug || '',
+    ));
+
+  const slug = typeof body.slug === 'string' ? body.slug.trim() : '';
+  if (!slug) { fail('', 'Project slug is required.'); return; }
+
+  // Only patch a real project — and use its canonical slug as the namespace.
+  const project = await getProjectBySlug(slug).catch(() => null);
+  if (!project) { fail(slug, 'No project with that slug.', 404); return; }
+
+  // Build overrides from the supplied fields. Blank → omit (keep the platform
+  // default). Each value must (a) be a valid quantity/count and (b) be ≥ the
+  // platform default — overrides are up-only. Reject the whole request on any
+  // bad field so the admin gets a clear error, not a half-applied patch.
+  const overrides: TenantResourceOverrides = {};
+  for (const f of RESOURCE_FIELDS) {
+    const raw = body[f.key];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== 'string') { fail(slug, `Invalid value for "${f.label}".`); return; }
+    const v = raw.trim();
+    if (v === '') continue;
+    const valid = f.kind === 'count' ? isCount(v) : isQuantity(v);
+    if (!valid) {
+      fail(slug, f.kind === 'count'
+        ? `"${v}" is not a valid integer for "${f.label}".`
+        : `"${v}" is not a valid quantity for "${f.label}" (e.g. 512Mi, 2, 500m).`);
+      return;
+    }
+    if (quantityToNumber(v) < quantityToNumber(f.def)) {
+      fail(slug, `"${v}" is below the platform default of ${f.def} for "${f.label}" — overrides are up-only.`);
+      return;
+    }
+    overrides[f.key] = v;
+  }
+
+  // PVC grow target (optional). Bounded below by the chart default (grow-only)
+  // and above by the per-volume admission cap — exceeding it would be denied by
+  // the cv-projects-*-bounds VAP, so reject up front instead of half-applying.
+  let pvcSize: string | undefined;
+  const rawSize = typeof body[PVC_SIZE.key] === 'string' ? (body[PVC_SIZE.key] as string).trim() : '';
+  if (rawSize !== '') {
+    if (!isQuantity(rawSize)) { fail(slug, `"${rawSize}" is not a valid storage quantity (e.g. 10Gi).`); return; }
+    if (quantityToNumber(rawSize) < quantityToNumber(PVC_SIZE.def)) {
+      fail(slug, `"${rawSize}" is below the platform default of ${PVC_SIZE.def} — storage is grow-only.`); return;
+    }
+    if (quantityToNumber(rawSize) > quantityToNumber(TENANT_MAX_PVC_SIZE)) {
+      fail(slug, `"${rawSize}" exceeds the per-volume cap of ${TENANT_MAX_PVC_SIZE} (admission would reject it) — raise tenant.storage.maxPerVolume in the chart.`); return;
+    }
+    pvcSize = rawSize;
+  }
+
+  try {
+    // Quota/LimitRange first — so a raised requests.storage ceiling is in place
+    // before we try to grow a volume into it.
+    const result = await reconcileTenantResources(project.slug, overrides);
+    if (result === null) { fail(project.slug, 'Kubernetes integration is disabled on this deployment.', 503); return; }
+
+    const details: string[] = [];
+    let helpLink = false;
+    if (pvcSize) {
+      const entries = (await reconcileTenantStorage(project.slug, pvcSize)) || [];
+      for (const e of entries) {
+        details.push(storageDetail(e));
+        if (e.result === 'unsupported') helpLink = true;
+      }
+    }
+
+    const setFields = RESOURCE_FIELDS.filter((f) => overrides[f.key]);
+    const applied = setFields.length || pvcSize
+      ? `custom budget (${[
+          ...setFields.map((f) => `${f.key}=${overrides[f.key]}`),
+          ...(pvcSize ? [`pvcSize=${pvcSize}`] : []),
+        ].join(', ')})`
+      : 'current platform defaults';
+    console.log(`[admin] reconcile resources for ${project.slug} by ${session.email}: `
+      + `quota ${result.quota}, limits ${result.limits}; ${applied}`
+      + (details.length ? `; storage: ${details.join('; ')}` : ''));
+
+    res.send(renderAdminProjectResources(
+      resourceGroups(form),
+      {
+        ok: true, slug: project.slug,
+        message: `Applied ${applied} — ResourceQuota ${result.quota}, LimitRange ${result.limits}.`,
+        details, helpLink,
+      },
+      session.email, csrf, project.slug,
+    ));
+  } catch (err: any) {
+    console.error('Reconcile project resources error:', err?.message);
+    fail(project.slug, 'Failed to apply — see portal logs.', 500);
+  }
+});
+
+// Help page linked from the resource form when a volume's StorageClass can't be
+// expanded online — describes the manual data-migration path.
+router.get('/help/storage', (req: Request, res: Response) => {
+  res.send(renderStorageHelp(req.portalSession!.email));
 });
 
 export default router;

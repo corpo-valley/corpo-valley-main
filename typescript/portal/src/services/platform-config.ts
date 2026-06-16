@@ -95,6 +95,146 @@ export const GARAGE_STORAGE_CLASS: string | undefined = POSTGRES_STORAGE_CLASS;
 // capability (built from corpo-valley-main containers/garage). MUST match the
 // image the chart's cv-projects-garage-bounds VAP pins, or the generated
 // StatefulSet is rejected at admission. The chart injects this from
-// `blob.garageImage`; the default reproduces the pinned upstream version.
+// `tenant.capabilities.garage.image`; the default reproduces the pinned
+// upstream version.
 export const GARAGE_IMAGE =
   process.env.CV_GARAGE_IMAGE || 'ghcr.io/corpo-valley/corpo-valley-garage:v1.0.1';
+
+// Pinned image for the per-project Postgres "database" capability. The chart
+// injects it from tenant.capabilities.postgres.image — the SAME value that
+// pins the cv-projects-postgres-bounds VAP, so the generated StatefulSet and
+// the admission gate can't drift. Sibling of GARAGE_IMAGE above.
+export const POSTGRES_IMAGE =
+  process.env.CV_POSTGRES_IMAGE || 'postgres:16-alpine';
+
+// A Kubernetes resource "quantity": digits with an optional decimal/exponent
+// and one of the canonical unit suffixes (e.g. 64Mi, 2Gi, 250m, 2). Anchored,
+// and length-capped to keep a pathological input from reaching the regex.
+// Used to validate BOTH operator-supplied env values below AND the untrusted
+// resource values the manifest generator reads back from a project's
+// hand-editable k8s/deployment.yaml — only a string that passes this is ever
+// interpolated into generated YAML or a k8s API object.
+// Mantissa, then an OPTIONAL tail that is EITHER a decimal exponent (e/E…) OR a
+// unit suffix — never both, and no leading sign. This matches what the k8s
+// apiserver actually accepts (a quantity is `<number><suffix>` where the
+// exponent IS a suffix form), so a value we accept here won't be rejected at
+// admission, and `quantityToNumber` parses exactly the same grammar.
+const QUANTITY_RE =
+  /^(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+|m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/;
+
+export function isQuantity(s: string | undefined | null): s is string {
+  return typeof s === 'string' && s.length > 0 && s.length <= 32 && QUANTITY_RE.test(s);
+}
+
+// Read a memory/CPU quantity from the env, falling back (with no throw) to the
+// baked default if the operator left it unset or supplied a non-quantity — a
+// bad chart value must not produce a broken ResourceQuota/LimitRange or a
+// deployment.yaml the apiserver rejects.
+function quantityEnv(name: string, fallback: string): string {
+  const v = process.env[name];
+  return isQuantity(v) ? v : fallback;
+}
+
+// ── Per-project memory budget (operator-owned ceilings) ─────────────────────
+//
+// The chart injects these; the portal stamps them onto every tenant namespace
+// as a ResourceQuota (per-project totals) + LimitRange (per-container bounds
+// and the defaults applied to containers that declare nothing). Project owners
+// tune their pods' `resources:` within these ceilings and the apiserver
+// enforces them — see k8s.ts (tenantResourceQuotaObject / tenantLimitRangeObject)
+// and manifests.ts (the default stamped into a newly added capability). The
+// defaults reproduce the original corpo-valley.com deployment.
+
+// ResourceQuota limits.memory — the headline per-project max memory usage.
+export const TENANT_MAX_MEMORY = quantityEnv('CV_MAX_MEMORY', '4Gi');
+// ResourceQuota requests.memory — the per-project scheduled floor.
+export const TENANT_MAX_MEMORY_REQUESTS = quantityEnv('CV_MAX_MEMORY_REQUESTS', '2Gi');
+// LimitRange max.memory — ceiling any single container may request.
+export const TENANT_MAX_MEMORY_PER_CONTAINER = quantityEnv('CV_MAX_MEMORY_PER_CONTAINER', '2Gi');
+// Stamped into a freshly added capability container, and the LimitRange
+// `default` (limit) for containers that declare no memory limit.
+export const TENANT_DEFAULT_MEMORY = quantityEnv('CV_DEFAULT_MEMORY', '256Mi');
+// The LimitRange `defaultRequest` and the request stamped into a new container.
+export const TENANT_DEFAULT_MEMORY_REQUEST = quantityEnv('CV_DEFAULT_MEMORY_REQUEST', '64Mi');
+
+// ── Per-project CPU budget (operator-owned ceilings) ────────────────────────
+//
+// The CPU twin of the memory block above — same ResourceQuota + LimitRange, and
+// the same chart-default → per-project-override flow. Defaults reproduce the
+// values that were hardcoded before they became tunable. Unlike before, the
+// LimitRange default/defaultRequest are ALSO what manifests.ts stamps into a
+// freshly added capability container, so a new container and the LimitRange
+// agree (cf. memory, which has always shared one default).
+//
+// ResourceQuota limits.cpu — the per-project max CPU usage.
+export const TENANT_MAX_CPU = quantityEnv('CV_MAX_CPU', '4');
+// ResourceQuota requests.cpu — the per-project scheduled CPU floor.
+export const TENANT_MAX_CPU_REQUESTS = quantityEnv('CV_MAX_CPU_REQUESTS', '2');
+// LimitRange max.cpu — ceiling any single container may request.
+export const TENANT_MAX_CPU_PER_CONTAINER = quantityEnv('CV_MAX_CPU_PER_CONTAINER', '2');
+// LimitRange `default` (limit) + the cpu limit stamped into a new container.
+export const TENANT_DEFAULT_CPU = quantityEnv('CV_DEFAULT_CPU', '500m');
+// LimitRange `defaultRequest` + the cpu request stamped into a new container.
+export const TENANT_DEFAULT_CPU_REQUEST = quantityEnv('CV_DEFAULT_CPU_REQUEST', '50m');
+
+// ── Per-project storage budget (operator-owned) ─────────────────────────────
+//
+// CV_DEFAULT_STORAGE sizes each capability's data volume at PROVISION time (the
+// Postgres/Garage volumeClaimTemplate). CV_MAX_STORAGE is the ResourceQuota
+// `requests.storage` ceiling — the SUM of every PVC in the namespace. Growing a
+// volume past 5Gi therefore needs this ceiling raised too; see reconcileTenant*
+// in k8s.ts. A volume can only be grown (k8s forbids shrinking a PVC) and only
+// when its StorageClass has allowVolumeExpansion.
+export const TENANT_DEFAULT_STORAGE = quantityEnv('CV_DEFAULT_STORAGE', '5Gi');
+// Per-VOLUME admission cap (chart tenant.storage.maxPerVolume). Mirrors the cap
+// the cv-projects-*-bounds VAPs enforce on each PVC, so the portal can reject a
+// grow that admission would later deny instead of half-applying it.
+export const TENANT_MAX_PVC_SIZE = quantityEnv('CV_MAX_PVC_SIZE', '10Gi');
+// Per-NAMESPACE total (chart tenant.storage.maxTotal) → ResourceQuota
+// requests.storage, the sum of every PVC in the project.
+export const TENANT_MAX_STORAGE = quantityEnv('CV_MAX_STORAGE', '20Gi');
+
+// ── Per-project object-count budget (operator-owned) ────────────────────────
+//
+// ResourceQuota `pods` / `persistentvolumeclaims`. These cap how many of each a
+// tenant can create — including objects an owner adds via their own repo, which
+// ArgoCD syncs recursively. A positive integer; a bad chart value falls back to
+// the baked default rather than producing a broken quota.
+function countEnv(name: string, fallback: string): string {
+  const v = process.env[name];
+  return isCount(v) ? v : fallback;
+}
+
+// A non-negative integer count (no unit suffix), length-capped. Distinct from
+// isQuantity, which would also accept "12Mi" for a field that must be a count.
+const COUNT_RE = /^\d+$/;
+export function isCount(s: string | undefined | null): s is string {
+  return typeof s === 'string' && s.length > 0 && s.length <= 9 && COUNT_RE.test(s);
+}
+
+export const TENANT_MAX_PODS = countEnv('CV_MAX_PODS', '12');
+export const TENANT_MAX_PVCS = countEnv('CV_MAX_PVCS', '3');
+
+// Normalise a k8s quantity (or plain count) to a comparable number so we can
+// enforce "up-only" per-project overrides — an admin may raise a project above
+// the platform default but not below it. Handles binary (Ki…Ei = 1024^n),
+// decimal (k…E = 1000^n), milli (m = 1e-3), and bare numbers (cpu cores, counts,
+// bytes). Only ever used to compare two values of the SAME dimension (a field
+// against its own default), so cross-unit meaning is irrelevant. Returns NaN on
+// anything isQuantity/isCount wouldn't have accepted; callers validate first.
+const QUANTITY_SUFFIX: Record<string, number> = {
+  m: 1e-3,
+  k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18,
+  Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60,
+};
+export function quantityToNumber(s: string): number {
+  // Reuse QUANTITY_RE so this parses EXACTLY the grammar isQuantity accepts —
+  // they can never drift. Group 1 = mantissa, group 3 = the optional tail.
+  const m = QUANTITY_RE.exec(s);
+  if (!m) return NaN;
+  const tail = m[3];
+  if (!tail) return Number(m[1]);
+  // The tail is either a decimal exponent or a unit suffix (mutually exclusive).
+  if (tail[0] === 'e' || tail[0] === 'E') return Number(m[1] + tail);
+  return Number(m[1]) * QUANTITY_SUFFIX[tail];
+}

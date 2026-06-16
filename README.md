@@ -158,7 +158,8 @@ and `values.schema.json` for the full, validated surface. The headline knobs:
 | `mcp.enforceAudience` | RFC 8707 audience enforcement on MCP tokens. |
 | `mcp.denyClientIds` | OAuth clients whose tokens the MCP endpoints refuse (confused-deputy guard). |
 | `storage.className` | StorageClass for per-project Postgres and Garage (storage) volumes. |
-| `blob.garageImage` / `blob.storageMax` | The pinned Garage image for the storage capability and its per-project PVC cap. |
+| `tenant.memory.*`, `tenant.cpu.*`, `tenant.storage.*`, `tenant.pods.max`, `tenant.pvcs.max` | Per-project resource budgets — the ResourceQuota + LimitRange stamped on each project namespace. `storage.maxPerVolume` is the per-PVC cap; `storage.maxTotal` the namespace sum. |
+| `tenant.capabilities.{postgres,garage}.image` | Pinned images for the per-project Postgres/Garage capabilities (each also pins its admission VAP). |
 | `scale.*`, `resources.*` | Replicas and limits for the platform components. |
 | `role` | Split a deployment into `platform` / `tenants` planes, or `all-in-one`. |
 

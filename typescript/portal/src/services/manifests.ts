@@ -15,6 +15,8 @@ import { getFile, upsertRepoFile } from './gitea';
 import type { Capabilities } from './templates';
 import {
   CV_REGISTRY, PORTAL_PUBLIC_URL, PORTAL_INTERNAL_URL, PROJECTS_DOMAIN,
+  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
+  TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST, isQuantity,
 } from './platform-config';
 
 const REGISTRY = CV_REGISTRY;
@@ -28,6 +30,110 @@ interface ManifestOpts {
   repo: string;
   slug: string;
   caps: Capabilities;
+  // The project's current k8s/deployment.yaml, if it already exists. Used to
+  // preserve each container's owner-tuned `resources:` across a regeneration
+  // (Layer 2). composeProjectManifests supplies this; callers that build a
+  // brand-new project leave it unset (everything gets the chart defaults).
+  existingDeployment?: string | null;
+}
+
+// cpu/memory defaults stamped into a newly added container both come from the
+// chart via platform-config now, and match the LimitRange's default/defaultRequest
+// so a fresh container agrees with what the platform would inject anyway. An
+// owner's hand-tuned values are preserved across regeneration regardless.
+
+// A container's resource quantities carried forward from an existing manifest.
+// Every field is either undefined (use the default) or a string already
+// validated by isQuantity — never raw YAML scraped from the repo.
+interface ResourceValues {
+  reqCpu?: string;
+  reqMem?: string;
+  limCpu?: string;
+  limMem?: string;
+}
+
+// Read `key:` from inside the `section:` ("requests"/"limits") sub-block of a
+// single container's text. Indentation-bounded: we stop at the first line whose
+// indent falls back to (or below) the section header's, so a `memory:` under
+// `limits:` can't be misread as one under `requests:`. The returned scalar is
+// stripped of any surrounding quotes; the CALLER validates it as a quantity.
+function valueUnder(block: string, section: 'requests' | 'limits', key: 'cpu' | 'memory'): string | undefined {
+  const sec = new RegExp(`^([ \\t]*)${section}:[ \\t]*$`, 'm').exec(block);
+  if (!sec) return undefined;
+  const sectionIndent = sec[1].length;
+  const lines = block.slice(sec.index + sec[0].length).split('\n');
+  const kv = new RegExp(`^[ \\t]*${key}:[ \\t]*(\\S+)[ \\t]*$`);
+  for (const line of lines) {
+    if (line.trim() === '') continue;
+    const indent = line.length - line.replace(/^[ \t]+/, '').length;
+    if (indent <= sectionIndent) break; // left the section's sub-block
+    const m = kv.exec(line);
+    if (m) return m[1].replace(/^["']|["']$/g, '');
+  }
+  return undefined;
+}
+
+// Pull one container's resource quantities out of an existing, hand-editable
+// deployment.yaml. UNTRUSTED INPUT: each value is accepted only if isQuantity
+// passes, and only that validated scalar is ever returned — never surrounding
+// YAML — so a doctored manifest cannot inject structure into the file we
+// regenerate. An absent/garbage value simply falls back to the default.
+function containerResources(block: string): ResourceValues {
+  const ok = (s: string | undefined) => (isQuantity(s) ? s : undefined);
+  return {
+    reqCpu: ok(valueUnder(block, 'requests', 'cpu')),
+    reqMem: ok(valueUnder(block, 'requests', 'memory')),
+    limCpu: ok(valueUnder(block, 'limits', 'cpu')),
+    limMem: ok(valueUnder(block, 'limits', 'memory')),
+  };
+}
+
+// Map each known container name → its current resource values, read from the
+// existing deployment.yaml. We slice the file into per-container blocks by the
+// list-item `- name: <known>` markers (anchored to the names we generate, like
+// detectCapabilities) and bound each block at the next such marker. Containers
+// absent from the file (or a brand-new project) just won't appear in the map.
+const CONTAINER_NAMES = ['static-site', 'database', 'storage', 'mcp'] as const;
+
+function extractContainerResources(existing: string | null | undefined): Map<string, ResourceValues> {
+  const out = new Map<string, ResourceValues>();
+  if (!existing) return out;
+  // Isolate the `containers:` list first, so a `- name:` that lives inside an
+  // env/ports entry (more deeply indented) or the `metadata.name` slug can't be
+  // mistaken for a container boundary — an attacker setting an env var
+  // `- name: database` must not be able to forge or split a container block.
+  const ch = /^([ \t]*)containers:[ \t]*$/m.exec(existing);
+  if (!ch) return out;
+  const cIndent = ch[1].length;
+  const afterLines = existing.slice(ch.index + ch[0].length).split('\n');
+  const regionLines: string[] = [];
+  for (const line of afterLines) {
+    if (line.trim() !== '') {
+      const indent = line.length - line.replace(/^[ \t]+/, '').length;
+      if (indent <= cIndent) break; // reached a sibling key (e.g. volumes:)
+    }
+    regionLines.push(line);
+  }
+  const region = regionLines.join('\n');
+  // Container list items are the SHALLOWEST `- name:` entries in that region;
+  // anything more indented is a nested env/ports entry and is ignored.
+  const itemRe = /^([ \t]*)-[ \t]+name:[ \t]*([A-Za-z0-9-]+)[ \t]*$/gm;
+  const all: Array<{ name: string; index: number; indent: number }> = [];
+  for (let m = itemRe.exec(region); m; m = itemRe.exec(region)) {
+    all.push({ name: m[2], index: m.index, indent: m[1].length });
+  }
+  if (all.length === 0) return out;
+  const itemIndent = Math.min(...all.map((x) => x.indent));
+  const starts = all.filter((x) => x.indent === itemIndent);
+  for (let i = 0; i < starts.length; i++) {
+    const end = i + 1 < starts.length ? starts[i + 1].index : region.length;
+    // Only carry forward containers we actually manage. First block wins if a
+    // name somehow repeats.
+    if ((CONTAINER_NAMES as readonly string[]).includes(starts[i].name) && !out.has(starts[i].name)) {
+      out.set(starts[i].name, containerResources(region.slice(starts[i].index, end)));
+    }
+  }
+  return out;
 }
 
 function image(owner: string, repo: string): string {
@@ -43,6 +149,11 @@ function containerBlock(opts: {
   portName: string;
   port: number;
   env: Array<{ name: string; value?: string; secret?: { name: string; key: string } }>;
+  // Owner-tuned resources carried forward from the existing manifest, if any.
+  // Each field is already isQuantity-validated; absent fields use the defaults
+  // (both cpu and memory from the chart). Always emitted via this fixed template,
+  // so only validated scalars — never repo YAML — reach the generated file.
+  resources?: ResourceValues;
 }): string {
   const envLines = opts.env.length
     ? ['          env:'].concat(opts.env.map((e) => {
@@ -71,11 +182,11 @@ function containerBlock(opts: {
     ...envLines,
     `          resources:`,
     `            requests:`,
-    `              cpu: 25m`,
-    `              memory: 64Mi`,
+    `              cpu: ${opts.resources?.reqCpu ?? TENANT_DEFAULT_CPU_REQUEST}`,
+    `              memory: ${opts.resources?.reqMem ?? TENANT_DEFAULT_MEMORY_REQUEST}`,
     `            limits:`,
-    `              cpu: 250m`,
-    `              memory: 256Mi`,
+    `              cpu: ${opts.resources?.limCpu ?? TENANT_DEFAULT_CPU}`,
+    `              memory: ${opts.resources?.limMem ?? TENANT_DEFAULT_MEMORY}`,
     `          securityContext:`,
     `            allowPrivilegeEscalation: false`,
     `            readOnlyRootFilesystem: true`,
@@ -103,57 +214,76 @@ function containerBlock(opts: {
 export function buildDeploymentYaml(opts: ManifestOpts): string {
   const img = image(opts.owner, opts.repo);
   const sharedVal = opts.caps.shared ? 'true' : 'false';
+  // Carry forward each container's owner-tuned resources from the existing
+  // manifest; a container that isn't there yet (newly enabled capability, or a
+  // brand-new project) gets undefined → the chart defaults.
+  const prior = extractContainerResources(opts.existingDeployment);
+
+  // Cross-capability credentials: EVERY container in the pod gets the creds for
+  // ALL enabled stateful capabilities, not just the one it serves. These
+  // containers are the same project image, in one pod, written by one author,
+  // so per-capability cred siloing blocked legitimate cross-capability app
+  // logic (e.g. the storage server recording a download into the database) for
+  // negligible blast-radius gain. A cred is only projected when its capability
+  // is enabled — so the referenced Secret (postgres / garage) always exists.
+  const sharedCreds: Array<{ name: string; value?: string; secret?: { name: string; key: string } }> = [];
+  if (opts.caps.database) {
+    sharedCreds.push({ name: 'DATABASE_URL', secret: { name: 'postgres', key: 'DATABASE_URL' } });
+  }
+  if (opts.caps.storage) {
+    // S3 connection + credentials from the per-project `garage` Secret
+    // (services/garage.ts seals it); all six keys projected individually.
+    for (const key of ['S3_ENDPOINT', 'S3_REGION', 'S3_BUCKET', 'S3_FORCE_PATH_STYLE', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY']) {
+      sharedCreds.push({ name: key, secret: { name: 'garage', key } });
+    }
+  }
+  // Per-container env = its own PORT + the shared data-mode flag + every
+  // enabled capability's creds.
+  const envFor = (port: number) => [
+    { name: 'PORT', value: String(port) },
+    { name: 'CV_SHARED', value: sharedVal },
+    ...sharedCreds,
+  ];
+
   const containers: string[] = [
     containerBlock({
       name: 'static-site', image: img, command: 'static-site/server.js',
       portName: 'http-site', port: PORTS.website,
-      env: [{ name: 'PORT', value: String(PORTS.website) }],
+      env: envFor(PORTS.website),
+      resources: prior.get('static-site'),
     }),
   ];
   if (opts.caps.database) {
     containers.push(containerBlock({
       name: 'database', image: img, command: 'database/server.js',
       portName: 'http-api', port: PORTS.database,
-      env: [
-        { name: 'PORT', value: String(PORTS.database) },
-        { name: 'CV_SHARED', value: sharedVal },
-        { name: 'DATABASE_URL', secret: { name: 'postgres', key: 'DATABASE_URL' } },
-      ],
+      env: envFor(PORTS.database),
+      resources: prior.get('database'),
     }));
   }
   if (opts.caps.storage) {
-    // The storage container reads its S3 connection + credentials from the
-    // per-project `garage` Secret (services/garage.ts seals it). All six keys
-    // are projected individually so only what the app needs is in its environ.
     containers.push(containerBlock({
       name: 'storage', image: img, command: 'storage/server.js',
       portName: 'http-files', port: PORTS.storage,
-      env: [
-        { name: 'PORT', value: String(PORTS.storage) },
-        { name: 'CV_SHARED', value: sharedVal },
-        { name: 'S3_ENDPOINT', secret: { name: 'garage', key: 'S3_ENDPOINT' } },
-        { name: 'S3_REGION', secret: { name: 'garage', key: 'S3_REGION' } },
-        { name: 'S3_BUCKET', secret: { name: 'garage', key: 'S3_BUCKET' } },
-        { name: 'S3_FORCE_PATH_STYLE', secret: { name: 'garage', key: 'S3_FORCE_PATH_STYLE' } },
-        { name: 'S3_ACCESS_KEY_ID', secret: { name: 'garage', key: 'S3_ACCESS_KEY_ID' } },
-        { name: 'S3_SECRET_ACCESS_KEY', secret: { name: 'garage', key: 'S3_SECRET_ACCESS_KEY' } },
-      ],
+      env: envFor(PORTS.storage),
+      resources: prior.get('storage'),
     }));
   }
   if (opts.caps.mcp) {
     containers.push(containerBlock({
       name: 'mcp', image: img, command: 'mcp/server.js',
       portName: 'http-mcp', port: PORTS.mcp,
-      env: [
-        { name: 'PORT', value: String(PORTS.mcp) },
-        { name: 'CV_SHARED', value: sharedVal },
-      ],
+      env: envFor(PORTS.mcp),
+      resources: prior.get('mcp'),
     }));
   }
   return `# Generated by the Corpo Valley portal from this project's capabilities.
-# One container per enabled capability, all from the same image. Don't
-# hand-edit — toggle capabilities in the portal and the platform rewrites this.
-# The image tag is pinned by the Build workflow on every push to main.
+# One container per enabled capability, all from the same image. Toggle
+# capabilities in the portal and the platform rewrites this — but it PRESERVES
+# each container's \`resources:\` block, so you can tune cpu/memory here and your
+# values stick (the platform only fills defaults for a newly added capability).
+# Memory is also bounded by the project's ResourceQuota/LimitRange. The image
+# tag is pinned by the Build workflow on every push to main.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -294,13 +424,24 @@ export async function detectCapabilities(opts: {
 // individual upserts so each carries the previous blob sha. Idempotent: an
 // unchanged file produces no commit.
 export async function composeProjectManifests(opts: ManifestOpts): Promise<void> {
-  const files: Array<{ path: string; content: string }> = [
-    { path: 'k8s/deployment.yaml', content: buildDeploymentYaml(opts) },
+  // Fetch the current deployment up front so regeneration can preserve the
+  // owner's resource tuning (Layer 2). Reused below as the deployment's
+  // existing blob for the sha + idempotency compare, so this is one GET, not
+  // two. A 404 (or any read error) → null → the chart defaults are used.
+  const existingDeployment = await getFile({ owner: opts.owner, repo: opts.repo, path: 'k8s/deployment.yaml' }).catch(() => null);
+  const files: Array<{ path: string; content: string; prefetched?: typeof existingDeployment }> = [
+    {
+      path: 'k8s/deployment.yaml',
+      content: buildDeploymentYaml({ ...opts, existingDeployment: existingDeployment?.content ?? null }),
+      prefetched: existingDeployment,
+    },
     { path: 'k8s/service.yaml', content: buildServiceYaml(opts) },
     { path: 'k8s/ingress.yaml', content: buildIngressYaml(opts) },
   ];
   for (const f of files) {
-    const existing = await getFile({ owner: opts.owner, repo: opts.repo, path: f.path }).catch(() => null);
+    const existing = f.prefetched !== undefined
+      ? f.prefetched
+      : await getFile({ owner: opts.owner, repo: opts.repo, path: f.path }).catch(() => null);
     if (existing && existing.content === f.content) continue;
     await upsertRepoFile({
       owner: opts.owner, repo: opts.repo,
