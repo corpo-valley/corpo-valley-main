@@ -30,20 +30,45 @@ per enabled capability (`node static-site/server.js`, `node database/server.js`,
 
 ## Identity & authorization — already enforced
 
-Every request is authenticated at the platform edge before it reaches any
-container: the Ingress gates on a valid Kratos session and bounces
-unauthenticated visitors to login. The signed-in user's `ory_kratos_session`
-cookie is forwarded through to the container, and the shared helper
-`lib/identity.js` re-validates it against Kratos to get the caller's stable id.
-A workload in this namespace can't forge an identity — that needs a real
-session only the signed-in user holds.
+Every request is authenticated **and authorized** at the platform edge before it
+reaches any container. The Ingress asks the portal whether the visitor may see
+this project: anonymous visitors are bounced to login, and signed-in members
+without `read` get a 403 — your code never sees either. Allowed requests arrive
+carrying three **trusted** headers:
 
-- Resolve the caller with `resolveUser(req)` from `lib/identity.js` (returns
-  `{ id, email }` or null). The `database`, `storage`, and `mcp` modules already do this.
-- Scope user data by that id. Rows are owned by their creator and a caller only
-  sees their own, unless the project's "data is shared across users" setting is
-  on (surfaced as the `CV_SHARED` env var). **Per-user isolation is the secure
-  default — don't remove the `owner_id` predicates without meaning to.**
+```
+X-CV-User-Id     stable identity id of the caller — use as your owner_id
+X-CV-User-Email  caller email
+X-CV-Perm        read | write | admin
+```
+
+nginx overwrites these from the portal's auth answer on every request, so a
+client-supplied copy never survives the edge (and network policy stops other
+projects calling your Services directly). That edge overwrite — not anything in
+your container — is what makes a forged identity impossible.
+
+- Resolve the caller with `resolveUser(req)` from `lib/identity.js` — it returns
+  `{ id, email, perm }` or `null`. The `database`, `storage`, and `mcp` modules
+  already do this.
+- **Gate every mutating route with `requirePerm('write')`** (also from
+  `lib/identity.js`): it 401s unauthenticated callers, 403s anyone below the
+  class, and sets `req.userId` / `req.userEmail` / `req.userPerm`. GETs are
+  already covered by the platform's `read` floor. Reserve `admin` for moderation
+  paths (acting on anyone's data); the project owner is always `admin`.
+- Scope user data by `req.userId` (never trust an id from the request body).
+  Rows are owned by their creator and a caller only sees their own, unless the
+  project's "data is shared across users" setting is on (surfaced as the
+  `CV_SHARED` env var, which widens *reads* only). **Per-user isolation is the
+  secure default — don't remove the `owner_id` predicates without meaning to.**
+
+The permission classes and grant model are the project's access standard — see
+[`ACCESS.md`](ACCESS.md) for the full contract.
+
+A Kratos session-cookie check exists only as a **local-dev fallback**:
+`resolveUser` validates the forwarded `ory_kratos_session` against Kratos and
+reports `write`, but **only** when `CV_DEV_COOKIE_FALLBACK` is set. In the
+cluster it never runs — a deployed container that ever loses its edge headers
+fails closed (deny) rather than granting `write` to any signed-in session.
 
 ## Adding or removing a capability
 
