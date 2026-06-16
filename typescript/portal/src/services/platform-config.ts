@@ -143,3 +143,74 @@ export const TENANT_MAX_MEMORY_PER_CONTAINER = quantityEnv('CV_MAX_MEMORY_PER_CO
 export const TENANT_DEFAULT_MEMORY = quantityEnv('CV_DEFAULT_MEMORY', '256Mi');
 // The LimitRange `defaultRequest` and the request stamped into a new container.
 export const TENANT_DEFAULT_MEMORY_REQUEST = quantityEnv('CV_DEFAULT_MEMORY_REQUEST', '64Mi');
+
+// ── Per-project CPU budget (operator-owned ceilings) ────────────────────────
+//
+// The CPU twin of the memory block above — same ResourceQuota + LimitRange, and
+// the same chart-default → per-project-override flow. Defaults reproduce the
+// values that were hardcoded before they became tunable. Unlike before, the
+// LimitRange default/defaultRequest are ALSO what manifests.ts stamps into a
+// freshly added capability container, so a new container and the LimitRange
+// agree (cf. memory, which has always shared one default).
+//
+// ResourceQuota limits.cpu — the per-project max CPU usage.
+export const TENANT_MAX_CPU = quantityEnv('CV_MAX_CPU', '4');
+// ResourceQuota requests.cpu — the per-project scheduled CPU floor.
+export const TENANT_MAX_CPU_REQUESTS = quantityEnv('CV_MAX_CPU_REQUESTS', '2');
+// LimitRange max.cpu — ceiling any single container may request.
+export const TENANT_MAX_CPU_PER_CONTAINER = quantityEnv('CV_MAX_CPU_PER_CONTAINER', '2');
+// LimitRange `default` (limit) + the cpu limit stamped into a new container.
+export const TENANT_DEFAULT_CPU = quantityEnv('CV_DEFAULT_CPU', '500m');
+// LimitRange `defaultRequest` + the cpu request stamped into a new container.
+export const TENANT_DEFAULT_CPU_REQUEST = quantityEnv('CV_DEFAULT_CPU_REQUEST', '50m');
+
+// ── Per-project storage budget (operator-owned) ─────────────────────────────
+//
+// CV_DEFAULT_STORAGE sizes each capability's data volume at PROVISION time (the
+// Postgres/Garage volumeClaimTemplate). CV_MAX_STORAGE is the ResourceQuota
+// `requests.storage` ceiling — the SUM of every PVC in the namespace. Growing a
+// volume past 5Gi therefore needs this ceiling raised too; see reconcileTenant*
+// in k8s.ts. A volume can only be grown (k8s forbids shrinking a PVC) and only
+// when its StorageClass has allowVolumeExpansion.
+export const TENANT_DEFAULT_STORAGE = quantityEnv('CV_DEFAULT_STORAGE', '5Gi');
+export const TENANT_MAX_STORAGE = quantityEnv('CV_MAX_STORAGE', '10Gi');
+
+// ── Per-project object-count budget (operator-owned) ────────────────────────
+//
+// ResourceQuota `pods` / `persistentvolumeclaims`. These cap how many of each a
+// tenant can create — including objects an owner adds via their own repo, which
+// ArgoCD syncs recursively. A positive integer; a bad chart value falls back to
+// the baked default rather than producing a broken quota.
+function countEnv(name: string, fallback: string): string {
+  const v = process.env[name];
+  return isCount(v) ? v : fallback;
+}
+
+// A non-negative integer count (no unit suffix), length-capped. Distinct from
+// isQuantity, which would also accept "12Mi" for a field that must be a count.
+const COUNT_RE = /^\d+$/;
+export function isCount(s: string | undefined | null): s is string {
+  return typeof s === 'string' && s.length > 0 && s.length <= 9 && COUNT_RE.test(s);
+}
+
+export const TENANT_MAX_PODS = countEnv('CV_MAX_PODS', '12');
+export const TENANT_MAX_PVCS = countEnv('CV_MAX_PVCS', '3');
+
+// Normalise a k8s quantity (or plain count) to a comparable number so we can
+// enforce "up-only" per-project overrides — an admin may raise a project above
+// the platform default but not below it. Handles binary (Ki…Ei = 1024^n),
+// decimal (k…E = 1000^n), milli (m = 1e-3), and bare numbers (cpu cores, counts,
+// bytes). Only ever used to compare two values of the SAME dimension (a field
+// against its own default), so cross-unit meaning is irrelevant. Returns NaN on
+// anything isQuantity/isCount wouldn't have accepted; callers validate first.
+const QUANTITY_SUFFIX: Record<string, number> = {
+  m: 1e-3,
+  k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18,
+  Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60,
+};
+export function quantityToNumber(s: string): number {
+  const m = /^[+]?(\d+(?:\.\d+)?|\.\d+)([eE][+-]?\d+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/.exec(s);
+  if (!m) return NaN;
+  const mantissa = Number(m[1] + (m[2] || ''));
+  return m[3] ? mantissa * QUANTITY_SUFFIX[m[3]] : mantissa;
+}
