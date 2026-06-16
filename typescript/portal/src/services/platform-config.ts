@@ -95,9 +95,17 @@ export const GARAGE_STORAGE_CLASS: string | undefined = POSTGRES_STORAGE_CLASS;
 // capability (built from corpo-valley-main containers/garage). MUST match the
 // image the chart's cv-projects-garage-bounds VAP pins, or the generated
 // StatefulSet is rejected at admission. The chart injects this from
-// `blob.garageImage`; the default reproduces the pinned upstream version.
+// `tenant.capabilities.garage.image`; the default reproduces the pinned
+// upstream version.
 export const GARAGE_IMAGE =
   process.env.CV_GARAGE_IMAGE || 'ghcr.io/corpo-valley/corpo-valley-garage:v1.0.1';
+
+// Pinned image for the per-project Postgres "database" capability. The chart
+// injects it from tenant.capabilities.postgres.image — the SAME value that
+// pins the cv-projects-postgres-bounds VAP, so the generated StatefulSet and
+// the admission gate can't drift. Sibling of GARAGE_IMAGE above.
+export const POSTGRES_IMAGE =
+  process.env.CV_POSTGRES_IMAGE || 'postgres:16-alpine';
 
 // A Kubernetes resource "quantity": digits with an optional decimal/exponent
 // and one of the canonical unit suffixes (e.g. 64Mi, 2Gi, 250m, 2). Anchored,
@@ -173,7 +181,13 @@ export const TENANT_DEFAULT_CPU_REQUEST = quantityEnv('CV_DEFAULT_CPU_REQUEST', 
 // in k8s.ts. A volume can only be grown (k8s forbids shrinking a PVC) and only
 // when its StorageClass has allowVolumeExpansion.
 export const TENANT_DEFAULT_STORAGE = quantityEnv('CV_DEFAULT_STORAGE', '5Gi');
-export const TENANT_MAX_STORAGE = quantityEnv('CV_MAX_STORAGE', '10Gi');
+// Per-VOLUME admission cap (chart tenant.storage.maxPerVolume). Mirrors the cap
+// the cv-projects-*-bounds VAPs enforce on each PVC, so the portal can reject a
+// grow that admission would later deny instead of half-applying it.
+export const TENANT_MAX_PVC_SIZE = quantityEnv('CV_MAX_PVC_SIZE', '10Gi');
+// Per-NAMESPACE total (chart tenant.storage.maxTotal) → ResourceQuota
+// requests.storage, the sum of every PVC in the project.
+export const TENANT_MAX_STORAGE = quantityEnv('CV_MAX_STORAGE', '20Gi');
 
 // ── Per-project object-count budget (operator-owned) ────────────────────────
 //

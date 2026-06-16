@@ -32,7 +32,8 @@ import {
   TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
   TENANT_MAX_CPU, TENANT_MAX_CPU_REQUESTS, TENANT_MAX_CPU_PER_CONTAINER,
   TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST,
-  TENANT_MAX_STORAGE, TENANT_DEFAULT_STORAGE, TENANT_MAX_PODS, TENANT_MAX_PVCS,
+  TENANT_MAX_STORAGE, TENANT_DEFAULT_STORAGE, TENANT_MAX_PVC_SIZE,
+  TENANT_MAX_PODS, TENANT_MAX_PVCS,
 } from '../services/platform-config';
 
 const router = Router();
@@ -574,14 +575,18 @@ router.post('/projects/resources', async (req: Request, res: Response) => {
     overrides[f.key] = v;
   }
 
-  // PVC grow target (optional). Up-only vs the chart default; the reconciler
-  // additionally refuses to shrink an already-larger volume.
+  // PVC grow target (optional). Bounded below by the chart default (grow-only)
+  // and above by the per-volume admission cap — exceeding it would be denied by
+  // the cv-projects-*-bounds VAP, so reject up front instead of half-applying.
   let pvcSize: string | undefined;
   const rawSize = typeof body[PVC_SIZE.key] === 'string' ? (body[PVC_SIZE.key] as string).trim() : '';
   if (rawSize !== '') {
     if (!isQuantity(rawSize)) { fail(slug, `"${rawSize}" is not a valid storage quantity (e.g. 10Gi).`); return; }
     if (quantityToNumber(rawSize) < quantityToNumber(PVC_SIZE.def)) {
       fail(slug, `"${rawSize}" is below the platform default of ${PVC_SIZE.def} — storage is grow-only.`); return;
+    }
+    if (quantityToNumber(rawSize) > quantityToNumber(TENANT_MAX_PVC_SIZE)) {
+      fail(slug, `"${rawSize}" exceeds the per-volume cap of ${TENANT_MAX_PVC_SIZE} (admission would reject it) — raise tenant.storage.maxPerVolume in the chart.`); return;
     }
     pvcSize = rawSize;
   }
