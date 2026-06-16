@@ -2157,8 +2157,9 @@ export function renderAdminProjectResources(
     + <code>LimitRange</code>, and (for storage) the size of its data volumes.
     The platform applies these once at project creation, so a changed platform
     default — or a per-project bump — only reaches an existing project through
-    here. Leave a field blank to use the current platform default (shown as the
-    placeholder). Overrides are <strong>up-only</strong>: you can grant more than
+    here. Leave a field blank to <strong>keep that field's current value
+    unchanged</strong> (the placeholder shows the platform default for
+    reference). Overrides are <strong>up-only</strong>: you can grant more than
     the default, not less.</p>`;
 
   const field = (f: ResourceFieldView) => `

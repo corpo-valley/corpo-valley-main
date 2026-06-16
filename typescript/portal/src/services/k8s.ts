@@ -510,48 +510,62 @@ export interface TenantResourceOverrides {
   maxPvcs?: string;
 }
 
-function tenantResourceQuotaObject(slug: string, o: TenantResourceOverrides = {}) {
+// Resolve the desired value of a field: an admin override wins; otherwise keep
+// the project's CURRENT live value; otherwise the chart default. So a field the
+// admin left blank stays UNCHANGED rather than being reset to the chart default
+// (which would clobber an earlier per-project bump). `cur` is the live object's
+// value, read by reconcileTenantResources; empty on the write-once create path.
+function tenantResourceQuotaObject(
+  slug: string, o: TenantResourceOverrides = {}, curHard: Record<string, string> = {},
+) {
+  const pick = (ov: string | undefined, key: string, def: string) => ov ?? curHard[key] ?? def;
   return {
     apiVersion: 'v1', kind: 'ResourceQuota',
     metadata: { name: 'cv-tenant-quota', namespace: slug,
       labels: { 'corpo-valley.com/managed': 'baseline' } },
-    // Every field below is operator-tunable via the chart (tenant.* → CV_*) and
-    // per-project raisable by an admin via reconcileTenantResources. The
-    // loadbalancers/nodeports zeros are deliberate hardening and stay fixed.
+    // Each field: operator-tunable via the chart (tenant.* → CV_*), per-project
+    // raisable by an admin, and preserved-as-is when neither is supplied.
     spec: { hard: {
-      'requests.cpu': o.cpuMaxRequests ?? TENANT_MAX_CPU_REQUESTS,
-      'limits.cpu': o.cpuMax ?? TENANT_MAX_CPU,
-      'requests.memory': o.maxRequests ?? TENANT_MAX_MEMORY_REQUESTS,
-      'limits.memory': o.max ?? TENANT_MAX_MEMORY,
-      'requests.storage': o.maxStorage ?? TENANT_MAX_STORAGE,
-      'pods': o.maxPods ?? TENANT_MAX_PODS,
-      'persistentvolumeclaims': o.maxPvcs ?? TENANT_MAX_PVCS,
+      'requests.cpu': pick(o.cpuMaxRequests, 'requests.cpu', TENANT_MAX_CPU_REQUESTS),
+      'limits.cpu': pick(o.cpuMax, 'limits.cpu', TENANT_MAX_CPU),
+      'requests.memory': pick(o.maxRequests, 'requests.memory', TENANT_MAX_MEMORY_REQUESTS),
+      'limits.memory': pick(o.max, 'limits.memory', TENANT_MAX_MEMORY),
+      'requests.storage': pick(o.maxStorage, 'requests.storage', TENANT_MAX_STORAGE),
+      'pods': pick(o.maxPods, 'pods', TENANT_MAX_PODS),
+      'persistentvolumeclaims': pick(o.maxPvcs, 'persistentvolumeclaims', TENANT_MAX_PVCS),
+      // Deliberate hardening — always RE-ASSERTED (never preserved from live, so
+      // a tampered quota can't keep a nonzero LB/NodePort allowance).
       'services.loadbalancers': '0', 'services.nodeports': '0',
     } },
   };
 }
 
-function tenantLimitRangeObject(slug: string, o: TenantResourceOverrides = {}) {
+function tenantLimitRangeObject(
+  slug: string, o: TenantResourceOverrides = {}, curLimit: any = undefined,
+) {
+  // Same precedence as the quota: override → current live value → chart default.
+  // The LimitRange `limits` is an array (JSON merge-patch replaces it wholesale),
+  // so we must emit the COMPLETE entry — hence reading each current sub-field.
+  const curReq = curLimit?.defaultRequest || {};
+  const curDef = curLimit?.default || {};
+  const curMax = curLimit?.max || {};
   return {
     apiVersion: 'v1', kind: 'LimitRange',
     metadata: { name: 'cv-tenant-limits', namespace: slug,
       labels: { 'corpo-valley.com/managed': 'baseline' } },
-    // Per-container cpu/memory defaults + ceiling — operator-tunable via the
-    // chart (tenant.* → CV_DEFAULT_* / CV_MAX_*_PER_CONTAINER) and per-project
-    // raisable by an admin via reconcileTenantResources.
     spec: { limits: [{
       type: 'Container',
       defaultRequest: {
-        cpu: o.cpuDefaultRequest ?? TENANT_DEFAULT_CPU_REQUEST,
-        memory: o.defaultRequest ?? TENANT_DEFAULT_MEMORY_REQUEST,
+        cpu: o.cpuDefaultRequest ?? curReq.cpu ?? TENANT_DEFAULT_CPU_REQUEST,
+        memory: o.defaultRequest ?? curReq.memory ?? TENANT_DEFAULT_MEMORY_REQUEST,
       },
       default: {
-        cpu: o.cpuDefault ?? TENANT_DEFAULT_CPU,
-        memory: o.default ?? TENANT_DEFAULT_MEMORY,
+        cpu: o.cpuDefault ?? curDef.cpu ?? TENANT_DEFAULT_CPU,
+        memory: o.default ?? curDef.memory ?? TENANT_DEFAULT_MEMORY,
       },
       max: {
-        cpu: o.cpuMaxPerContainer ?? TENANT_MAX_CPU_PER_CONTAINER,
-        memory: o.maxPerContainer ?? TENANT_MAX_MEMORY_PER_CONTAINER,
+        cpu: o.cpuMaxPerContainer ?? curMax.cpu ?? TENANT_MAX_CPU_PER_CONTAINER,
+        memory: o.maxPerContainer ?? curMax.memory ?? TENANT_MAX_MEMORY_PER_CONTAINER,
       },
     }] },
   };
@@ -591,26 +605,43 @@ async function patchOrCreate(collection: string, name: string, body: unknown): P
   }
 }
 
-// Reconcile ONE project's ResourceQuota + LimitRange to the current memory
-// budget — the chart-configured defaults, optionally overridden per field for
-// this project. Because applyNamespaceBaseline creates these write-once, a
-// changed chart ceiling (or an admin's per-project bump) only reaches an
-// existing namespace through this call. Admin-triggered; see routes/admin.ts.
-// Returns null when the k8s client is disabled (local dev). Throws (404)
-// if the namespace doesn't exist — the caller validates the project first.
+// GET a named object, returning null on 404 (rather than throwing) so callers
+// can branch on existence. Other errors propagate.
+async function getNamespacedOrNull(path: string): Promise<any | null> {
+  try {
+    return await call<any>({ method: 'GET', path });
+  } catch (err) {
+    if (err instanceof K8sApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// Reconcile ONE project's ResourceQuota + LimitRange. We GET the live objects
+// FIRST and resolve each field as override → current live value → chart default,
+// so an admin's partial edit changes ONLY the fields they supplied and leaves
+// the rest untouched (a blank form field = unchanged). Because
+// applyNamespaceBaseline creates these write-once, an admin's per-project bump
+// only reaches an existing namespace through this call. Admin-triggered; see
+// routes/admin.ts. Returns null when the k8s client is disabled (local dev).
+// Throws (404) if the namespace doesn't exist — the caller validates first.
 export async function reconcileTenantResources(
   slug: string,
   o: TenantResourceOverrides = {},
 ): Promise<{ quota: 'patched' | 'created'; limits: 'patched' | 'created' } | null> {
   if (!k8sEnabled()) return null;
   const ns = encodeURIComponent(slug);
+  const quotaColl = `/api/v1/namespaces/${ns}/resourcequotas`;
+  const limitsColl = `/api/v1/namespaces/${ns}/limitranges`;
+  // Read current state first so unspecified fields are preserved, not reset.
+  const curQuota = await getNamespacedOrNull(`${quotaColl}/cv-tenant-quota`);
+  const curLimits = await getNamespacedOrNull(`${limitsColl}/cv-tenant-limits`);
   const quota = await patchOrCreate(
-    `/api/v1/namespaces/${ns}/resourcequotas`, 'cv-tenant-quota',
-    tenantResourceQuotaObject(slug, o),
+    quotaColl, 'cv-tenant-quota',
+    tenantResourceQuotaObject(slug, o, curQuota?.spec?.hard),
   );
   const limits = await patchOrCreate(
-    `/api/v1/namespaces/${ns}/limitranges`, 'cv-tenant-limits',
-    tenantLimitRangeObject(slug, o),
+    limitsColl, 'cv-tenant-limits',
+    tenantLimitRangeObject(slug, o, curLimits?.spec?.limits?.[0]),
   );
   return { quota, limits };
 }
