@@ -637,6 +637,7 @@ function dashboardLayout(
 ): string {
   const navItems: NavItem[] = [
     { label: 'Projects', href: '/', key: 'projects' },
+    { label: 'Community', href: '/community', key: 'community' },
     { label: 'Groups', href: '/groups', key: 'groups' },
     { label: 'Connect Claude Code', href: '/connect', key: 'connect' },
   ];
@@ -759,6 +760,76 @@ export interface GroupOptionRow {
 
 function accessBadge(value: string): string {
   return `<span class="badge badge-access">${escapeHtml(value)}</span>`;
+}
+
+// ── Community Feed ──────────────────────────────────────────
+
+// The sort axes the feed offers. `created`/`updated` render newest-first;
+// `creator` is alphabetical by email. Shared with routes/dashboard.ts so the
+// route and template agree on the valid set.
+export const COMMUNITY_SORTS = ['created', 'creator', 'updated'] as const;
+export type CommunitySort = (typeof COMMUNITY_SORTS)[number];
+
+export interface CommunityRow {
+  name: string;
+  slug: string;
+  creator: string;   // owner email (or '—' if unresolved)
+  sitePerm: string;  // the everyone site grant: 'read' | 'write'
+  createdAt: string; // pre-formatted date
+  updatedAt: string; // pre-formatted date (repo last-updated, or created)
+}
+
+export function renderCommunityFeed(
+  email: string,
+  rows: CommunityRow[],
+  isAdmin: boolean,
+  sort: CommunitySort,
+): string {
+  // A sortable column header: a link that flips ?sort=, with a ▾ marker on the
+  // active column.
+  const sortHeader = (key: CommunitySort, label: string) =>
+    `<a href="/community?sort=${key}">${escapeHtml(label)}${sort === key ? ' ▾' : ''}</a>`;
+
+  let body = `
+    <p class="tagline">Internal projects shared across the valley. Open one to see what folks are building.</p>
+  `;
+
+  if (rows.length === 0) {
+    body += `
+      <div class="app-card" style="text-align:center;padding:2rem 1.5rem;">
+        <div style="font-size:2rem;margin-bottom:0.5rem;">🏘️</div>
+        <h3 style="color:#fdf6e8;margin:0 0 0.35rem 0;">Nothing shared yet</h3>
+        <p class="help" style="margin-bottom:0;">No internal projects are visible right now. When someone shares a project's site with everyone, it shows up here.</p>
+      </div>
+    `;
+  } else {
+    body += `<div class="table-wrap"><table class="table">
+      <thead><tr>
+        <th>Project</th>
+        <th>Access</th>
+        <th>${sortHeader('creator', 'Creator')}</th>
+        <th>${sortHeader('created', 'Created')}</th>
+        <th>${sortHeader('updated', 'Last updated')}</th>
+      </tr></thead>
+      <tbody>`;
+    for (const r of rows) {
+      const host = `${escapeHtml(r.slug)}.${escapeHtml(PROJECTS_DOMAIN)}`;
+      body += `
+        <tr>
+          <td>
+            <a href="${projectSiteUrl(escapeHtml(r.slug))}" target="_blank" rel="noopener">${escapeHtml(r.name)} ↗</a>
+            <div class="help" style="margin:0;">${host}</div>
+          </td>
+          <td>${accessBadge(r.sitePerm)}</td>
+          <td>${escapeHtml(r.creator)}</td>
+          <td>${escapeHtml(r.createdAt)}</td>
+          <td>${escapeHtml(r.updatedAt)}</td>
+        </tr>`;
+    }
+    body += `</tbody></table></div>`;
+  }
+
+  return dashboardLayout('Community Feed', body, email, isAdmin, 'community');
 }
 
 export function renderProjects(

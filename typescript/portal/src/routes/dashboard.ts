@@ -18,11 +18,12 @@ import {
   listProjectGrants, upsertProjectGrant, getGrantById,
   setGrantFacet, revokeGrantFacet, getEveryoneGrants,
   getGroupByName, listGroups, listProjectsSharedWith,
+  listProjectsWithEveryoneSiteGrant,
   EVERYONE_SUBJECT_ID, EVERYONE_SUBJECT_NAME,
   SubjectType, GrantFacet,
 } from '../services/access';
 import { syncRepoAccess, giteaUsernameForIdentity } from '../services/repo-access';
-import { findIdentityByEmail, findIdentityByUsername } from '../services/kratos-admin';
+import { findIdentityByEmail, findIdentityByUsername, listAllHumanIdentities } from '../services/kratos-admin';
 import { ensureProvisionedLazy } from '../services/provisioning';
 import { generatePinToken, hashPinToken } from '../services/pin-token';
 import {
@@ -49,6 +50,7 @@ import {
   setBranchProtection,
   listRepoFiles, upsertRepoFile, deleteRepoFile,
   mintUserCliToken, setActionsSecret,
+  getRepoUpdatedAtMap,
 } from '../services/gitea';
 import { createArgoApplication, k8sEnabled, namespaceExists } from '../services/k8s';
 import { purgeProjectResources } from '../services/project-purge';
@@ -57,8 +59,8 @@ import { PROJECTS_DOMAIN } from '../services/platform-config';
 import {
   renderProjects, renderProjectCreate, renderProjectDetail,
   renderKeyManagement, renderNewKeyDisplay, renderError,
-  renderGiteaCliTokenReveal,
-  ProjectRow, ApiKeyRow,
+  renderGiteaCliTokenReveal, renderCommunityFeed,
+  ProjectRow, ApiKeyRow, CommunityRow, COMMUNITY_SORTS, CommunitySort,
 } from '../templates';
 import * as crypto from 'crypto';
 
@@ -160,6 +162,72 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Projects list error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load projects.'));
+  }
+});
+
+// GET /community — the Community Feed. Every internal (site shared org-wide via
+// an `everyone` site grant) project across all owners, with creator email +
+// last-updated, sortable by creation date (default, newest first), creator, or
+// last updated. Visible to any logged-in user. Three batch lookups total,
+// independent of project count: the shared-projects query, one Kratos identity
+// page (owner → email), and one Gitea repos/search (gitea_repo → updated_at).
+// Both enrichment lookups are best-effort — a failure degrades a column rather
+// than the whole page.
+router.get('/community', requireSession, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const isAdmin = await isUserAdmin(session.id);
+    const sortParam = String(req.query.sort || '');
+    const sort: CommunitySort = (COMMUNITY_SORTS as readonly string[]).includes(sortParam)
+      ? (sortParam as CommunitySort) : 'created';
+
+    const projects = await listProjectsWithEveryoneSiteGrant();
+    const [identities, repoUpdated] = await Promise.all([
+      listAllHumanIdentities().catch(() => []),
+      getRepoUpdatedAtMap().catch(() => new Map<string, string>()),
+    ]);
+    const emailById = new Map<string, string>();
+    for (const i of identities) {
+      const e = (i.traits as any)?.email;
+      if (typeof e === 'string' && e) emailById.set(i.id, e);
+    }
+
+    // Enrich each project. "Last updated" is the repo's Gitea updated_at; fall
+    // back to created_at for projects with no repo yet (or any the search
+    // omitted) so the column is never blank.
+    const enriched = projects.map((p) => {
+      const updatedIso = (p.gitea_repo && repoUpdated.get(p.gitea_repo)) || p.created_at;
+      return {
+        name: p.name,
+        slug: p.slug,
+        creator: emailById.get(p.owner_id) || '—',
+        sitePerm: p.everyone_site_perm,
+        createdIso: p.created_at,
+        updatedIso,
+      };
+    });
+
+    // Sort: created/updated newest-first, creator alphabetical (case-insensitive).
+    enriched.sort((a, b) => {
+      if (sort === 'creator') return a.creator.localeCompare(b.creator, undefined, { sensitivity: 'base' });
+      if (sort === 'updated') return b.updatedIso.localeCompare(a.updatedIso);
+      return b.createdIso.localeCompare(a.createdIso);
+    });
+
+    const fmt = (iso: string) => (iso ? new Date(iso).toLocaleDateString() : '—');
+    const rows: CommunityRow[] = enriched.map((e) => ({
+      name: e.name,
+      slug: e.slug,
+      creator: e.creator,
+      sitePerm: e.sitePerm,
+      createdAt: fmt(e.createdIso),
+      updatedAt: fmt(e.updatedIso),
+    }));
+
+    res.send(renderCommunityFeed(session.email, rows, isAdmin, sort));
+  } catch (err: any) {
+    console.error('Community feed error:', err.message);
+    res.status(500).send(renderError('Error', 'Failed to load the community feed.'));
   }
 });
 

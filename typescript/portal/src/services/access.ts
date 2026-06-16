@@ -274,6 +274,22 @@ export async function listProjectsWithEveryoneRepoGrant(): Promise<Array<Project
   return rows;
 }
 
+// Projects whose deployed site is shared org-wide — the `everyone` grant has a
+// non-null site_perm (read or write). This is the "internal / not-private" set
+// the Community Feed lists: any logged-in user can reach these sites, so they
+// belong in a browse view. Default-private projects (no everyone grant) and
+// repo-only shares (site_perm null) are excluded. Newest-first; the route
+// re-sorts for the creator / last-updated axes.
+export async function listProjectsWithEveryoneSiteGrant(): Promise<Array<Project & { everyone_site_perm: GrantLevel }>> {
+  const { rows } = await pool.query<Project & { everyone_site_perm: GrantLevel }>(
+    `SELECT p.*, g.site_perm AS everyone_site_perm
+     FROM projects p JOIN project_grants g ON g.project_id = p.id
+     WHERE g.subject_type = 'everyone' AND g.site_perm IN ('read', 'write')
+     ORDER BY p.created_at DESC`
+  );
+  return rows;
+}
+
 // Projects shared with a user via a direct or group grant (any area) — the
 // dashboard's "Shared with you" section.
 export async function listProjectsSharedWith(userId: string): Promise<Array<Project & { site_perm: EffectivePerm; repo_perm: EffectivePerm }>> {
