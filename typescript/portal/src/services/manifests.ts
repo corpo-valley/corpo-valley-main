@@ -151,7 +151,7 @@ function containerBlock(opts: {
   env: Array<{ name: string; value?: string; secret?: { name: string; key: string } }>;
   // Owner-tuned resources carried forward from the existing manifest, if any.
   // Each field is already isQuantity-validated; absent fields use the defaults
-  // (memory from the chart, cpu fixed). Always emitted via this fixed template,
+  // (both cpu and memory from the chart). Always emitted via this fixed template,
   // so only validated scalars — never repo YAML — reach the generated file.
   resources?: ResourceValues;
 }): string {

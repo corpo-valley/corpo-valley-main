@@ -114,8 +114,13 @@ export const POSTGRES_IMAGE =
 // resource values the manifest generator reads back from a project's
 // hand-editable k8s/deployment.yaml — only a string that passes this is ever
 // interpolated into generated YAML or a k8s API object.
+// Mantissa, then an OPTIONAL tail that is EITHER a decimal exponent (e/E…) OR a
+// unit suffix — never both, and no leading sign. This matches what the k8s
+// apiserver actually accepts (a quantity is `<number><suffix>` where the
+// exponent IS a suffix form), so a value we accept here won't be rejected at
+// admission, and `quantityToNumber` parses exactly the same grammar.
 const QUANTITY_RE =
-  /^[+]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/;
+  /^(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+|m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/;
 
 export function isQuantity(s: string | undefined | null): s is string {
   return typeof s === 'string' && s.length > 0 && s.length <= 32 && QUANTITY_RE.test(s);
@@ -223,8 +228,13 @@ const QUANTITY_SUFFIX: Record<string, number> = {
   Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60,
 };
 export function quantityToNumber(s: string): number {
-  const m = /^[+]?(\d+(?:\.\d+)?|\.\d+)([eE][+-]?\d+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/.exec(s);
+  // Reuse QUANTITY_RE so this parses EXACTLY the grammar isQuantity accepts —
+  // they can never drift. Group 1 = mantissa, group 3 = the optional tail.
+  const m = QUANTITY_RE.exec(s);
   if (!m) return NaN;
-  const mantissa = Number(m[1] + (m[2] || ''));
-  return m[3] ? mantissa * QUANTITY_SUFFIX[m[3]] : mantissa;
+  const tail = m[3];
+  if (!tail) return Number(m[1]);
+  // The tail is either a decimal exponent or a unit suffix (mutually exclusive).
+  if (tail[0] === 'e' || tail[0] === 'E') return Number(m[1] + tail);
+  return Number(m[1]) * QUANTITY_SUFFIX[tail];
 }

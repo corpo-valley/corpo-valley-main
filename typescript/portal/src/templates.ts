@@ -2166,7 +2166,7 @@ export function renderAdminProjectResources(
         <label>${escapeHtml(f.label)}</label>
         <input type="text" name="${escapeHtml(f.key)}" value="${escapeHtml(f.value)}"
                placeholder="${escapeHtml(f.placeholder)}" autocomplete="off" spellcheck="false">
-        <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">${f.help}</div>
+        <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">${escapeHtml(f.help)}</div>
       </div>`;
 
   const sections = groups.map((g) => `

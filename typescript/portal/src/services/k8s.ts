@@ -17,7 +17,7 @@ import {
   TENANT_MAX_CPU, TENANT_MAX_CPU_REQUESTS, TENANT_MAX_CPU_PER_CONTAINER,
   TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST,
   TENANT_MAX_STORAGE, TENANT_MAX_PODS, TENANT_MAX_PVCS,
-  quantityToNumber,
+  quantityToNumber, isQuantity,
 } from './platform-config';
 
 const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
@@ -680,6 +680,10 @@ export async function reconcileTenantStorage(
   size: string,
 ): Promise<StorageReconcileEntry[] | null> {
   if (!k8sEnabled()) return null;
+  // Defensive: callers (routes/admin.ts) validate `size`, but this is exported —
+  // never let an unvalidated value reach a PVC patch (NaN comparisons would slip
+  // past the up-only/noop checks below).
+  if (!isQuantity(size)) throw new Error(`reconcileTenantStorage: invalid size ${JSON.stringify(size)}`);
   const ns = encodeURIComponent(slug);
   const want = quantityToNumber(size);
   const out: StorageReconcileEntry[] = [];
