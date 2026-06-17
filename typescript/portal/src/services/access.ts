@@ -180,6 +180,19 @@ export async function getGrantById(id: string): Promise<ProjectGrant | null> {
   return rows[0] ?? null;
 }
 
+// The existing grant for a (project, subject), if any. Used to locate the row
+// to revoke a facet from when an edit sets a facet to "none" (the UI knows the
+// subject, not the grant id).
+export async function findGrantBySubject(
+  projectId: string, subjectType: SubjectType, subjectId: string,
+): Promise<ProjectGrant | null> {
+  const { rows } = await pool.query<ProjectGrant>(
+    'SELECT * FROM project_grants WHERE project_id = $1 AND subject_type = $2 AND subject_id = $3',
+    [projectId, subjectType, subjectId]
+  );
+  return rows[0] ?? null;
+}
+
 // Upsert: granting the same subject again replaces its levels rather than
 // erroring, which is what an owner adjusting access expects.
 export async function upsertProjectGrant(grant: {
@@ -270,6 +283,22 @@ export async function listProjectsWithEveryoneRepoGrant(): Promise<Array<Project
     `SELECT p.*, g.repo_perm AS everyone_repo_perm
      FROM projects p JOIN project_grants g ON g.project_id = p.id
      WHERE g.subject_type = 'everyone' AND g.repo_perm IN ('read', 'write')`
+  );
+  return rows;
+}
+
+// Projects whose deployed site is shared org-wide — the `everyone` grant has a
+// non-null site_perm (read or write). This is the "internal / not-private" set
+// the Community Feed lists: any logged-in user can reach these sites, so they
+// belong in a browse view. Default-private projects (no everyone grant) and
+// repo-only shares (site_perm null) are excluded. Newest-first; the route
+// re-sorts for the creator / last-updated axes.
+export async function listProjectsWithEveryoneSiteGrant(): Promise<Array<Project & { everyone_site_perm: GrantLevel }>> {
+  const { rows } = await pool.query<Project & { everyone_site_perm: GrantLevel }>(
+    `SELECT p.*, g.site_perm AS everyone_site_perm
+     FROM projects p JOIN project_grants g ON g.project_id = p.id
+     WHERE g.subject_type = 'everyone' AND g.site_perm IN ('read', 'write')
+     ORDER BY p.created_at DESC`
   );
   return rows;
 }

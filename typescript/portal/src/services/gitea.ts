@@ -84,6 +84,29 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
+// One-shot inventory of every repo the platform admin token can see — all of
+// them, public AND private (verified against live Gitea: repos/search with the
+// cvportal admin token returns private repos too). Keyed by full_name
+// (`owner/repo`) → ISO `updated_at`. Powers the Community Feed's "last updated"
+// sort with a single call instead of one-per-project. Paginates because Gitea
+// caps a page at 50; stops when a page comes back short.
+export async function getRepoUpdatedAtMap(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (!giteaEnabled()) return map;
+  const limit = 50;
+  for (let page = 1; ; page++) {
+    const body = await call<{ data?: Array<{ full_name?: string; updated_at?: string }> }>(
+      `/repos/search?limit=${limit}&page=${page}`
+    );
+    const repos = body.data ?? [];
+    for (const r of repos) {
+      if (r.full_name && r.updated_at) map.set(r.full_name, r.updated_at);
+    }
+    if (repos.length < limit) break;
+  }
+  return map;
+}
+
 export interface GiteaUser {
   id: number;
   login: string;

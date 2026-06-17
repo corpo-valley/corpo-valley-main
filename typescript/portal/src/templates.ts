@@ -104,7 +104,11 @@ const CSS = `
   }
   input:focus { border-color: #e8b94a; box-shadow: 0 0 0 3px rgba(232,185,74,0.15); }
   input[type="hidden"] { display: none; }
-  button[type="submit"], input[type="submit"] {
+  /* Auth-page submit buttons (login/flow/recovery/settings) are full-width
+     green. Scoped with :not(.btn) so dashboard .btn submit buttons keep their
+     own variant styling (.btn-primary/.btn-secondary/.btn-danger) instead of
+     being overridden by this higher-specificity element rule. */
+  button[type="submit"]:not(.btn), input[type="submit"]:not(.btn) {
     width: 100%;
     padding: 0.75rem;
     background: #84a25a;
@@ -117,8 +121,8 @@ const CSS = `
     transition: background 0.15s, transform 0.1s;
     margin-top: 0.25rem;
   }
-  button[type="submit"]:hover, input[type="submit"]:hover { background: #93b366; }
-  button[type="submit"]:active { transform: scale(0.98); }
+  button[type="submit"]:not(.btn):hover, input[type="submit"]:not(.btn):hover { background: #93b366; }
+  button[type="submit"]:not(.btn):active { transform: scale(0.98); }
   .links {
     margin-top: 1.5rem;
     text-align: center;
@@ -192,7 +196,8 @@ const CSS = `
   .app-card-name { font-weight: 600; color: #fdf6e8; font-size: 1rem; }
   .app-card-sub { font-size: 0.8rem; color: #a89878; margin-bottom: 0.5rem; }
   .app-card-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
-  .btn { display: inline-block; padding: 0.4rem 0.75rem; border-radius: 5px; font-size: 0.85rem; text-decoration: none; border: none; cursor: pointer; font-weight: 500; text-align: center; }
+  .btn { display: inline-block; width: auto; padding: 0.4rem 0.75rem; border-radius: 5px; font-size: 0.85rem; text-decoration: none; border: none; cursor: pointer; font-weight: 500; text-align: center; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-primary { background: #84a25a; color: #1f2912; }
   .btn-primary:hover { background: #93b366; }
   .btn-secondary { background: #4a3c2c; color: #f3ead9; }
@@ -540,7 +545,7 @@ export function renderError(title: string, error: string, details?: string): str
     body += `<p><code>${escapeHtml(details)}</code></p>`;
   }
   body += `<div class="links" style="margin-top:2rem">
-    <a href="/login">Back to Login</a>
+    <a href="/">Back to Portal</a>
   </div></div>`;
   return layout(title, body);
 }
@@ -612,7 +617,7 @@ export function renderInfo(title: string, message: string): string {
     <h1>${escapeHtml(title)}</h1>
     <div class="message info">${escapeHtml(message)}</div>
     <div class="links" style="margin-top:2rem">
-      <a href="/login">Back to Login</a>
+      <a href="/">Back to Portal</a>
     </div>
   </div>`;
   return layout(title, body);
@@ -637,6 +642,7 @@ function dashboardLayout(
 ): string {
   const navItems: NavItem[] = [
     { label: 'Projects', href: '/', key: 'projects' },
+    { label: 'Community', href: '/community', key: 'community' },
     { label: 'Groups', href: '/groups', key: 'groups' },
     { label: 'Connect Claude Code', href: '/connect', key: 'connect' },
   ];
@@ -759,6 +765,179 @@ export interface GroupOptionRow {
 
 function accessBadge(value: string): string {
   return `<span class="badge badge-access">${escapeHtml(value)}</span>`;
+}
+
+// ── Community Feed ──────────────────────────────────────────
+
+// The sort axes the feed offers. `created`/`updated` render newest-first;
+// `creator` is alphabetical by email. Shared with routes/dashboard.ts so the
+// route and template agree on the valid set.
+export const COMMUNITY_SORTS = ['created', 'creator', 'updated'] as const;
+export type CommunitySort = (typeof COMMUNITY_SORTS)[number];
+
+// Sort direction. Validated by the route the same way `sort` is.
+export const COMMUNITY_DIRS = ['asc', 'desc'] as const;
+export type CommunityDir = (typeof COMMUNITY_DIRS)[number];
+
+// The default direction for each axis when a user first clicks it: dates go
+// newest-first (desc), creator goes A→Z (asc). Shared with the route so its
+// default matches the affordance the header advertises.
+export const COMMUNITY_DEFAULT_DIR: Record<CommunitySort, CommunityDir> = {
+  created: 'desc',
+  updated: 'desc',
+  creator: 'asc',
+};
+
+export interface CommunityRow {
+  name: string;
+  slug: string;
+  creator: string;   // owner email (or '—' if unresolved)
+  sitePerm: string;  // the everyone site grant: 'read' | 'write'
+  createdAt: string; // pre-formatted absolute date (tooltip)
+  updatedAt: string; // pre-formatted absolute date (tooltip)
+  createdRel: string; // relative "2d ago" label
+  updatedRel: string; // relative "3w ago" label
+}
+
+export function renderCommunityFeed(
+  email: string,
+  rows: CommunityRow[],
+  isAdmin: boolean,
+  sort: CommunitySort,
+  dir: CommunityDir,
+): string {
+  // A sortable column header. Clicking the ACTIVE column flips direction;
+  // clicking another switches to it with that column's sensible default. The
+  // active column shows ▲/▼ for its direction; inactive sortable columns show a
+  // dim ⇅ so it's clear they can be sorted too. Project & Access are not
+  // sortable and render as plain (.col-static) headers.
+  const sortHeader = (key: CommunitySort, label: string) => {
+    const active = sort === key;
+    const nextDir: CommunityDir = active
+      ? (dir === 'asc' ? 'desc' : 'asc')
+      : COMMUNITY_DEFAULT_DIR[key];
+    const caret = active
+      ? `<span class="sort-caret" aria-hidden="true">${dir === 'asc' ? '▲' : '▼'}</span>`
+      : `<span class="sort-caret sort-caret-idle" aria-hidden="true">⇅</span>`;
+    const ariaSort = active ? (dir === 'asc' ? 'ascending' : 'descending') : 'none';
+    return {
+      ariaSort,
+      html: `<a class="sort-link${active ? ' is-active' : ''}" href="/community?sort=${key}&dir=${nextDir}">${escapeHtml(label)}${caret}</a>`,
+    };
+  };
+
+  let body = `
+    <p class="tagline">Internal projects shared across the valley. Open one to see what folks are building.</p>
+  `;
+
+  if (rows.length === 0) {
+    body += `
+      <div class="app-card" style="text-align:center;padding:2rem 1.5rem;">
+        <div style="font-size:2rem;margin-bottom:0.5rem;">🏘️</div>
+        <h3 style="color:#fdf6e8;margin:0 0 0.35rem 0;">Nothing shared yet</h3>
+        <p class="help" style="margin-bottom:0;">No internal projects are visible right now. When someone shares a project's site with everyone, it shows up here.</p>
+      </div>
+    `;
+    return dashboardLayout('Community Feed', body, email, isAdmin, 'community');
+  }
+
+  const creatorH = sortHeader('creator', 'Creator');
+  const createdH = sortHeader('created', 'Created');
+  const updatedH = sortHeader('updated', 'Last updated');
+
+  body += `
+    <style>
+      .cf-filter-wrap { margin: 1rem 0 0; }
+      .cf-filter {
+        width: 100%; max-width: 22rem; box-sizing: border-box;
+        padding: 0.5rem 0.7rem; border-radius: 6px;
+        border: 1px solid #5a4a36; background: #2a2118; color: #fdf6e8;
+        font-size: 0.9rem;
+      }
+      .cf-filter::placeholder { color: #a89878; }
+      .cf-filter:focus { outline: none; border-color: #e8b94a; }
+      .table th.col-static { color: #8a7a5e; font-weight: 600; }
+      .table th .sort-link { color: #c4b698; display: inline-flex; align-items: center; gap: 0.3rem; }
+      .table th .sort-link:hover { color: #e8b94a; text-decoration: none; }
+      .table th .sort-link.is-active { color: #e8b94a; }
+      .sort-caret { font-size: 0.7rem; }
+      .sort-caret-idle { color: #6f5e44; }
+      .table th .sort-link:hover .sort-caret-idle { color: #c4b698; }
+      .table tr.cf-row { cursor: pointer; }
+      .table tr.cf-row:hover td { background: #3a2e22; }
+      .cf-nomatch { display: none; }
+      .cf-nomatch td { color: #a89878; text-align: center; padding: 1.5rem 0.75rem; font-style: italic; }
+    </style>
+    <div class="cf-filter-wrap">
+      <input type="text" id="cf-filter" class="cf-filter" placeholder="Filter by project or creator…"
+             aria-label="Filter projects by name or creator" autocomplete="off">
+    </div>
+    <div class="table-wrap"><table class="table" id="cf-table">
+      <thead><tr>
+        <th class="col-static">Project</th>
+        <th class="col-static">Access</th>
+        <th aria-sort="${creatorH.ariaSort}">${creatorH.html}</th>
+        <th aria-sort="${createdH.ariaSort}">${createdH.html}</th>
+        <th aria-sort="${updatedH.ariaSort}">${updatedH.html}</th>
+      </tr></thead>
+      <tbody>`;
+  for (const r of rows) {
+    const host = `${escapeHtml(r.slug)}.${escapeHtml(PROJECTS_DOMAIN)}`;
+    const siteUrl = projectSiteUrl(escapeHtml(r.slug));
+    body += `
+        <tr class="cf-row" data-href="${siteUrl}" data-name="${escapeHtml(r.name)}" data-creator="${escapeHtml(r.creator)}">
+          <td>
+            <a href="${siteUrl}" target="_blank" rel="noopener">${escapeHtml(r.name)} ↗</a>
+            <div class="help" style="margin:0;">${host}</div>
+          </td>
+          <td>${accessBadge(r.sitePerm)}</td>
+          <td>${escapeHtml(r.creator)}</td>
+          <td><span title="${escapeHtml(r.createdAt)}">${escapeHtml(r.createdRel)}</span></td>
+          <td><span title="${escapeHtml(r.updatedAt)}">${escapeHtml(r.updatedRel)}</span></td>
+        </tr>`;
+  }
+  body += `
+        <tr class="cf-nomatch"><td colspan="5">No projects match your filter.</td></tr>
+      </tbody></table></div>
+    <script nonce="${cspNonce()}">
+      (function(){
+        var input = document.getElementById('cf-filter');
+        var table = document.getElementById('cf-table');
+        if (!table) return;
+        var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr.cf-row'));
+        var noMatch = table.querySelector('tbody tr.cf-nomatch');
+
+        // Live client-side filter on project name OR creator (case-insensitive).
+        if (input) {
+          input.addEventListener('input', function(){
+            var q = input.value.trim().toLowerCase();
+            var shown = 0;
+            rows.forEach(function(tr){
+              var name = (tr.getAttribute('data-name') || '').toLowerCase();
+              var creator = (tr.getAttribute('data-creator') || '').toLowerCase();
+              var hit = !q || name.indexOf(q) !== -1 || creator.indexOf(q) !== -1;
+              tr.style.display = hit ? '' : 'none';
+              if (hit) shown++;
+            });
+            if (noMatch) noMatch.style.display = shown === 0 ? 'table-row' : 'none';
+          });
+        }
+
+        // Whole-row click opens the project site in a new tab. Real links and
+        // text selections are left alone.
+        rows.forEach(function(tr){
+          tr.addEventListener('click', function(ev){
+            if (ev.target.closest('a')) return;
+            var sel = window.getSelection && window.getSelection();
+            if (sel && String(sel).length) return;
+            var href = tr.getAttribute('data-href');
+            if (href) window.open(href, '_blank', 'noopener');
+          });
+        });
+      })();
+    </script>`;
+
+  return dashboardLayout('Community Feed', body, email, isAdmin, 'community');
 }
 
 export function renderProjects(
@@ -1162,62 +1341,117 @@ claude`
     </script>
   ` : '';
 
-  // ── Access section: two facets — Project (the deployed site's X-CV-Perm
-  // class) shown FIRST, then Repo (the Gitea permission) — each rendered as
-  // Read / Write / Admin rows listing the users, groups, and the virtual
-  // "Everyone" subject granted that level. Each facet has its own add form;
-  // "Everyone" is offered read/write only (admin filtered client-side, refused
-  // server-side). Each chip's × revokes that one facet for that subject.
-  const accessFacets = [
-    { key: 'site', title: 'Project Access', help: 'What a member can do on the deployed site — your code reads the <code>X-CV-Perm</code> header (read &lt; write &lt; admin; without read the request is blocked at the edge).' },
-    { key: 'repo', title: 'Repo Access', help: 'Permission on the project&rsquo;s Gitea repository (read &lt; write &lt; admin).' },
-  ];
-  const permFor = (g: ProjectGrantRow, facet: string) => (facet === 'site' ? g.site_perm : g.repo_perm);
-  const grantChip = (g: ProjectGrantRow, facet: string) => `
-    <span class="grant-chip">
-      ${escapeHtml(g.subject_name || '(unknown)')}<span class="grant-chip-type">${escapeHtml(g.subject_type)}</span>
-      <form method="POST" action="/projects/${escapeHtml(project.id)}/access/${escapeHtml(g.id)}/revoke" class="inline-form" style="display:inline;">
-        ${csrf}
-        <input type="hidden" name="facet" value="${escapeHtml(facet)}">
-        <button type="submit" class="grant-chip-x" title="Revoke">&times;</button>
-      </form>
-    </span>`;
-  const accessLevelRow = (facet: string, level: string) => {
-    const subjects = grants.filter((g) => permFor(g, facet) === level);
+  // ── Share panel: a people-centric "Manage access" view (Google Docs / GitHub
+  // style) over the same grant model. Three parts: General access (the
+  // org-wide "Everyone" subject → Private vs Internal), a People-with-access
+  // list (one row per user/group grant, Site + Repo levels both editable
+  // inline), and one unified Add form. All wired to the existing
+  // /access + /access/:id/revoke endpoints.
+  const accessAction = `/projects/${escapeHtml(project.id)}/access`;
+
+  // A compact <select> that POSTs a single facet on change (none = revoke).
+  // Used for inline edits in the people list and the general-access control.
+  const facetSelect = (opts: {
+    name: string; facet: 'site' | 'repo'; current: string | null;
+    subjectType: string; identifier?: string | null; allowAdmin?: boolean; label: string;
+  }) => {
+    const levels = opts.allowAdmin === false ? ['read', 'write'] : ['read', 'write', 'admin'];
+    const cur = opts.current || 'none';
+    const options = [`<option value="none"${cur === 'none' ? ' selected' : ''}>No access</option>`]
+      .concat(levels.map((l) => `<option value="${l}"${cur === l ? ' selected' : ''}>${l}</option>`))
+      .join('');
     return `
-      <div class="grant-row">
-        <span class="grant-level-label">${escapeHtml(level)}</span>
-        <span class="grant-chips">${subjects.length ? subjects.map((g) => grantChip(g, facet)).join('') : '<span class="help" style="margin:0;">—</span>'}</span>
-      </div>`;
+      <form method="POST" action="${accessAction}" class="js-facet-form inline-form" style="display:inline;">
+        ${csrf}
+        <input type="hidden" name="subject_type" value="${escapeHtml(opts.subjectType)}">
+        ${opts.identifier != null ? `<input type="hidden" name="identifier" value="${escapeHtml(opts.identifier)}">` : ''}
+        <input type="hidden" name="facet" value="${escapeHtml(opts.facet)}">
+        <label class="share-select-label">${escapeHtml(opts.label)}
+          <select name="level" class="js-facet-select">${options}</select>
+        </label>
+        <noscript><button type="submit" class="btn btn-secondary btn-sm">Set</button></noscript>
+      </form>`;
   };
-  const accessFacetSection = (facet: string, title: string, help: string) => `
-    <h4 style="margin:1.1rem 0 0.2rem 0;color:#fdf6e8;font-size:0.95rem;">${escapeHtml(title)}</h4>
-    <p class="help" style="margin-bottom:0.5rem;">${help}</p>
-    <div class="grant-rows">
-      ${['read', 'write', 'admin'].map((l) => accessLevelRow(facet, l)).join('')}
-    </div>
-    <form method="POST" action="/projects/${escapeHtml(project.id)}/access" class="js-grant-add" style="display:flex;flex-wrap:wrap;gap:0.4rem;align-items:flex-end;margin-top:0.5rem;">
+
+  // General access (Everyone). Private = no everyone grant (or all-null);
+  // Internal = everyone has a site read/write grant.
+  const everyone = grants.find((g) => g.subject_type === 'everyone');
+  const everyoneSite = everyone?.site_perm ?? null;
+  const isInternal = everyoneSite === 'read' || everyoneSite === 'write';
+  const generalAccess = `
+    <div class="share-general">
+      <div class="share-general-icon" aria-hidden="true">${isInternal ? '🌐' : '🔒'}</div>
+      <div class="share-general-text">
+        <div class="share-general-title">${isInternal ? 'Internal' : 'Private'}</div>
+        <div class="help" style="margin:0;">${isInternal
+          ? `Anyone signed in can view the site (${escapeHtml(everyoneSite!)}).`
+          : 'Only you, your bot, and the people you add below can reach it.'}</div>
+      </div>
+      <div class="share-general-control">
+        ${facetSelect({
+          name: 'everyone', facet: 'site', current: everyoneSite,
+          subjectType: 'everyone', allowAdmin: false, label: 'General access',
+        })}
+      </div>
+    </div>`;
+
+  // People list — one row per non-everyone grant, Site + Repo both editable.
+  const people = grants.filter((g) => g.subject_type !== 'everyone');
+  const personRow = (g: ProjectGrantRow) => `
+    <div class="share-person">
+      <div class="share-person-id">
+        <span class="share-person-name">${escapeHtml(g.subject_name || '(unknown)')}</span>
+        <span class="badge badge-access share-person-type">${escapeHtml(g.subject_type)}</span>
+      </div>
+      <div class="share-person-perms">
+        ${facetSelect({ name: 'site', facet: 'site', current: g.site_perm, subjectType: g.subject_type, identifier: g.subject_name, label: 'Site' })}
+        ${facetSelect({ name: 'repo', facet: 'repo', current: g.repo_perm, subjectType: g.subject_type, identifier: g.subject_name, label: 'Repo' })}
+        <form method="POST" action="/projects/${escapeHtml(project.id)}/access/${escapeHtml(g.id)}/revoke" class="inline-form" style="display:inline;"
+              data-confirm="Remove ${escapeHtml(g.subject_name || 'this subject')}'s access entirely?">
+          ${csrf}
+          <input type="hidden" name="all" value="true">
+          <button type="submit" class="share-remove" title="Remove access" aria-label="Remove ${escapeHtml(g.subject_name || 'subject')}">&times;</button>
+        </form>
+      </div>
+    </div>`;
+  const peopleList = people.length
+    ? `<div class="share-people">${people.map(personRow).join('')}</div>`
+    : `<p class="help share-empty">Just you and your bot — no one else has access yet.</p>`;
+
+  // Unified add form — one identifier + Site/Repo level pickers (submitted as
+  // site_level/repo_level so a single POST can set both areas at once).
+  const noneFirst = () =>
+    [`<option value="none" selected>No access</option>`]
+      .concat(['read', 'write', 'admin'].map((l) => `<option value="${l}">${l}</option>`))
+      .join('');
+  const addForm = `
+    <form method="POST" action="${accessAction}" class="share-add">
       ${csrf}
-      <input type="hidden" name="facet" value="${escapeHtml(facet)}">
-      <div class="field" style="margin:0;">
-        <label>Subject</label>
-        <select name="subject_type" class="js-subject">
-          <option value="user">user</option>
-          <option value="group">group</option>
-          <option value="everyone">everyone</option>
-        </select>
+      <div class="share-add-row">
+        <div class="field" style="margin:0;">
+          <label for="share-subject-type">Type</label>
+          <select id="share-subject-type" name="subject_type" class="js-add-subject">
+            <option value="user">user</option>
+            <option value="group">group</option>
+          </select>
+        </div>
+        <div class="field js-add-id-wrap" style="margin:0;flex:2;min-width:12rem;">
+          <label for="share-identifier">Email / username / group name</label>
+          <input type="text" id="share-identifier" name="identifier" class="js-add-id"
+                 placeholder="alice@example.com or platform-team" autocomplete="off">
+        </div>
+        <div class="field" style="margin:0;">
+          <label for="share-site-level">Site</label>
+          <select id="share-site-level" name="site_level">${noneFirst()}</select>
+        </div>
+        <div class="field" style="margin:0;">
+          <label for="share-repo-level">Repo</label>
+          <select id="share-repo-level" name="repo_level">${noneFirst()}</select>
+        </div>
+        <button type="submit" class="btn btn-primary btn-sm">Add</button>
       </div>
-      <div class="field js-identifier-wrap" style="margin:0;flex:2;min-width:12rem;">
-        <label>Email / username / group</label>
-        <input type="text" name="identifier" class="js-identifier" placeholder="alice@example.com or platform-team">
-      </div>
-      <div class="field" style="margin:0;">
-        <label>Level</label>
-        <select name="level" class="js-level">${selectOptions(GRANT_LEVEL_OPTS, 'read')}</select>
-      </div>
-      <button type="submit" class="btn btn-primary btn-sm">Add</button>
+      <p class="help" style="margin:0.4rem 0 0;">Pick a level for Site, Repo, or both. <strong>Site</strong> is the deployed website; <strong>Repo</strong> is the Gitea source. The highest applicable level wins; you always have admin on both.</p>
     </form>`;
-  const accessSection = accessFacets.map((f) => accessFacetSection(f.key, f.title, f.help)).join('');
 
   // ── Configure card: Sealed Secrets + Access settings, grouped because
   // both are "settings on the running project". Sub-sections inside the
@@ -1251,50 +1485,69 @@ claude`
 
       <hr style="border:none;border-top:1px solid #5a4a36;margin:1.5rem 0 1rem 0;" />
 
-      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Access</h4>
-      <p class="help" style="margin-bottom:0.5rem;">
-        <strong>Private by default</strong> — only you and your bot. Widen access by granting
-        users, groups, or <strong>Everyone</strong> (every signed-in member) below. Two areas:
-        <strong>Project</strong> (the deployed site) and <strong>Repo</strong> (the Gitea source).
-        The highest applicable level wins; you always have admin on both. &ldquo;Everyone&rdquo; can
-        be granted read or write, never admin.
-      </p>
-      ${accessSection}
+      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Share</h4>
+      <p class="help" style="margin-bottom:0.85rem;"><strong>Private by default</strong> — only you and your bot can reach this project. Add people below, or open the site to everyone signed in.</p>
+
+      <div class="share-block-label">General access</div>
+      ${generalAccess}
+
+      <div class="share-block-label" style="margin-top:1.1rem;">People with access</div>
+      ${peopleList}
+
+      <div class="share-block-label" style="margin-top:1.1rem;">Add people</div>
+      ${addForm}
+
       ${groups.length > 0
-        ? `<p class="help" style="margin-top:0.7rem;">Groups: ${groups.map((g) => `<code>${escapeHtml(g.name)}</code> (${g.memberCount})`).join(', ')} — manage under <a href="/groups" style="color:#e8b94a;">Groups</a>.</p>`
-        : `<p class="help" style="margin-top:0.7rem;">No groups exist yet — create one under <a href="/groups" style="color:#e8b94a;">Groups</a> to grant many members at once.</p>`}
+        ? `<p class="help" style="margin-top:0.85rem;">Tip: add a <strong>group</strong> by name to grant many members at once. Groups: ${groups.map((g) => `<code>${escapeHtml(g.name)}</code> (${g.memberCount})`).join(', ')} — manage under <a href="/groups" style="color:#e8b94a;">Groups</a>.</p>`
+        : `<p class="help" style="margin-top:0.85rem;">Tip: create a <a href="/groups" style="color:#e8b94a;">group</a> to grant many members at once, then add it by name above.</p>`}
+
+      <details class="share-dev">
+        <summary>For developers</summary>
+        <p class="help" style="margin:0.5rem 0 0;"><strong>Site</strong> levels are surfaced to your code as the <code>X-CV-Perm</code> header (read &lt; write &lt; admin); without read the request is blocked at the edge. <strong>Repo</strong> levels map onto Gitea collaborator permissions on the project&rsquo;s source repository.</p>
+      </details>
+
       <style>
-        .grant-rows { display:flex; flex-direction:column; gap:0.3rem; }
-        .grant-row { display:flex; align-items:flex-start; gap:0.5rem; }
-        .grant-level-label { display:inline-block; min-width:3.5rem; padding-top:0.15rem; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.04em; color:#a89878; }
-        .grant-chips { display:flex; flex-wrap:wrap; gap:0.35rem; }
-        .grant-chip { display:inline-flex; align-items:center; gap:0.3rem; background:#3a3120; border:1px solid #5a4a36; border-radius:999px; padding:0.1rem 0.55rem; font-size:0.82rem; color:#fdf6e8; }
-        .grant-chip-type { font-size:0.66rem; color:#a89878; text-transform:uppercase; }
-        .grant-chip-x { background:none; border:none; color:#cc9988; cursor:pointer; font-size:1rem; line-height:1; padding:0; }
-        .grant-chip-x:hover { color:#e8b94a; }
+        .share-block-label { font-size:0.78rem; text-transform:uppercase; letter-spacing:0.04em; color:#a89878; margin-bottom:0.4rem; font-weight:600; }
+        .share-general { display:flex; align-items:center; gap:0.75rem; background:#3a3120; border:1px solid #5a4a36; border-radius:8px; padding:0.65rem 0.85rem; }
+        .share-general-icon { font-size:1.3rem; line-height:1; }
+        .share-general-text { flex:1; min-width:0; }
+        .share-general-title { font-weight:600; color:#fdf6e8; font-size:0.95rem; }
+        .share-general-control { flex-shrink:0; }
+        .share-select-label { display:inline-flex; align-items:center; gap:0.35rem; margin:0; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.03em; color:#a89878; font-weight:600; }
+        .share-people { display:flex; flex-direction:column; gap:0.4rem; }
+        .share-person { display:flex; align-items:center; justify-content:space-between; gap:0.75rem; background:#3a3120; border:1px solid #5a4a36; border-radius:8px; padding:0.5rem 0.75rem; flex-wrap:wrap; }
+        .share-person-id { display:flex; align-items:center; gap:0.5rem; min-width:0; }
+        .share-person-name { color:#fdf6e8; font-size:0.9rem; word-break:break-all; }
+        .share-person-type { flex-shrink:0; }
+        .share-person-perms { display:flex; align-items:center; gap:0.6rem; flex-wrap:wrap; }
+        .share-remove { background:none; border:none; color:#cc9988; cursor:pointer; font-size:1.15rem; line-height:1; padding:0 0.15rem; }
+        .share-remove:hover { color:#f3a5a5; }
+        .share-empty { background:#3a3120; border:1px dashed #5a4a36; border-radius:8px; padding:0.75rem; margin:0; }
+        .share-add-row { display:flex; flex-wrap:wrap; gap:0.5rem; align-items:flex-end; }
+        .share-dev { margin-top:0.85rem; }
+        .share-dev summary { cursor:pointer; color:#a89878; font-size:0.85rem; }
+        .share-dev summary:hover { color:#fdf6e8; }
+        @media (max-width: 768px) {
+          .share-person-perms { gap:0.4rem; }
+          .share-add-row { flex-direction:column; align-items:stretch; }
+          .share-add-row .btn { width:100%; }
+        }
       </style>
       <script nonce="${cspNonce()}">
         (function(){
-          document.querySelectorAll('.js-grant-add').forEach(function(form){
-            var subj = form.querySelector('.js-subject');
-            var idWrap = form.querySelector('.js-identifier-wrap');
-            var id = form.querySelector('.js-identifier');
-            var level = form.querySelector('.js-level');
-            var adminOpt = level ? level.querySelector('option[value="admin"]') : null;
-            function sync(){
-              var everyone = subj.value === 'everyone';
-              // Everyone needs no identifier and cannot be granted admin.
-              if (idWrap) idWrap.style.display = everyone ? 'none' : '';
-              if (id) id.disabled = everyone;
-              if (adminOpt){
-                adminOpt.disabled = everyone;
-                adminOpt.hidden = everyone;
-                if (everyone && level.value === 'admin') level.value = 'write';
-              }
-            }
-            subj && subj.addEventListener('change', sync);
-            sync();
+          // Inline facet selects auto-submit on change (no Set button needed).
+          document.querySelectorAll('.js-facet-form .js-facet-select').forEach(function(sel){
+            sel.addEventListener('change', function(){ sel.form.submit(); });
           });
+          // Add form: group identifier hint placeholder (cosmetic only).
+          var addSubject = document.querySelector('.share-add .js-add-subject');
+          var addId = document.querySelector('.share-add .js-add-id');
+          if (addSubject && addId){
+            addSubject.addEventListener('change', function(){
+              addId.placeholder = addSubject.value === 'group'
+                ? 'platform-team' : 'alice@example.com';
+            });
+          }
         })();
       </script>
     </div>
@@ -1369,12 +1622,42 @@ claude`
   const dangerCard = `
     <div class="app-card" style="margin-top:1.25rem;border-color:#7f3d1d;">
       <h3 style="margin:0 0 0.35rem 0;color:#f3a5a5;">Danger zone</h3>
-      <p class="help" style="margin-bottom:0.75rem;">Deleting removes this project record from the portal. Your Gitea repository and cluster namespace are not removed automatically — clean those up separately if you want them gone.</p>
+      <p class="help" style="margin-bottom:0.75rem;">
+        Deleting <strong>tears down everything</strong>: the Gitea repository, the
+        ArgoCD deployment, and the entire <code>${escapeHtml(project.slug)}</code>
+        cluster namespace — including any database, file storage, and their data
+        volumes. This is permanent and <strong>cannot be undone.</strong>
+      </p>
       <form method="POST" action="/projects/${escapeHtml(project.id)}/delete"
-            data-confirm="Delete project ${escapeHtml(project.slug)}? This cannot be undone.">
+            class="cv-delete-form"
+            data-confirm="Delete project ${escapeHtml(project.slug)}? This permanently removes the repo, deployment, and namespace (data included) and cannot be undone.">
         ${csrf}
-        <button type="submit" class="btn btn-danger">Delete project</button>
+        <div class="field" style="max-width:22rem;">
+          <label for="cv-delete-confirm">Type <code>${escapeHtml(project.slug)}</code> to confirm</label>
+          <input type="text" id="cv-delete-confirm" class="cv-delete-confirm"
+                 autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                 aria-describedby="cv-delete-hint" placeholder="${escapeHtml(project.slug)}">
+        </div>
+        <button type="submit" class="btn btn-danger cv-delete-btn">Delete project</button>
       </form>
+      <style>
+        .cv-delete-form input.cv-delete-confirm { width:100%; }
+      </style>
+      <script nonce="${cspNonce()}">
+        (function(){
+          var form = document.currentScript.closest('.app-card').querySelector('.cv-delete-form');
+          if (!form) return;
+          var input = form.querySelector('.cv-delete-confirm');
+          var btn = form.querySelector('.cv-delete-btn');
+          var slug = ${JSON.stringify(project.slug)};
+          if (!input || !btn) return;
+          // JS-enabled: gate the button on an exact slug match. (No-JS callers
+          // keep the enabled button + the data-confirm dialog as a fallback.)
+          function sync(){ btn.disabled = input.value.trim() !== slug; }
+          input.addEventListener('input', sync);
+          sync();
+        })();
+      </script>
     </div>
   `;
 
