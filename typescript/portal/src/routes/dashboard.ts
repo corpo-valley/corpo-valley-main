@@ -15,7 +15,7 @@ import {
   GrantLevel,
 } from '../services/projects';
 import {
-  listProjectGrants, upsertProjectGrant, getGrantById,
+  listProjectGrants, upsertProjectGrant, getGrantById, findGrantBySubject,
   setGrantFacet, revokeGrantFacet, getEveryoneGrants,
   getGroupByName, listGroups, listProjectsSharedWith,
   listProjectsWithEveryoneSiteGrant,
@@ -61,6 +61,7 @@ import {
   renderKeyManagement, renderNewKeyDisplay, renderError,
   renderGiteaCliTokenReveal, renderCommunityFeed,
   ProjectRow, ApiKeyRow, CommunityRow, COMMUNITY_SORTS, CommunitySort,
+  COMMUNITY_DIRS, CommunityDir, COMMUNITY_DEFAULT_DIR,
 } from '../templates';
 import * as crypto from 'crypto';
 
@@ -180,6 +181,11 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
     const sortParam = String(req.query.sort || '');
     const sort: CommunitySort = (COMMUNITY_SORTS as readonly string[]).includes(sortParam)
       ? (sortParam as CommunitySort) : 'created';
+    // Direction: validated against the allowlist; if omitted/invalid, fall back
+    // to the axis's sensible default (dates → desc/newest-first, creator → asc).
+    const dirParam = String(req.query.dir || '');
+    const dir: CommunityDir = (COMMUNITY_DIRS as readonly string[]).includes(dirParam)
+      ? (dirParam as CommunityDir) : COMMUNITY_DEFAULT_DIR[sort];
 
     const projects = await listProjectsWithEveryoneSiteGrant();
     const [identities, repoUpdated] = await Promise.all([
@@ -207,18 +213,44 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       };
     });
 
-    // Sort: created/updated newest-first, creator alphabetical (case-insensitive).
-    // created/updated are timestamps — pg hands back `created_at` as a Date and
-    // Gitea's `updated_at` is an ISO string, so compare by epoch millis (works
-    // for both) rather than localeCompare, which only exists on strings.
+    // Sort: created/updated by timestamp, creator alphabetical
+    // (case-insensitive). created/updated are timestamps — pg hands back
+    // `created_at` as a Date and Gitea's `updated_at` is an ISO string, so
+    // compare by epoch millis (works for both) rather than localeCompare, which
+    // only exists on strings. A base comparator yields ascending order; `dir`
+    // flips it to descending. Defaults (created/updated → desc, creator → asc)
+    // are applied in the route above so the URL the headers link to matches.
     const ms = (v: string | Date) => { const t = new Date(v).getTime(); return Number.isNaN(t) ? 0 : t; };
-    enriched.sort((a, b) => {
+    const cmp = (a: typeof enriched[number], b: typeof enriched[number]) => {
       if (sort === 'creator') return a.creator.localeCompare(b.creator, undefined, { sensitivity: 'base' });
-      if (sort === 'updated') return ms(b.updatedIso) - ms(a.updatedIso);
-      return ms(b.createdIso) - ms(a.createdIso);
-    });
+      if (sort === 'updated') return ms(a.updatedIso) - ms(b.updatedIso);
+      return ms(a.createdIso) - ms(b.createdIso);
+    };
+    enriched.sort((a, b) => (dir === 'asc' ? cmp(a, b) : -cmp(a, b)));
 
-    const fmt = (iso: string) => (iso ? new Date(iso).toLocaleDateString() : '—');
+    const fmt = (iso: string | Date) => (iso ? new Date(iso).toLocaleDateString() : '—');
+    // Relative "2d ago" / "3w ago" label for a timestamp, computed server-side.
+    const rel = (iso: string | Date): string => {
+      if (!iso) return '—';
+      const t = new Date(iso).getTime();
+      if (Number.isNaN(t)) return '—';
+      const diff = Date.now() - t;
+      if (diff < 0) return 'just now';
+      const sec = Math.floor(diff / 1000);
+      if (sec < 60) return 'just now';
+      const min = Math.floor(sec / 60);
+      if (min < 60) return `${min}m ago`;
+      const hr = Math.floor(min / 60);
+      if (hr < 24) return `${hr}h ago`;
+      const day = Math.floor(hr / 24);
+      if (day < 7) return `${day}d ago`;
+      const wk = Math.floor(day / 7);
+      if (wk < 5) return `${wk}w ago`;
+      const mo = Math.floor(day / 30);
+      if (mo < 12) return `${mo}mo ago`;
+      const yr = Math.floor(day / 365);
+      return `${yr}y ago`;
+    };
     const rows: CommunityRow[] = enriched.map((e) => ({
       name: e.name,
       slug: e.slug,
@@ -226,9 +258,11 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       sitePerm: e.sitePerm,
       createdAt: fmt(e.createdIso),
       updatedAt: fmt(e.updatedIso),
+      createdRel: rel(e.createdIso),
+      updatedRel: rel(e.updatedIso),
     }));
 
-    res.send(renderCommunityFeed(session.email, rows, isAdmin, sort));
+    res.send(renderCommunityFeed(session.email, rows, isAdmin, sort, dir));
   } catch (err: any) {
     console.error('Community feed error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load the community feed.'));
@@ -700,13 +734,62 @@ router.post('/projects/:id/storage/disable', requireSession, requireVerifiedEmai
   }
 });
 
-// POST /projects/:id/access — grant a subject (user, group, or everyone) a
-// level on ONE area (owner only). Form: `facet` ('site'|'repo'), `level`
-// ('read'|'write'|'admin'), `subject_type` ('user'|'group'|'everyone'),
-// `identifier` (email/username or group name; unused for everyone). The two
-// areas are edited independently — a grant the subject already holds on the
-// OTHER area is preserved. Site access takes effect within seconds (the edge
-// auth endpoint reads the DB live); repo grants converge Gitea collaborators.
+// Resolve the subject named in an access form into the fields setGrantFacet
+// needs. Returns either a resolved subject or an error (status + message) the
+// caller renders. Enforces the bot/owner/group-exists rules shared by every
+// facet operation. `everyone` needs no identifier.
+type ResolvedSubject = {
+  subjectType: SubjectType; subjectId: string;
+  subjectName: string | null; giteaUsername?: string | null;
+};
+async function resolveGrantSubject(
+  project: { id: string; owner_id: string },
+  rawSubject: any,
+  identifier: string,
+): Promise<{ subject: ResolvedSubject } | { error: { status: number; title: string; message: string } }> {
+  const subjectType: SubjectType =
+    rawSubject === 'group' ? 'group' : rawSubject === 'everyone' ? 'everyone' : 'user';
+
+  if (subjectType === 'everyone') {
+    return { subject: { subjectType, subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME } };
+  }
+  if (subjectType === 'group') {
+    if (!identifier) return { error: { status: 400, title: 'Invalid Input', message: 'Provide a group name.' } };
+    const group = await getGroupByName(identifier.toLowerCase());
+    if (!group) return { error: { status: 404, title: 'Not Found', message: `No group named "${identifier}". Create it under Groups first.` } };
+    return { subject: { subjectType, subjectId: group.id, subjectName: group.name } };
+  }
+  // user
+  if (!identifier || identifier.length > 254) {
+    return { error: { status: 400, title: 'Invalid Input', message: 'Provide a user email or username.' } };
+  }
+  const identity = identifier.includes('@')
+    ? await findIdentityByEmail(identifier)
+    : await findIdentityByUsername(identifier);
+  if (!identity) return { error: { status: 404, title: 'Not Found', message: `No Corpo Valley member matches "${identifier}".` } };
+  const meta = (identity.metadata_public ?? {}) as Record<string, any>;
+  if (meta.type === 'bot') return { error: { status: 400, title: 'Invalid Subject', message: 'Bot identities cannot be granted access directly.' } };
+  if (identity.id === project.owner_id) return { error: { status: 400, title: 'Invalid Subject', message: 'The owner already has full access.' } };
+  const traits = (identity.traits ?? {}) as Record<string, any>;
+  return { subject: {
+    subjectType, subjectId: identity.id,
+    subjectName: traits.email || traits.preferred_username || identity.id,
+    giteaUsername: giteaUsernameForIdentity(identity),
+  } };
+}
+
+// POST /projects/:id/access — set a subject's (user, group, or everyone) access
+// on ONE OR BOTH areas (owner only). Form:
+//   - `subject_type` ('user'|'group'|'everyone') + `identifier`
+//     (email/username or group name; unused for everyone).
+//   - SINGLE-FACET (inline edit) contract: `facet` ('site'|'repo') + `level`
+//     ('read'|'write'|'admin', or 'none'/'' to revoke that facet).
+//   - BOTH-FACET (unified add form) contract: `site_level` and/or `repo_level`
+//     (each 'read'|'write'|'admin' to set, 'none'/'' to leave/clear). Used when
+//     `facet` is absent.
+// Areas are still applied independently — an untouched area is preserved. Site
+// access takes effect within seconds (the edge auth endpoint reads the DB
+// live); repo grants converge Gitea collaborators.
 router.post('/projects/:id/access', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
@@ -715,76 +798,74 @@ router.post('/projects/:id/access', requireSession, requireVerifiedEmail, async 
       res.status(404).send(renderError('Not Found', 'Project not found.'));
       return;
     }
-    const facet: GrantFacet = req.body?.facet === 'repo' ? 'repo' : 'site';
-    const rawLevel = String(req.body?.level || '');
-    if (!isGrantLevel(rawLevel)) {
-      res.status(400).send(renderError('Invalid Input', 'Level must be read, write, or admin.'));
+
+    // Build the list of facet operations. `null` level => revoke that facet.
+    type FacetOp = { facet: GrantFacet; level: GrantLevel | null };
+    const ops: FacetOp[] = [];
+    const parseLevel = (v: any): { ok: true; level: GrantLevel | null } | { ok: false } => {
+      const s = String(v ?? '').trim();
+      if (s === '' || s === 'none') return { ok: true, level: null };
+      if (isGrantLevel(s)) return { ok: true, level: s };
+      return { ok: false };
+    };
+
+    if (req.body?.facet === 'site' || req.body?.facet === 'repo') {
+      // Single-facet contract (inline selects + legacy callers).
+      const facet: GrantFacet = req.body.facet === 'repo' ? 'repo' : 'site';
+      const parsed = parseLevel(req.body?.level);
+      if (!parsed.ok) {
+        res.status(400).send(renderError('Invalid Input', 'Level must be read, write, admin, or none.'));
+        return;
+      }
+      ops.push({ facet, level: parsed.level });
+    } else {
+      // Both-facet contract (unified add form). At least one must be set.
+      for (const facet of ['site', 'repo'] as GrantFacet[]) {
+        const key = facet === 'site' ? 'site_level' : 'repo_level';
+        const parsed = parseLevel(req.body?.[key]);
+        if (!parsed.ok) {
+          res.status(400).send(renderError('Invalid Input', 'Level must be read, write, admin, or none.'));
+          return;
+        }
+        if (parsed.level !== null) ops.push({ facet, level: parsed.level });
+      }
+      if (ops.length === 0) {
+        res.status(400).send(renderError('Invalid Input', 'Pick a level for Site and/or Repo access.'));
+        return;
+      }
+    }
+
+    const resolved = await resolveGrantSubject(project, req.body?.subject_type, String(req.body?.identifier || '').trim());
+    if ('error' in resolved) {
+      res.status(resolved.error.status).send(renderError(resolved.error.title, resolved.error.message));
       return;
     }
-    const level: GrantLevel = rawLevel;
-    const rawSubject = req.body?.subject_type;
-    const subjectType: SubjectType =
-      rawSubject === 'group' ? 'group' : rawSubject === 'everyone' ? 'everyone' : 'user';
+    const subject = resolved.subject;
 
     // The org-wide `everyone` subject is capped at read/write on both areas.
-    if (subjectType === 'everyone' && level === 'admin') {
+    if (subject.subjectType === 'everyone' && ops.some((o) => o.level === 'admin')) {
       res.status(400).send(renderError('Invalid Input', '“Everyone” cannot be granted Admin — use read or write for org-wide access.'));
       return;
     }
 
-    if (subjectType === 'everyone') {
-      await setGrantFacet({
-        projectId: project.id, subjectType: 'everyone',
-        subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME,
-        facet, level,
-      });
-    } else if (subjectType === 'group') {
-      const identifier = String(req.body?.identifier || '').trim();
-      if (!identifier) {
-        res.status(400).send(renderError('Invalid Input', 'Provide a group name.'));
-        return;
+    let touchedRepo = false;
+    for (const op of ops) {
+      if (op.level === null) {
+        // Revoke a facet by looking up the subject's existing grant.
+        const existing = await findGrantBySubject(project.id, subject.subjectType, subject.subjectId);
+        if (existing) await revokeGrantFacet(existing.id, op.facet);
+      } else {
+        await setGrantFacet({
+          projectId: project.id,
+          subjectType: subject.subjectType, subjectId: subject.subjectId,
+          subjectName: subject.subjectName, giteaUsername: subject.giteaUsername,
+          facet: op.facet, level: op.level,
+        });
       }
-      const group = await getGroupByName(identifier.toLowerCase());
-      if (!group) {
-        res.status(404).send(renderError('Not Found', `No group named "${identifier}". Create it under Groups first.`));
-        return;
-      }
-      await setGrantFacet({
-        projectId: project.id, subjectType: 'group', subjectId: group.id,
-        subjectName: group.name, facet, level,
-      });
-    } else {
-      const identifier = String(req.body?.identifier || '').trim();
-      if (!identifier || identifier.length > 254) {
-        res.status(400).send(renderError('Invalid Input', 'Provide a user email or username.'));
-        return;
-      }
-      const identity = identifier.includes('@')
-        ? await findIdentityByEmail(identifier)
-        : await findIdentityByUsername(identifier);
-      if (!identity) {
-        res.status(404).send(renderError('Not Found', `No Corpo Valley member matches "${identifier}".`));
-        return;
-      }
-      const meta = (identity.metadata_public ?? {}) as Record<string, any>;
-      if (meta.type === 'bot') {
-        res.status(400).send(renderError('Invalid Subject', 'Bot identities cannot be granted access directly.'));
-        return;
-      }
-      if (identity.id === project.owner_id) {
-        res.status(400).send(renderError('Invalid Subject', 'The owner already has full access.'));
-        return;
-      }
-      const traits = (identity.traits ?? {}) as Record<string, any>;
-      await setGrantFacet({
-        projectId: project.id, subjectType: 'user', subjectId: identity.id,
-        subjectName: traits.email || traits.preferred_username || identity.id,
-        giteaUsername: giteaUsernameForIdentity(identity),
-        facet, level,
-      });
+      if (op.facet === 'repo') touchedRepo = true;
     }
 
-    if (facet === 'repo') {
+    if (touchedRepo) {
       const fresh = await getProjectById(project.id);
       if (fresh) {
         syncRepoAccess(fresh).catch((e: any) =>
@@ -799,8 +880,10 @@ router.post('/projects/:id/access', requireSession, requireVerifiedEmail, async 
 });
 
 // POST /projects/:id/access/:grantId/revoke — remove a subject's level on ONE
-// area (owner only). Form: `facet` ('site'|'repo'). When the subject is left
-// with no grant on either area the grant row is deleted entirely.
+// area, or the WHOLE subject (owner only). Form: `facet` ('site'|'repo') for a
+// single area, or `all`='true' to remove both areas (the × in the people list).
+// When the subject is left with no grant on either area the grant row is
+// deleted entirely.
 router.post('/projects/:id/access/:grantId/revoke', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
@@ -809,12 +892,19 @@ router.post('/projects/:id/access/:grantId/revoke', requireSession, requireVerif
       res.status(404).send(renderError('Not Found', 'Project not found.'));
       return;
     }
-    const facet: GrantFacet = req.body?.facet === 'repo' ? 'repo' : 'site';
     const grant = await getGrantById(req.params.grantId);
     if (grant && grant.project_id === project.id) {
       const hadRepo = !!grant.repo_perm;
-      await revokeGrantFacet(grant.id, facet);
-      if (facet === 'repo' && hadRepo) {
+      if (req.body?.all === 'true') {
+        // Remove the whole subject — revoke each non-null facet (the row is
+        // dropped once both are NULL).
+        if (grant.site_perm) await revokeGrantFacet(grant.id, 'site');
+        if (grant.repo_perm) await revokeGrantFacet(grant.id, 'repo');
+      } else {
+        const facet: GrantFacet = req.body?.facet === 'repo' ? 'repo' : 'site';
+        await revokeGrantFacet(grant.id, facet);
+      }
+      if (hadRepo && (req.body?.all === 'true' || req.body?.facet === 'repo')) {
         syncRepoAccess(project).catch((e: any) =>
           console.error(`[dashboard] repo access sync failed for ${project.slug}:`, e?.message));
       }
