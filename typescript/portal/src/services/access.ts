@@ -180,6 +180,19 @@ export async function getGrantById(id: string): Promise<ProjectGrant | null> {
   return rows[0] ?? null;
 }
 
+// The existing grant for a (project, subject), if any. Used to locate the row
+// to revoke a facet from when an edit sets a facet to "none" (the UI knows the
+// subject, not the grant id).
+export async function findGrantBySubject(
+  projectId: string, subjectType: SubjectType, subjectId: string,
+): Promise<ProjectGrant | null> {
+  const { rows } = await pool.query<ProjectGrant>(
+    'SELECT * FROM project_grants WHERE project_id = $1 AND subject_type = $2 AND subject_id = $3',
+    [projectId, subjectType, subjectId]
+  );
+  return rows[0] ?? null;
+}
+
 // Upsert: granting the same subject again replaces its levels rather than
 // erroring, which is what an owner adjusting access expects.
 export async function upsertProjectGrant(grant: {
