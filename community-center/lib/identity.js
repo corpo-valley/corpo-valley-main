@@ -17,9 +17,12 @@
 // `read` view, `write` create/update their own data, and `admin` moderate
 // everything. The project owner is always `admin`.
 //
-// resolveUser(req) returns { id, email, perm } or null. The MCP capability
-// receives X-User-Id from the MCP gateway instead (no perm — MCP access is
-// owner-only at the gateway), so it keeps using resolveUser's fallbacks.
+// resolveUser(req) returns { id, email, perm } or null. It is used by the
+// site-edge capabilities (database, storage), which sit behind the project
+// Ingress that sets the X-CV-* headers. The MCP capability does NOT use this
+// helper: it sits behind the MCP gateway, which OAuth-authenticates the caller
+// and forwards X-User-Id / X-User-Email / X-CV-Perm (admitting anyone with
+// >= read, mirroring the site gate), and mcp/server.js reads those directly.
 //
 // Fallback: when the edge headers are absent (running the container locally),
 // we re-validate the forwarded Kratos session cookie against Kratos and report
