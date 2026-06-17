@@ -40,6 +40,25 @@ async function listRelations(params: Record<string, string>): Promise<{ relation
   return res.json() as Promise<{ relation_tuples: RelationTuple[] }>;
 }
 
+// Same query as listRelations but surfaces Keto's pagination cursor so callers
+// that need the FULL relation set (not just "does ≥1 exist") can page through
+// it. Keto returns `next_page_token: ""` on the last page.
+async function listRelationsPaged(
+  params: Record<string, string>
+): Promise<{ relation_tuples: RelationTuple[]; next_page_token?: string }> {
+  const qs = new URLSearchParams(params).toString();
+  const res = await fetch(`${ketoReadUrl}/relation-tuples?${qs}`);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Keto list failed (${res.status}): ${body}`);
+  }
+  const json = (await res.json()) as { relation_tuples: RelationTuple[]; next_page_token?: string };
+  return {
+    relation_tuples: json.relation_tuples || [],
+    next_page_token: json.next_page_token ? json.next_page_token : undefined,
+  };
+}
+
 async function createRelation(tuple: RelationTuple): Promise<void> {
   const res = await fetch(`${ketoWriteUrl}/admin/relation-tuples`, {
     method: 'PUT',
@@ -61,6 +80,36 @@ async function deleteRelation(params: Record<string, string>): Promise<void> {
     const body = await res.text();
     throw new Error(`Keto delete failed (${res.status}): ${body}`);
   }
+}
+
+// Every user id that carries the admin role. Mirrors isUserAdmin's query but
+// lists the whole `groups:ADMIN#members` relation instead of filtering to one
+// subject. Pages through Keto's relation-tuple list (default page size is
+// small) so a large admin set isn't silently truncated; bots/groups never
+// appear here because the admin marker is only ever written with a subject_id.
+export async function listAdminUserIds(): Promise<string[]> {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < 1000; page++) {
+    const params: Record<string, string> = {
+      namespace: 'groups',
+      object: ADMIN_GROUP,
+      relation: 'members',
+      'page_size': '500',
+    };
+    if (pageToken) params['page_token'] = pageToken;
+    const { relation_tuples, next_page_token } = await listRelationsPaged(params);
+    for (const t of relation_tuples) {
+      if (t.subject_id && !seen.has(t.subject_id)) {
+        seen.add(t.subject_id);
+        ids.push(t.subject_id);
+      }
+    }
+    if (!next_page_token) break;
+    pageToken = next_page_token;
+  }
+  return ids;
 }
 
 export async function isUserAdmin(userId: string): Promise<boolean> {

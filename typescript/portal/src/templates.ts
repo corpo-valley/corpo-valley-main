@@ -2343,11 +2343,35 @@ export interface TemplateResetView {
   deleted?: number;
 }
 
+// Repo-access overview for the Community Center template (structurally matches
+// services/community-center.ts CommunityCenterAccessOverview — kept as a local
+// view type to avoid a templates ↔ service import cycle).
+export interface CommunityCenterAccessView {
+  giteaEnabled: boolean;
+  repo: string;
+  adminCount: number;
+  manual: Array<{ username: string; permission: string }>;
+  branchProtection: {
+    configured: boolean;
+    forcesPr: boolean;
+    pushWhitelist: string[];
+    statusChecksEnabled: boolean;
+  };
+  error?: string;
+}
+
+export interface AccessActionResultView {
+  ok: boolean;
+  message: string;
+}
+
 export function renderAdminTemplate(
   status: TemplateStatusView,
   result: TemplateResetView | null,
   email: string,
-  csrf: string = ''
+  csrf: string = '',
+  access: CommunityCenterAccessView | null = null,
+  accessResult: AccessActionResultView | null = null,
 ): string {
   const yes = '✓';
   const no = '✗';
@@ -2383,7 +2407,93 @@ export function renderAdminTemplate(
     </form>`;
   }
 
+  body += renderCommunityCenterAccessPanel(access, accessResult, csrf);
+
   return dashboardLayout('Project Template', body, email, true, 'template');
+}
+
+// The "Repo access" panel on the Project Template page: who can write to the
+// template repo (admins are auto-managed; non-admins added by hand), the
+// branch-protection status, and the manual add/remove controls.
+function renderCommunityCenterAccessPanel(
+  access: CommunityCenterAccessView | null,
+  accessResult: AccessActionResultView | null,
+  csrf: string,
+): string {
+  let html = `<div class="app-card" style="margin-top:2rem;">
+    <h2 style="margin-top:0;">Repo access</h2>
+    <p class="help">Who can write to the <code>${escapeHtml(access?.repo || 'community-center')}</code>
+      template repo. <strong>Write</strong> means create branches and merge pull requests.
+      Direct pushes to <code>main</code> are blocked by branch protection (only the platform
+      account may push directly), so everyone else must open a PR. Platform admins are added
+      as write collaborators automatically and stay in sync with their role; the list below is
+      for granting access to non-admin users by hand.</p>`;
+
+  if (!access || !access.giteaEnabled) {
+    html += `<div class="message info" style="margin-top:1rem;">Gitea integration is not configured on this deployment, so repo access cannot be managed here.</div></div>`;
+    return html;
+  }
+
+  if (accessResult) {
+    const cls = accessResult.ok ? 'success' : 'error';
+    html += `<div class="message ${cls}" style="margin-top:1rem;">${escapeHtml(accessResult.message)}</div>`;
+  }
+  if (access.error) {
+    html += `<div class="message error" style="margin-top:1rem;">${escapeHtml(access.error)}</div>`;
+  }
+
+  // Branch-protection status.
+  const bp = access.branchProtection;
+  const bpLine = !bp.configured
+    ? `<span style="color:#f3a5a5;">Not configured — direct pushes to <code>main</code> are NOT restricted.</span>`
+    : bp.forcesPr
+      ? `PRs are enforced — only ${bp.pushWhitelist.length
+          ? bp.pushWhitelist.map((u) => `<code>${escapeHtml(u)}</code>`).join(', ')
+          : '(no one)'} may push directly to <code>main</code>. `
+        + `Merge status checks: ${bp.statusChecksEnabled ? 'on' : 'off'}.`
+      : `<span style="color:#f3a5a5;">Branch protection exists but does not restrict direct push.</span>`;
+  html += `<p style="margin-top:1rem;"><strong>Branch protection:</strong> ${bpLine}</p>`;
+  html += `<p class="help"><strong>${access.adminCount}</strong> platform admin(s) have automatic write access (managed by role, not shown below).</p>`;
+
+  // Manual (non-admin) collaborators.
+  html += `<h3 style="margin-top:1.5rem;">Manually-granted users</h3>`;
+  if (!access.manual.length) {
+    html += `<p class="help">No non-admin users have been granted access by hand.</p>`;
+  } else {
+    html += `<div class="table-wrap"><table class="table">
+      <thead><tr><th>Username</th><th>Permission</th><th></th></tr></thead><tbody>`;
+    for (const c of access.manual) {
+      html += `<tr>
+        <td><code>${escapeHtml(c.username)}</code></td>
+        <td>${escapeHtml(c.permission)}</td>
+        <td>
+          <form method="POST" action="/admin/template/access/revoke" class="inline-form"
+                data-confirm="Remove ${escapeHtml(c.username)} from the template repo?">
+            ${csrf}
+            <input type="hidden" name="username" value="${escapeHtml(c.username)}">
+            <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+          </form>
+        </td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  // Grant form.
+  html += `<h3 style="margin-top:1.5rem;">Grant access</h3>
+    <p class="help">Enter a user's email address or username. They must be a non-admin
+      human (admins are managed automatically). They'll be added as a <code>write</code> collaborator.</p>
+    <form method="POST" action="/admin/template/access/grant">
+      ${csrf}
+      <div class="field">
+        <label>Email or username</label>
+        <input type="text" name="identifier" placeholder="user@example.com or username" required>
+      </div>
+      <button type="submit" class="btn btn-primary">Grant write access</button>
+    </form>`;
+
+  html += `</div>`;
+  return html;
 }
 
 // ── Project Resources (per-project memory budget) ──────────

@@ -15,6 +15,9 @@ import { migrate } from './services/projects';
 import { reconcileAllProjects } from './services/repo-access';
 import { backfillPinTokens } from './services/pin-token-backfill';
 import { seedCommunityCenterTemplate } from './services/template-seed';
+import {
+  ensureCommunityCenterBranchProtection, syncCommunityCenterAdmins,
+} from './services/community-center';
 import { runWithNonce } from './lib/csp-nonce';
 import * as crypto from 'crypto';
 
@@ -178,6 +181,21 @@ async function start() {
       (seeded.written !== undefined ? ` (${seeded.written} written, ${seeded.deleted} deleted)` : ''));
   } catch (err: any) {
     console.error('Community Center template seed failed:', err?.message);
+  }
+
+  // Lock down the Community Center template repo: force-PR branch protection on
+  // `main` (only cvportal may push directly, so the seed above still works),
+  // then ensure every current admin is a write collaborator (add-only). Both
+  // are idempotent and best-effort — a Gitea hiccup must not block startup.
+  try {
+    await ensureCommunityCenterBranchProtection();
+  } catch (err: any) {
+    console.error('Community Center branch protection failed:', err?.message);
+  }
+  try {
+    await syncCommunityCenterAdmins();
+  } catch (err: any) {
+    console.error('Community Center admin reconcile failed:', err?.message);
   }
 
   // Periodic repo-access reconcile sweep. Triggered grant/default/membership

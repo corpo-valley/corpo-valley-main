@@ -52,6 +52,15 @@ export function giteaEnabled(): boolean {
   return giteaAdminToken.length > 0;
 }
 
+// The platform site-admin Gitea username (default `cvportal`). This account
+// seeds the template repo, drives manifest/sealed-secret writes, and is the
+// one account always whitelisted for direct push under branch protection.
+// Exposed so callers (e.g. community-center access management) can name it
+// explicitly rather than re-reading the env var.
+export function giteaAdminUsername(): string {
+  return giteaAdminUser;
+}
+
 export class GiteaApiError extends Error {
   constructor(public status: number, public body: any) {
     super(`Gitea API ${status}: ${body?.message || JSON.stringify(body).slice(0, 200)}`);
@@ -935,10 +944,25 @@ export async function setBranchProtection(opts: {
   repo: string;
   branch?: string;
   statusCheckGlobs?: string[];
+  // Overrides the default direct-push whitelist (`[owner, cvportal]`). Pass an
+  // explicit list to force-PR for everyone but the named accounts — e.g. the
+  // community-center template passes `[cvportal]` so only the seeding account
+  // may push to `main` and all human collaborators must open a PR.
+  pushWhitelistUsernames?: string[];
+  // Whether merging is gated on the scan status checks. Defaults to true (the
+  // current project-repo behavior). Pass false to force PRs without blocking
+  // merges on checks/approvals (community-center seeding doesn't run scans).
+  enableStatusCheck?: boolean;
 }): Promise<void> {
   if (!giteaEnabled()) return;
   const branch = opts.branch || 'main';
   const contexts = opts.statusCheckGlobs || ['*semgrep*', '*osv-scanner*'];
+  const enableStatusCheck = opts.enableStatusCheck ?? true;
+  // Default whitelist preserves the existing project-repo behavior: the repo
+  // owner (whose CV_PUSH_TOKEN PAT the Build workflow pushes with) plus the
+  // platform admin. Callers may override it wholesale.
+  const pushWhitelist = (opts.pushWhitelistUsernames ?? [opts.owner, giteaAdminUser])
+    .filter((u, i, a) => u && a.indexOf(u) === i);
   // Status-check enforcement is back ON. The Build workflow auto-bump
   // would normally be rejected because Gitea 1.22's auto-provisioned
   // Actions token is an internal pseudo-user (UID 0) that can't be
@@ -955,14 +979,14 @@ export async function setBranchProtection(opts: {
     branch_name: branch,
     enable_push: true,
     enable_push_whitelist: true,
-    // Whitelist both the project owner (the Build workflow's CV_PUSH_TOKEN
-    // PAT is minted on their account) and `cvportal` (the platform admin
-    // that drives manifest generation, sealed-secret writes,
-    // and any future portal-side Contents API edits).
-    push_whitelist_usernames: [opts.owner, giteaAdminUser].filter((u, i, a) => u && a.indexOf(u) === i),
+    // Whitelist defaults to the project owner (the Build workflow's
+    // CV_PUSH_TOKEN PAT is minted on their account) and `cvportal` (the
+    // platform admin that drives manifest generation, sealed-secret writes,
+    // and any future portal-side Contents API edits). Overridable per call.
+    push_whitelist_usernames: pushWhitelist,
     push_whitelist_deploy_keys: false,
-    enable_status_check: true,
-    status_check_contexts: contexts,
+    enable_status_check: enableStatusCheck,
+    status_check_contexts: enableStatusCheck ? contexts : [],
     required_approvals: 0,
     block_on_outdated_branch: false,
     block_on_rejected_reviews: false,
@@ -975,7 +999,61 @@ export async function setBranchProtection(opts: {
       { method: 'POST', body: JSON.stringify(body) }
     );
   } catch (err) {
-    if (err instanceof GiteaApiError && (err.status === 409 || alreadyExists(err))) return;
+    // A rule for this branch already exists. PATCH it so re-runs converge the
+    // rule onto the requested config (e.g. a whitelist/status-check change),
+    // instead of silently keeping a stale rule — this keeps the call truly
+    // idempotent rather than create-once.
+    if (err instanceof GiteaApiError && (err.status === 409 || alreadyExists(err))) {
+      await call(
+        `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/branch_protections/${encodeURIComponent(branch)}`,
+        { method: 'PATCH', body: JSON.stringify(body) }
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
+// Read the branch-protection rule on a branch (default `main`), or null if no
+// rule exists. Surfaces the fields the admin panel reports on: whether direct
+// push is whitelisted, who's on the whitelist, and whether status checks gate
+// merges.
+export interface BranchProtectionInfo {
+  branch: string;
+  enablePush: boolean;
+  enablePushWhitelist: boolean;
+  pushWhitelistUsernames: string[];
+  enableStatusCheck: boolean;
+  statusCheckContexts: string[];
+}
+
+export async function getBranchProtection(opts: {
+  owner: string; repo: string; branch?: string;
+}): Promise<BranchProtectionInfo | null> {
+  if (!giteaEnabled()) return null;
+  const branch = opts.branch || 'main';
+  try {
+    const r = await call<{
+      branch_name?: string;
+      rule_name?: string;
+      enable_push?: boolean;
+      enable_push_whitelist?: boolean;
+      push_whitelist_usernames?: string[];
+      enable_status_check?: boolean;
+      status_check_contexts?: string[];
+    }>(
+      `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/branch_protections/${encodeURIComponent(branch)}`
+    );
+    return {
+      branch: r.branch_name || r.rule_name || branch,
+      enablePush: !!r.enable_push,
+      enablePushWhitelist: !!r.enable_push_whitelist,
+      pushWhitelistUsernames: r.push_whitelist_usernames || [],
+      enableStatusCheck: !!r.enable_status_check,
+      statusCheckContexts: r.status_check_contexts || [],
+    };
+  } catch (err) {
+    if (err instanceof GiteaApiError && err.status === 404) return null;
     throw err;
   }
 }
