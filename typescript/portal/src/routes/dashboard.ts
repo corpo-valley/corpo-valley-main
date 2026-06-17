@@ -208,10 +208,14 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
     });
 
     // Sort: created/updated newest-first, creator alphabetical (case-insensitive).
+    // created/updated are timestamps — pg hands back `created_at` as a Date and
+    // Gitea's `updated_at` is an ISO string, so compare by epoch millis (works
+    // for both) rather than localeCompare, which only exists on strings.
+    const ms = (v: string | Date) => { const t = new Date(v).getTime(); return Number.isNaN(t) ? 0 : t; };
     enriched.sort((a, b) => {
       if (sort === 'creator') return a.creator.localeCompare(b.creator, undefined, { sensitivity: 'base' });
-      if (sort === 'updated') return b.updatedIso.localeCompare(a.updatedIso);
-      return b.createdIso.localeCompare(a.createdIso);
+      if (sort === 'updated') return ms(b.updatedIso) - ms(a.updatedIso);
+      return ms(b.createdIso) - ms(a.createdIso);
     });
 
     const fmt = (iso: string) => (iso ? new Date(iso).toLocaleDateString() : '—');

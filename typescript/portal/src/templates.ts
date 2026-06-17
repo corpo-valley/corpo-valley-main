@@ -540,7 +540,7 @@ export function renderError(title: string, error: string, details?: string): str
     body += `<p><code>${escapeHtml(details)}</code></p>`;
   }
   body += `<div class="links" style="margin-top:2rem">
-    <a href="/login">Back to Login</a>
+    <a href="/">Back to Portal</a>
   </div></div>`;
   return layout(title, body);
 }
@@ -612,7 +612,7 @@ export function renderInfo(title: string, message: string): string {
     <h1>${escapeHtml(title)}</h1>
     <div class="message info">${escapeHtml(message)}</div>
     <div class="links" style="margin-top:2rem">
-      <a href="/login">Back to Login</a>
+      <a href="/">Back to Portal</a>
     </div>
   </div>`;
   return layout(title, body);
