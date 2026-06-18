@@ -22,6 +22,10 @@ import {
   seedCommunityCenterTemplate, communityCenterTemplateStatus,
 } from '../services/template-seed';
 import {
+  communityCenterAccessOverview, grantManualAccess, revokeManualAccess,
+  applyAdminRoleToRepo,
+} from '../services/community-center';
+import {
   reconcileTenantResources, reconcileTenantStorage,
   TenantResourceOverrides, StorageReconcileEntry,
 } from '../services/k8s';
@@ -214,6 +218,11 @@ router.post('/users/:id/role', async (req: Request, res: Response) => {
 
   try {
     await setUserAdmin(req.params.id, role === 'admin');
+    // Drive Community Center template repo access from the role change:
+    // promote → write collaborator, demote → removed. Best-effort and
+    // non-throwing (the service logs on failure) so a Gitea hiccup never
+    // fails the role change itself.
+    await applyAdminRoleToRepo(req.params.id, role === 'admin');
     res.redirect(`/admin/users/${req.params.id}`);
   } catch (err: any) {
     console.error('Set role error:');
@@ -425,8 +434,11 @@ router.post('/apps/:appId/delete', async (req: Request, res: Response) => {
 router.get('/template', async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const status = await communityCenterTemplateStatus();
-    res.send(renderAdminTemplate(status, null, session.email, csrfHiddenField(req, res)));
+    const [status, access] = await Promise.all([
+      communityCenterTemplateStatus(),
+      communityCenterAccessOverview(),
+    ]);
+    res.send(renderAdminTemplate(status, null, session.email, csrfHiddenField(req, res), access, null));
   } catch (err: any) {
     console.error('Admin template status error:', err?.message);
     res.status(500).send(renderError('Error', 'Failed to load template status.'));
@@ -439,11 +451,62 @@ router.post('/template/reset', async (req: Request, res: Response) => {
     const result = await seedCommunityCenterTemplate({ force: true });
     console.log(`[template-seed] admin reset by ${session.email}: ${result.action}` +
       (result.written !== undefined ? ` (${result.written} written, ${result.deleted} deleted)` : ''));
-    const status = await communityCenterTemplateStatus();
-    res.send(renderAdminTemplate(status, result, session.email, csrfHiddenField(req, res)));
+    const [status, access] = await Promise.all([
+      communityCenterTemplateStatus(),
+      communityCenterAccessOverview(),
+    ]);
+    res.send(renderAdminTemplate(status, result, session.email, csrfHiddenField(req, res), access, null));
   } catch (err: any) {
     console.error('Admin template reset error:', err?.message);
     res.status(500).send(renderError('Error', 'Template reset failed — see portal logs.'));
+  }
+});
+
+// Re-render the template page with the result of a manual repo-access change.
+async function renderTemplateWithAccessResult(
+  req: Request, res: Response,
+  result: { ok: boolean; message: string },
+  statusCode = 200,
+) {
+  const session = req.portalSession!;
+  const [status, access] = await Promise.all([
+    communityCenterTemplateStatus(),
+    communityCenterAccessOverview(),
+  ]);
+  res.status(statusCode).send(
+    renderAdminTemplate(status, null, session.email, csrfHiddenField(req, res), access, result),
+  );
+}
+
+// Manually grant a non-admin user write access to the template repo.
+router.post('/template/access/grant', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const identifier = typeof req.body?.identifier === 'string' ? req.body.identifier : '';
+  try {
+    const result = await grantManualAccess(identifier);
+    if (result.ok) {
+      console.log(`[community-center] manual grant of ${result.username} by ${session.email}`);
+    }
+    await renderTemplateWithAccessResult(req, res, result, result.ok ? 200 : 400);
+  } catch (err: any) {
+    console.error('Community Center manual grant error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to grant access — see portal logs.'));
+  }
+});
+
+// Manually remove a non-admin collaborator from the template repo.
+router.post('/template/access/revoke', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const username = typeof req.body?.username === 'string' ? req.body.username : '';
+  try {
+    const result = await revokeManualAccess(username);
+    if (result.ok) {
+      console.log(`[community-center] manual revoke of ${result.username} by ${session.email}`);
+    }
+    await renderTemplateWithAccessResult(req, res, result, result.ok ? 200 : 400);
+  } catch (err: any) {
+    console.error('Community Center manual revoke error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to remove access — see portal logs.'));
   }
 });
 

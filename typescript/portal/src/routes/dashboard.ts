@@ -11,7 +11,7 @@ import {
   clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
   clearGarageCredentials, claimOrGetGarageCredentials, decodeGarageCredentials,
-  setPinTokenHash,
+  setPinTokenHash, setProjectStatus,
   GrantLevel,
 } from '../services/projects';
 import {
@@ -58,6 +58,7 @@ import { buildSealedSecretYaml } from '../services/seal';
 import { PROJECTS_DOMAIN } from '../services/platform-config';
 import {
   renderProjects, renderProjectCreate, renderProjectDetail,
+  renderProjectInitializing,
   renderKeyManagement, renderNewKeyDisplay, renderError,
   renderGiteaCliTokenReveal, renderCommunityFeed,
   ProjectRow, ApiKeyRow, CommunityRow, COMMUNITY_SORTS, CommunitySort,
@@ -97,7 +98,7 @@ const hydraPublicUrl = process.env.HYDRA_PUBLIC_URL || 'http://localhost:4444';
 
 function toProjectRow(p: {
   id: string; slug: string; name: string; created_at: string;
-  gitea_repo?: string | null;
+  gitea_repo?: string | null; status: string;
 }, extras: {
   postgresEnabled?: boolean; storageEnabled?: boolean;
   // The project's org-wide `everyone` grant levels, for the summary badge
@@ -114,6 +115,7 @@ function toProjectRow(p: {
     giteaRepo: p.gitea_repo ?? null,
     postgresEnabled: extras.postgresEnabled ?? false,
     storageEnabled: extras.storageEnabled ?? false,
+    status: p.status,
   };
 }
 
@@ -359,15 +361,21 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
     // namespace baseline first, then provisions repo/postgres/manifests/argocd.
     // Best-effort — never fail creation on a downstream error; the project row
     // is the source of truth and a reconciler can retry from it.
-    await provisionProject(project, caps, {
+    //
+    // Provisioning takes ~a minute, so we DON'T await it here — we redirect
+    // immediately to the project page, which renders the "initializing" screen
+    // while status is `provisioning`. provisionProject flips status to `ready`
+    // at the end of its happy path; the catch below covers a rare hard throw.
+    // The post-provision repo-access converge for internal projects moves into
+    // the `.then` so it still runs once the repo actually exists.
+    provisionProject(project, caps, {
       ownerUsername: session.preferredUsername, email: session.email, logTag: 'dashboard',
-    });
-    // Converge the repo collaborator set for the seeded org-wide grant (the
-    // repo only exists after provisioning).
-    if (visible === 'internal') {
-      syncRepoAccess(project).catch((e: any) =>
-        console.error(`[dashboard] repo access sync failed for ${project.slug}:`, e?.message));
-    }
+    })
+      .then(() => { if (visible === 'internal') return syncRepoAccess(project); })
+      .catch((e: any) => {
+        console.error(`[dashboard] provisioning failed for ${project.slug}:`, e?.message);
+        setProjectStatus(project.id, 'failed').catch(() => {});
+      });
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
     // Unique-violation race: another request grabbed the slug first.
@@ -389,6 +397,14 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       return;
     }
     const isAdmin = await isUserAdmin(session.id);
+    // Still provisioning (or failed)? Show the initializing screen and bail —
+    // the repo/postgres/garage/grants lookups below would fail because those
+    // resources don't exist yet. The screen polls /projects/:id/status and
+    // reloads this URL once status flips to `ready`.
+    if (project.status !== 'ready') {
+      res.send(renderProjectInitializing(session.email, isAdmin, toProjectRow(project)));
+      return;
+    }
     const csrf = csrfHiddenField(req, res);
     const secrets = await listProjectSecretNames(project);
     let postgresEnabledNow = false;
@@ -413,6 +429,23 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
   } catch (err: any) {
     console.error('Project detail error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load project.'));
+  }
+});
+
+// GET /projects/:id/status — JSON `{ status }` for the initializing screen's
+// poll (owner only; same 404 behaviour as GET /projects/:id).
+router.get('/projects/:id/status', requireSession, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const project = await getProjectById(req.params.id);
+    if (!project || project.owner_id !== session.id) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    res.json({ status: project.status });
+  } catch (err: any) {
+    console.error('Project status error:', err.message);
+    res.status(500).json({ error: 'error' });
   }
 });
 

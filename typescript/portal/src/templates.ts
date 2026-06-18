@@ -638,7 +638,11 @@ function dashboardLayout(
   bodyHtml: string,
   email: string,
   isAdmin: boolean,
-  activeNav: string
+  activeNav: string,
+  // Optional extra markup injected into <head> (e.g. a no-JS meta refresh on
+  // the initializing screen). Trusted, static, caller-supplied markup only —
+  // never interpolate user input here.
+  opts: { headExtra?: string } = {}
 ): string {
   const navItems: NavItem[] = [
     { label: 'Projects', href: '/', key: 'projects' },
@@ -663,6 +667,7 @@ function dashboardLayout(
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)} - Corpo Valley</title>
+  ${opts.headExtra ?? ''}
   <style>${CSS}</style>
 </head>
 <body class="dashboard-body">
@@ -742,6 +747,10 @@ export interface ProjectRow {
   // True when k8s/garage.yaml exists in the project repo — the Storage card
   // uses this to choose the enable vs. remove control.
   storageEnabled?: boolean;
+  // Provisioning lifecycle: 'provisioning' | 'ready' | 'failed'. Cards in the
+  // non-ready states show an "Initializing…" badge and their link lands on the
+  // initializing screen.
+  status: string;
 }
 
 // A project shared with the viewer via a grant, with their effective levels.
@@ -978,9 +987,11 @@ export function renderProjects(
           <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
           <div class="app-card-sub" style="margin-top:0.4rem;">${(p.everyoneSite === 'none' && p.everyoneRepo === 'none')
             ? accessBadge('private')
-            : `Everyone: site ${accessBadge(p.everyoneSite)} &nbsp; repo ${accessBadge(p.everyoneRepo)}`}</div>
+            : `Everyone: site ${accessBadge(p.everyoneSite)} &nbsp; repo ${accessBadge(p.everyoneRepo)}`}${p.status !== 'ready'
+            ? ` &nbsp; <span class="badge badge-access" style="background:#3a3120;color:#e8d39a;">${p.status === 'failed' ? 'Provisioning failed' : 'Initializing…'}</span>`
+            : ''}</div>
           <div class="app-card-actions">
-            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-secondary">Edit</a>
+            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-secondary">${p.status !== 'ready' ? 'View' : 'Edit'}</a>
             ${p.giteaRepo
               ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a>`
               : ''}
@@ -1013,6 +1024,93 @@ export function renderProjects(
   }
 
   return dashboardLayout('Projects', body, email, isAdmin, 'projects');
+}
+
+// The "project initializing" screen shown right after async creation (POST
+// /projects redirects here) and on any open of a project whose status is not
+// yet `ready`. The user can wait — we auto-redirect to the detail page the
+// moment provisioning completes — or head back to the portal.
+//
+// Auto-redirect to ready works two ways, belt-and-suspenders:
+//   - No-JS fallback: <meta http-equiv="refresh"> reloads THIS same
+//     /projects/:id URL every 5s; once status is `ready` the route renders the
+//     real detail page instead of this screen.
+//   - With JS: a nonce'd inline script polls /projects/:id/status every ~2.5s
+//     and sets location.href to the detail URL as soon as it sees `ready`.
+// `failed` renders an error state and does NOT auto-poll/refresh.
+//
+// statusOverride lets callers/tests force a state without a full ProjectRow
+// round-trip; otherwise the project's own status is used.
+export function renderProjectInitializing(
+  email: string,
+  isAdmin: boolean,
+  project: ProjectRow,
+  statusOverride?: string,
+): string {
+  const status = statusOverride ?? project.status;
+  const failed = status === 'failed';
+  const detailUrl = `/projects/${escapeHtml(project.id)}`;
+  const statusUrl = `/projects/${encodeURIComponent(project.id)}/status`;
+
+  let body = `
+    <style>
+      .init-card { max-width: 34rem; margin: 2rem auto; text-align: center; padding: 2.5rem 2rem; }
+      .init-spinner {
+        width: 3rem; height: 3rem; margin: 0.5rem auto 1.5rem;
+        border: 4px solid #4a3c2c; border-top-color: #e8b94a; border-radius: 50%;
+        animation: init-spin 0.9s linear infinite;
+      }
+      @keyframes init-spin { to { transform: rotate(360deg); } }
+      .init-card h2 { color: #fdf6e8; margin: 0 0 0.5rem 0; }
+      .init-actions { margin-top: 1.75rem; }
+    </style>
+  `;
+
+  if (failed) {
+    body += `
+      <div class="app-card init-card">
+        <h2>🌱 ${escapeHtml(project.name)}</h2>
+        <div class="message error" style="text-align:left;">Provisioning hit a snag — the platform will keep retrying in the background.</div>
+        <div class="init-actions">
+          <a href="/" class="btn btn-secondary">← Back to projects</a>
+        </div>
+      </div>
+    `;
+    return dashboardLayout('Initializing', body, email, isAdmin, 'projects');
+  }
+
+  body += `
+    <div class="app-card init-card">
+      <div class="init-spinner" aria-hidden="true"></div>
+      <h2>🌱 Planting ${escapeHtml(project.name)}…</h2>
+      <p class="help">Setting up your repo, deployment, and live URL. This usually takes under a minute — you can wait here or head back; we'll keep building.</p>
+      <div class="init-actions">
+        <a href="/" class="btn btn-secondary">← Back to projects</a>
+      </div>
+    </div>
+    <script nonce="${cspNonce()}">
+      (function(){
+        var statusUrl = ${JSON.stringify(statusUrl)};
+        var detailUrl = ${JSON.stringify(detailUrl)};
+        function poll(){
+          fetch(statusUrl, { headers: { 'Accept': 'application/json' }, credentials: 'same-origin' })
+            .then(function(r){ return r.ok ? r.json() : null; })
+            .then(function(j){
+              if (j && j.status === 'ready') { window.location.href = detailUrl; return; }
+              setTimeout(poll, 2500);
+            })
+            .catch(function(){ setTimeout(poll, 2500); });
+        }
+        setTimeout(poll, 2500);
+      })();
+    </script>
+  `;
+
+  // No-JS fallback: reload this same URL, which renders the detail page once
+  // the project is ready. (Injected into <head> via the meta hook below.)
+  return dashboardLayout('Initializing', body, email, isAdmin, 'projects', {
+    headExtra: '<meta http-equiv="refresh" content="5">',
+  });
 }
 
 // Grant levels for the SITE/PROJECT facet and the REPO facet. Both areas
@@ -2343,11 +2441,35 @@ export interface TemplateResetView {
   deleted?: number;
 }
 
+// Repo-access overview for the Community Center template (structurally matches
+// services/community-center.ts CommunityCenterAccessOverview — kept as a local
+// view type to avoid a templates ↔ service import cycle).
+export interface CommunityCenterAccessView {
+  giteaEnabled: boolean;
+  repo: string;
+  adminCount: number;
+  manual: Array<{ username: string; permission: string }>;
+  branchProtection: {
+    configured: boolean;
+    forcesPr: boolean;
+    pushWhitelist: string[];
+    statusChecksEnabled: boolean;
+  };
+  error?: string;
+}
+
+export interface AccessActionResultView {
+  ok: boolean;
+  message: string;
+}
+
 export function renderAdminTemplate(
   status: TemplateStatusView,
   result: TemplateResetView | null,
   email: string,
-  csrf: string = ''
+  csrf: string = '',
+  access: CommunityCenterAccessView | null = null,
+  accessResult: AccessActionResultView | null = null,
 ): string {
   const yes = '✓';
   const no = '✗';
@@ -2383,7 +2505,93 @@ export function renderAdminTemplate(
     </form>`;
   }
 
+  body += renderCommunityCenterAccessPanel(access, accessResult, csrf);
+
   return dashboardLayout('Project Template', body, email, true, 'template');
+}
+
+// The "Repo access" panel on the Project Template page: who can write to the
+// template repo (admins are auto-managed; non-admins added by hand), the
+// branch-protection status, and the manual add/remove controls.
+function renderCommunityCenterAccessPanel(
+  access: CommunityCenterAccessView | null,
+  accessResult: AccessActionResultView | null,
+  csrf: string,
+): string {
+  let html = `<div class="app-card" style="margin-top:2rem;">
+    <h2 style="margin-top:0;">Repo access</h2>
+    <p class="help">Who can write to the <code>${escapeHtml(access?.repo || 'community-center')}</code>
+      template repo. <strong>Write</strong> means create branches and merge pull requests.
+      Direct pushes to <code>main</code> are blocked by branch protection (only the platform
+      account may push directly), so everyone else must open a PR. Platform admins are added
+      as write collaborators automatically and stay in sync with their role; the list below is
+      for granting access to non-admin users by hand.</p>`;
+
+  if (!access || !access.giteaEnabled) {
+    html += `<div class="message info" style="margin-top:1rem;">Gitea integration is not configured on this deployment, so repo access cannot be managed here.</div></div>`;
+    return html;
+  }
+
+  if (accessResult) {
+    const cls = accessResult.ok ? 'success' : 'error';
+    html += `<div class="message ${cls}" style="margin-top:1rem;">${escapeHtml(accessResult.message)}</div>`;
+  }
+  if (access.error) {
+    html += `<div class="message error" style="margin-top:1rem;">${escapeHtml(access.error)}</div>`;
+  }
+
+  // Branch-protection status.
+  const bp = access.branchProtection;
+  const bpLine = !bp.configured
+    ? `<span style="color:#f3a5a5;">Not configured — direct pushes to <code>main</code> are NOT restricted.</span>`
+    : bp.forcesPr
+      ? `PRs are enforced — only ${bp.pushWhitelist.length
+          ? bp.pushWhitelist.map((u) => `<code>${escapeHtml(u)}</code>`).join(', ')
+          : '(no one)'} may push directly to <code>main</code>. `
+        + `Merge status checks: ${bp.statusChecksEnabled ? 'on' : 'off'}.`
+      : `<span style="color:#f3a5a5;">Branch protection exists but does not restrict direct push.</span>`;
+  html += `<p style="margin-top:1rem;"><strong>Branch protection:</strong> ${bpLine}</p>`;
+  html += `<p class="help"><strong>${access.adminCount}</strong> platform admin(s) have automatic write access (managed by role, not shown below).</p>`;
+
+  // Manual (non-admin) collaborators.
+  html += `<h3 style="margin-top:1.5rem;">Manually-granted users</h3>`;
+  if (!access.manual.length) {
+    html += `<p class="help">No non-admin users have been granted access by hand.</p>`;
+  } else {
+    html += `<div class="table-wrap"><table class="table">
+      <thead><tr><th>Username</th><th>Permission</th><th></th></tr></thead><tbody>`;
+    for (const c of access.manual) {
+      html += `<tr>
+        <td><code>${escapeHtml(c.username)}</code></td>
+        <td>${escapeHtml(c.permission)}</td>
+        <td>
+          <form method="POST" action="/admin/template/access/revoke" class="inline-form"
+                data-confirm="Remove ${escapeHtml(c.username)} from the template repo?">
+            ${csrf}
+            <input type="hidden" name="username" value="${escapeHtml(c.username)}">
+            <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+          </form>
+        </td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  // Grant form.
+  html += `<h3 style="margin-top:1.5rem;">Grant access</h3>
+    <p class="help">Enter a user's email address or username. They must be a non-admin
+      human (admins are managed automatically). They'll be added as a <code>write</code> collaborator.</p>
+    <form method="POST" action="/admin/template/access/grant">
+      ${csrf}
+      <div class="field">
+        <label>Email or username</label>
+        <input type="text" name="identifier" placeholder="user@example.com or username" required>
+      </div>
+      <button type="submit" class="btn btn-primary">Grant write access</button>
+    </form>`;
+
+  html += `</div>`;
+  return html;
 }
 
 // ── Project Resources (per-project memory budget) ──────────
