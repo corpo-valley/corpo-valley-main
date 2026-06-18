@@ -13,8 +13,8 @@
     "start:mcp": "node mcp/server.js"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "3.654.0",
-    "@aws-sdk/s3-request-presigner": "3.654.0",
+    "@aws-sdk/client-s3": "3.1068.0",
+    "@aws-sdk/s3-request-presigner": "3.1068.0",
     "express": "5.1.0",
     "pg": "8.13.1"
   }
