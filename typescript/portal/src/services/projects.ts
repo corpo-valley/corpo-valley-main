@@ -62,12 +62,22 @@ export function isGrantLevel(value: string): value is GrantLevel {
   return GRANT_LEVELS.includes(value as GrantLevel);
 }
 
+// Lifecycle of a project's external resources. New projects start
+// `provisioning` and flip to `ready` the moment provisionProject finishes its
+// happy path (shared by both the portal fire-and-forget path and the awaited
+// MCP path). `failed` is set only when provisioning throws hard out of the
+// portal's fire-and-forget call. Existing rows pre-date the column and default
+// to `ready` (they are already provisioned).
+export type ProjectStatus = 'provisioning' | 'ready' | 'failed';
+
 export interface Project {
   id: string;
   slug: string;
   name: string;
   owner_id: string;
   created_at: string;
+  // Provisioning lifecycle — see ProjectStatus.
+  status: string;
   // Gitea repo full_name (`<owner>/<slug>`) once provisioned; null otherwise.
   gitea_repo: string | null;
   // Set when this project has ever had Postgres enabled. We keep it across
@@ -137,6 +147,10 @@ export async function migrate(): Promise<void> {
   `);
   // Added in the Gitea-integration MVP: records the provisioned repo full_name.
   await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS gitea_repo text;');
+  // Provisioning lifecycle (see ProjectStatus). Existing rows are already
+  // provisioned, so the column defaults to 'ready'; only newly-created rows
+  // start out 'provisioning'.
+  await pool.query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ready';");
   // Per-project Postgres password (only ever set once per data lifecycle —
   // see services/postgres.ts).
   await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS postgres_password text;');
@@ -328,12 +342,19 @@ export async function createProject(input: {
   ownerId: string;
 }): Promise<Project> {
   const { rows } = await pool.query<Project>(
-    `INSERT INTO projects (slug, name, owner_id)
-     VALUES ($1, $2, $3)
+    `INSERT INTO projects (slug, name, owner_id, status)
+     VALUES ($1, $2, $3, 'provisioning')
      RETURNING *`,
     [input.slug, input.name, input.ownerId]
   );
   return rows[0];
+}
+
+// Update a project's provisioning lifecycle status. Best-effort UPDATE called
+// from provisionProject (→ 'ready') and the portal's fire-and-forget catch
+// (→ 'failed').
+export async function setProjectStatus(id: string, status: ProjectStatus): Promise<void> {
+  await pool.query('UPDATE projects SET status = $2 WHERE id = $1', [id, status]);
 }
 
 // Every project, for the periodic repo-access reconcile sweep.

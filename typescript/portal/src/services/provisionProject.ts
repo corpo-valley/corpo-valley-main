@@ -14,7 +14,7 @@ import type { Project } from './projects';
 import {
   claimOrGetPostgresPassword, decodePostgresPassword,
   claimOrGetGarageCredentials, decodeGarageCredentials,
-  setGiteaRepo, setPinTokenHash,
+  setGiteaRepo, setPinTokenHash, setProjectStatus,
 } from './projects';
 import { syncRepoAccess } from './repo-access';
 import { type Capabilities, requiresPostgres, TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO } from './templates';
@@ -146,6 +146,11 @@ export async function provisionProject(
   //    project row remains and a retry/reconcile can complete it later.
   if (!result.namespaceSealed) {
     console.error(`[${tag}] skipping ArgoCD registration for ${slug}: namespace not sealed`);
+    // Fail closed AND surface it: the project never reached a deployable state,
+    // so mark it `failed` rather than leaving it stuck `provisioning` (which
+    // would poll the initializing screen forever). Best-effort/logged.
+    try { await setProjectStatus(project.id, 'failed'); }
+    catch (e: any) { console.error(`[${tag}] could not mark ${slug} failed:`, e?.message); }
     return result;
   }
   if (k8sEnabled() && ctx.ownerUsername) {
@@ -163,6 +168,13 @@ export async function provisionProject(
       console.error(`[${tag}] argo register failed for ${slug}:`, e?.message);
     }
   }
+
+  // Provisioning reached the end of the happy path. Flip the project to
+  // `ready` so the portal's initializing screen redirects to the detail page
+  // and the MCP path (which awaits this) returns a ready project. Best-effort
+  // and logged — a DB hiccup here shouldn't change provisionProject's contract.
+  try { await setProjectStatus(project.id, 'ready'); }
+  catch (e: any) { console.error(`[${tag}] could not mark ${slug} ready:`, e?.message); }
 
   return result;
 }
