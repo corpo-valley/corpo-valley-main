@@ -1,6 +1,6 @@
 {
   "name": "corpo-valley-project",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "A Corpo Valley project. One Node app, composed of the capability modules you enabled (static-site, database, storage, mcp).",
   "engines": {

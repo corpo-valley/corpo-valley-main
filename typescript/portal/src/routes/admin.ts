@@ -16,8 +16,14 @@ import {
   renderAdminRecoveryResult, renderAdminApps,
   renderAdminRegisterForm, renderAdminRegisterResult, renderAdminTemplate,
   renderAdminProjectResources, renderStorageHelp, renderError,
+  renderAdminCooldeps,
   UserRow, AppRow, ResourceGroupView, ProjectResourcesResultView,
 } from '../templates';
+import {
+  cooldepsEnabled, loadCooldepsConfig, saveCooldepsConfig,
+  parseCooldepsConfig, reconcileCooldepsConfig, CooldepsConfigError,
+  DEFAULT_COOLDEPS_CONFIG,
+} from '../services/cooldeps-config';
 import {
   seedCommunityCenterTemplate, communityCenterTemplateStatus,
 } from '../services/template-seed';
@@ -700,6 +706,74 @@ router.post('/projects/resources', async (req: Request, res: Response) => {
 // expanded online — describes the manual data-migration path.
 router.get('/help/storage', (req: Request, res: Response) => {
   res.send(renderStorageHelp(req.portalSession!.email));
+});
+
+// ── cooldeps gating policy ─────────────────────────────────────────────────
+// Only mounted when the deployment runs cooldeps; otherwise 404 so the page
+// (and its nav link) don't exist.
+
+router.get('/cooldeps', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  if (!cooldepsEnabled()) {
+    res.status(404).send(renderError('Not found', 'cooldeps is not enabled on this deployment.'));
+    return;
+  }
+  try {
+    const record = await loadCooldepsConfig();
+    res.send(renderAdminCooldeps(record, null, session.email, csrfHiddenField(req, res)));
+  } catch (err: any) {
+    console.error('Admin cooldeps load error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load cooldeps configuration.'));
+  }
+});
+
+router.post('/cooldeps', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  if (!cooldepsEnabled()) {
+    res.status(404).send(renderError('Not found', 'cooldeps is not enabled on this deployment.'));
+    return;
+  }
+  const csrf = csrfHiddenField(req, res);
+  const body = (req.body || {}) as Record<string, unknown>;
+
+  // Validate first so a bad field re-renders the form with the typed values and
+  // a clear message, without touching the DB or the cluster.
+  let config;
+  try {
+    config = parseCooldepsConfig(body);
+  } catch (err: any) {
+    if (err instanceof CooldepsConfigError) {
+      // Re-render with what they submitted (parse failed, so show defaults merged
+      // with valid fields is overkill — show the persisted record + the error).
+      const record = await loadCooldepsConfig().catch(() => null);
+      res.status(400).send(renderAdminCooldeps(
+        record ?? { config: DEFAULT_COOLDEPS_CONFIG, updatedAt: null, updatedBy: null, persisted: false },
+        { ok: false, message: err.message }, session.email, csrf,
+      ));
+      return;
+    }
+    throw err;
+  }
+
+  try {
+    await saveCooldepsConfig(config, session.email);
+    const reconcile = await reconcileCooldepsConfig(config);
+    console.log(`[admin] cooldeps policy updated by ${session.email} (applied=${reconcile.applied})`);
+    const message = reconcile.applied
+      ? 'Saved. cooldeps is restarting with the new policy.'
+      : `Saved to the portal, but not applied to the cluster: ${reconcile.reason}.`;
+    const record = await loadCooldepsConfig();
+    res.send(renderAdminCooldeps(record, { ok: true, message }, session.email, csrf));
+  } catch (err: any) {
+    console.error('Admin cooldeps save error:', err?.message);
+    // It may have persisted but failed to reconcile — reload so the form is truthful.
+    const record = await loadCooldepsConfig().catch(() => null);
+    res.status(500).send(renderAdminCooldeps(
+      record ?? { config, updatedAt: null, updatedBy: null, persisted: false },
+      { ok: false, message: 'Saved state may be partial — failed to apply to the cluster. See portal logs.' },
+      session.email, csrf,
+    ));
+  }
 });
 
 export default router;

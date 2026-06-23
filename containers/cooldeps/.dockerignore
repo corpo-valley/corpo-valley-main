@@ -1,0 +1,7 @@
+# Keep the build context small and reproducible.
+*.db
+*.db-wal
+*.db-shm
+artifacts/
+/data/
+*.log

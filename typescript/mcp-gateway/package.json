@@ -1,6 +1,6 @@
 {
   "name": "mcp-gateway",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Corpo Valley MCP gateway: OAuth-authenticating reverse proxy in front of per-project MCP endpoints",
   "main": "dist/index.js",
   "scripts": {

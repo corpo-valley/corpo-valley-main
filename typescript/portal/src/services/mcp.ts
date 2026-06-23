@@ -60,7 +60,7 @@ import {
 import { purgeProjectResources } from './project-purge';
 import { buildSealedSecretYaml } from './seal';
 import { getDocsTopic, listDocsTopics, type DocsTopic } from './mcp-docs';
-import { PROJECTS_DOMAIN, GITEA_PUBLIC_URL } from './platform-config';
+import { PROJECTS_DOMAIN, GITEA_PUBLIC_URL, COOLDEPS_ENABLED } from './platform-config';
 
 const PROTOCOL_VERSION = '2025-03-26';
 const SERVER_INFO = {
@@ -89,6 +89,36 @@ function requireVerified(ctx: McpContext): void {
     throw new ToolError('email verification required: verify your Corpo Valley email before provisioning resources.');
   }
 }
+
+// ── cooldeps reminders ─────────────────────────────────────────────────────
+// When this deployment runs the cooldeps gate, agents must know their package
+// installs/builds are proxied through it. We surface that in two places: the
+// server `instructions` (read once at connect) and a content block appended to
+// the result of tools that precede dependency work (clone/build/CI), so the
+// nudge lands right when it's relevant.
+
+// One-line reminder appended to the MCP server instructions.
+const COOLDEPS_INSTRUCTIONS =
+  ' This deployment gates dependency installs through cooldeps (a package-manager ' +
+  'proxy that blocks brand-new, badly-licensed, or vulnerable npm/PyPI/Go releases). ' +
+  'CI runners are already pointed at it; before you install or build packages anywhere ' +
+  'else, ensure your package managers use it. Call `how_corpo_valley_works` with topic ' +
+  '`cooldeps` for the registry URLs and details.';
+
+// Tools after which an agent is about to write code, clone, build, or debug a
+// build — i.e. the moments dependency installs happen. Appending the reminder
+// to these keeps it timely without spamming every read-only call.
+const COOLDEPS_REMINDER_TOOLS = new Set([
+  'create_project', 'set_capabilities', 'get_template',
+  'get_gitea_credentials', 'get_ci_logs',
+]);
+
+const COOLDEPS_TOOL_REMINDER =
+  '⚠️ cooldeps is enabled on this deployment: npm/PyPI/Go installs are gated on ' +
+  'release-age, license, and known CVEs. CI builds already route through it. If you ' +
+  'install or build packages outside CI, point your package managers at cooldeps first ' +
+  '(see `how_corpo_valley_works` topic `cooldeps`). A blocked install is policy, not a ' +
+  'network error — do not work around it by disabling the registry.';
 
 // ── JSON-RPC types ─────────────────────────────────────────────────────────
 
@@ -1246,7 +1276,8 @@ async function handleRpc(req: JsonRpcRequest, ctx: McpContext): Promise<JsonRpcR
           // tools/list — no editor restart needed.
           capabilities: { tools: { listChanged: true } },
           serverInfo: SERVER_INFO,
-          instructions: 'Call `how_corpo_valley_works` first to learn the platform. Use `list_projects` to see what the user has, `create_project` to plant a new one, and `get_gitea_credentials` to get a ready-to-use clone URL. Platform source & issues: https://github.com/corpo-valley/corpo-valley-main',
+          instructions: 'Call `how_corpo_valley_works` first to learn the platform. Use `list_projects` to see what the user has, `create_project` to plant a new one, and `get_gitea_credentials` to get a ready-to-use clone URL. Platform source & issues: https://github.com/corpo-valley/corpo-valley-main'
+            + (COOLDEPS_ENABLED ? COOLDEPS_INSTRUCTIONS : ''),
         };
         return isNotification ? null : ok(req.id, result);
       }
@@ -1273,8 +1304,15 @@ async function handleRpc(req: JsonRpcRequest, ctx: McpContext): Promise<JsonRpcR
           // structured returns we hand the agent a JSON-stringified text
           // block — Claude / Cursor / Codex all parse it back happily,
           // and the text representation keeps payloads inspectable.
+          const content: any[] = [{ type: 'text', text: JSON.stringify(result, null, 2) }];
+          // Nudge the agent about the cooldeps gate right before it does
+          // dependency work (clone/build/CI). Gated on the deployment flag and
+          // the tool being one that precedes installs.
+          if (COOLDEPS_ENABLED && params.name && COOLDEPS_REMINDER_TOOLS.has(params.name)) {
+            content.push({ type: 'text', text: COOLDEPS_TOOL_REMINDER });
+          }
           return ok(req.id, {
-            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+            content,
             isError: false,
             structuredContent: result,
           });

@@ -28,7 +28,35 @@ import { TEMPLATE_GITEA_OWNER, TEMPLATE_GITEA_REPO } from './templates';
 import {
   CV_REGISTRY, PORTAL_INTERNAL_URL, PORTAL_PUBLIC_URL,
   KRATOS_CLUSTER_URL, PROJECTS_DOMAIN,
+  COOLDEPS_ENABLED, COOLDEPS_INTERNAL_URL,
 } from './platform-config';
+
+// cooldeps template fragments. When the deployment runs the gate, the seeded
+// repo carries an .npmrc pointing the in-image `npm install` at the proxy (so
+// project builds are gated, not just CI's native steps) and an AGENTS.md note
+// telling agents to expect it. When off, both render empty so a project looks
+// exactly as it did before cooldeps existed. NOTE: these are FACTORY DEFAULTS
+// applied at seed time — toggling cooldeps later affects newly created projects;
+// existing repos pick up the note on a template reset.
+const COOLDEPS_NPMRC = COOLDEPS_ENABLED
+  ? `# Managed by Corpo Valley: route dependency installs through the cooldeps\n`
+    + `# gating proxy (release-age + license + CVE checks). Leave this in place;\n`
+    + `# a blocked install is policy, not a network error.\n`
+    + `registry=${COOLDEPS_INTERNAL_URL}/npm/\n`
+  : '';
+
+const COOLDEPS_AGENTS_NOTE = COOLDEPS_ENABLED
+  ? `\n## Dependency gating (cooldeps)\n\n`
+    + `This platform proxies npm/PyPI/Go installs through **cooldeps**, which blocks\n`
+    + `brand-new (within a cooldown window), badly-licensed, or known-vulnerable\n`
+    + `releases. The build pipeline and this repo's \`.npmrc\` are already wired to it,\n`
+    + `so a normal push-and-build flow needs no extra setup.\n\n`
+    + `If a dependency is rejected, that's policy — **don't** work around it by removing\n`
+    + `\`.npmrc\` or switching registries. A brand-new package usually just needs to age\n`
+    + `out of the cooldown; otherwise ask an admin to add an override on the portal's\n`
+    + `cooldeps page. MCP-connected agents: call \`how_corpo_valley_works\` topic\n`
+    + `\`cooldeps\` for details.\n`
+  : '';
 
 // Locate the baseline tree. In the container it's /app/community-center
 // (two levels up from dist/services); in a dev checkout it's at the monorepo
@@ -52,6 +80,10 @@ const RENDER_VARS: Record<string, string> = {
   '{{CV_PORTAL_LOGIN_URL}}': `${PORTAL_PUBLIC_URL}/login`,
   '{{CV_KRATOS_PUBLIC_URL}}': KRATOS_CLUSTER_URL,
   '{{CV_PROJECTS_DOMAIN}}': PROJECTS_DOMAIN,
+  // Empty string when cooldeps is off, so the .npmrc / AGENTS.md placeholders
+  // disappear cleanly on deployments that don't run the gate.
+  '{{CV_COOLDEPS_NPMRC}}': COOLDEPS_NPMRC,
+  '{{CV_COOLDEPS_NOTE}}': COOLDEPS_AGENTS_NOTE,
 };
 
 export function renderTemplateFile(content: string): string {

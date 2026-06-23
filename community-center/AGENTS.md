@@ -141,7 +141,7 @@ daemon's, not the app's.
 SQL (the `database` module does), keep dependencies current, and if a scanner
 flags an accepted false positive, suppress the single line with a justified
 `// nosemgrep: <rule-id> -- <reason>` rather than disabling the workflow.
-
+{{CV_COOLDEPS_NOTE}}
 ## See also
 
 - `.claude/CLAUDE.md` — a one-line pointer back to this file for tooling that
