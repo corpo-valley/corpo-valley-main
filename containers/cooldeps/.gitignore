@@ -1,0 +1,16 @@
+# Build output
+/cooldeps
+/dist/
+*.exe
+
+# Test / coverage
+coverage.out
+*.test
+
+# Runtime data + cache
+/data/
+*.db
+*.db-wal
+*.db-shm
+artifacts/
+*.log

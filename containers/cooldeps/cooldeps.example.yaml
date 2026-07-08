@@ -1,0 +1,54 @@
+# cooldeps configuration — reference file showing every setting at its built-in
+# default. All keys are optional; omit a key to keep the default shown here.
+#
+# Load it by pointing COOLDEPS_CONFIG at this file:
+#     COOLDEPS_CONFIG=/etc/cooldeps/cooldeps.yaml cooldeps
+#
+# Any field can also be overridden by an environment variable named
+# COOLDEPS_<SECTION>_<FIELD> (uppercased, e.g. COOLDEPS_CACHE_METATTL,
+# COOLDEPS_POLICY_CVE_MAXSEVERITY). Precedence: defaults < this file < env.
+# See docs/config-schema.md for the full normative spec.
+
+server:
+  addr: ":8080"                          # COOLDEPS_SERVER_ADDR
+  statusEnabled: false                   # COOLDEPS_SERVER_STATUSENABLED — /status is 404 unless true
+  logLevel: info                         # COOLDEPS_SERVER_LOGLEVEL — debug|info|warn|error
+  npmUpstream: https://registry.npmjs.org
+  pypiUpstream: https://pypi.org
+  goUpstream: https://proxy.golang.org
+  publicURL: ""                          # COOLDEPS_SERVER_PUBLICURL — base for rewritten npm tarball URLs (default: derived from request)
+
+cache:
+  dataDir: /data                         # COOLDEPS_CACHE_DATADIR — metadata DB + artifact cache root
+  artifacts: true                        # COOLDEPS_CACHE_ARTIFACTS — enable the on-disk artifact cache
+  artifactDir: ""                        # COOLDEPS_CACHE_ARTIFACTDIR — defaults to <dataDir>/artifacts
+  artifactMaxBytes: 40GiB                # COOLDEPS_CACHE_ARTIFACTMAXBYTES — LRU cap (KiB/MiB/GiB or KB/MB/GB, or raw bytes)
+  vulnTTL: 6h                            # COOLDEPS_CACHE_VULNTTL — re-query OSV after this
+  metaTTL: 0                             # COOLDEPS_CACHE_METATTL — re-fetch found metadata after this; 0 = forever
+  metaNotFoundRefresh: 30m               # COOLDEPS_CACHE_METANOTFOUNDREFRESH — re-check a not-yet-known version after this
+  fetchConcurrency: 8                    # COOLDEPS_CACHE_FETCHCONCURRENCY — per-request upstream fetch parallelism
+
+policy:
+  license:
+    # Versions whose license is outside `allow` (and not unknown) are blocked.
+    # Leave `allow` empty to allow everything not in `block` (blocklist-only).
+    allow: [MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC]
+    block: [GPL-3.0, AGPL-3.0]
+    warnOnUnknown: true                  # COOLDEPS_POLICY_LICENSE_WARNONUNKNOWN
+  releaseAge:
+    minDays: 14                          # COOLDEPS_POLICY_RELEASEAGE_MINDAYS — the cooldown window; 0 disables it
+    warnOnly: false                      # COOLDEPS_POLICY_RELEASEAGE_WARNONLY
+    blockOnUnknown: false                # COOLDEPS_POLICY_RELEASEAGE_BLOCKONUNKNOWN
+  cve:
+    maxSeverity: HIGH                    # COOLDEPS_POLICY_CVE_MAXSEVERITY — NONE|LOW|MEDIUM|HIGH|CRITICAL; "" disables CVE checks
+    warnOnly: false                      # COOLDEPS_POLICY_CVE_WARNONLY
+    fetchSeverity: true                  # COOLDEPS_POLICY_CVE_FETCHSEVERITY
+  failOpen: false                        # COOLDEPS_POLICY_FAILOPEN — APIs unreachable => false: BLOCK, true: WARN/allow
+  # Override pins force a decision regardless of the checks above (file-only —
+  # not settable via env). Forms: "ecosystem:name@version", "ecosystem:name",
+  # "name@version", "name".
+  overrides:
+    allow: []
+      # - "npm:laps@1.0.1"               # let a fresh critical fix through the cooldown
+    block: []
+      # - "npm:left-pad@1.0.0"           # incident response: kill a known-bad release

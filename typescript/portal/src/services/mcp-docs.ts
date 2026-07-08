@@ -6,10 +6,11 @@
 // not internal architecture trivia. If you change platform behaviour, edit
 // the relevant topic here so an MCP-connected agent learns about it.
 
-export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'resources' | 'database' | 'storage';
+export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'resources' | 'database' | 'storage' | 'cooldeps';
 
 import {
   PROJECTS_DOMAIN, BASE_DOMAIN, GITEA_PUBLIC_URL, CV_REGISTRY, PORTAL_INTERNAL_URL,
+  COOLDEPS_ENABLED, COOLDEPS_INTERNAL_URL, COOLDEPS_PUBLIC_URL,
 } from './platform-config';
 
 // Display values for the docs, derived from this deployment's config so the
@@ -17,6 +18,11 @@ import {
 const GITEA_HOST = GITEA_PUBLIC_URL.replace(/^https?:\/\//, '');
 const PORTAL_PIN_HOST = PORTAL_INTERNAL_URL.replace(/^https?:\/\//, '');
 const PROJECTS_ARGOCD_NS = process.env.CV_PROJECTS_ARGOCD_NAMESPACE || 'cv-projects-argocd';
+
+// cooldeps proxy endpoints, derived from this deployment's config. The public
+// base (laptops) is preferred for human-facing docs when exposed; CI always
+// uses the in-cluster base.
+const COOLDEPS_BASE = COOLDEPS_PUBLIC_URL || COOLDEPS_INTERNAL_URL;
 
 const TOPICS: Record<DocsTopic, string> = {
   overview: `# Corpo Valley — overview
@@ -65,7 +71,12 @@ portal checkboxes); to model a capability by hand, read its pattern with
 Platform source lives at https://github.com/corpo-valley/corpo-valley-main
 (portal + this MCP server + the mcp gateway) — point the user there for
 issues or to read how the platform itself works.
-`,
+${COOLDEPS_ENABLED ? `
+**Dependency gating (cooldeps).** This deployment proxies all npm/PyPI/Go
+installs through cooldeps, which blocks brand-new, badly-licensed, or
+vulnerable releases. CI is already wired to it; see the \`cooldeps\` topic
+before you add or build dependencies.
+` : ''}`,
   projects: `# Projects
 
 A project is owned by exactly one Corpo Valley user. The slug is a
@@ -456,13 +467,59 @@ scoping.)
    on the portal project page; \`create_project\`'s \`visibility\` seeds the
    initial posture (\`private\` = no grant, \`internal\` = everyone read+write).
 `,
+  cooldeps: `# cooldeps — dependency gating
+
+This deployment runs **cooldeps**, a package-manager proxy that sits in front of
+npm, PyPI, and the Go module proxy and gates every requested version before it
+downloads. It blocks:
+
+- **brand-new releases** — held until they've survived a cooldown window (the
+  prime defense against a compromised-maintainer supply-chain attack),
+- packages with a **disallowed license**, and
+- versions with a **known CVE** at or above the configured severity.
+
+A blocked install is **policy, not a network error**. Don't route around it by
+resetting the registry or pinning a different index — surface the block to the
+user (a brand-new dependency usually just needs to age out of the cooldown, or
+an admin can add an override pin on the portal's /admin/cooldeps page).
+
+**CI is already wired.** The Gitea build/scan runners install through cooldeps
+automatically — you don't configure anything for a normal push-and-build flow.
+Expect a freshly published dependency to fail the build until it clears the
+cooldown.
+
+**Installing outside CI** (a local clone, a one-off container build): point your
+package managers at the proxy:
+
+\`\`\`sh
+# npm / pnpm / yarn
+npm config set registry ${COOLDEPS_BASE}/npm/
+# pip
+export PIP_INDEX_URL=${COOLDEPS_BASE}/pypi/simple
+# go
+go env -w GOPROXY=${COOLDEPS_BASE}/go,direct
+\`\`\`
+${COOLDEPS_PUBLIC_URL ? `
+The proxy is also reachable at ${COOLDEPS_PUBLIC_URL} for machines outside the
+cluster.
+` : `
+The proxy is in-cluster only; the URL above resolves from inside the platform
+(CI, project pods).
+`}`,
 };
 
+// `cooldeps` is only a real topic when the deployment runs the gate; otherwise
+// it's hidden from the list and a request for it falls back to the overview.
+function topicAvailable(key: DocsTopic): boolean {
+  return key !== 'cooldeps' || COOLDEPS_ENABLED;
+}
+
 export function getDocsTopic(topic?: string): { topic: DocsTopic; markdown: string } {
-  const key = (topic && (topic in TOPICS) ? topic : 'overview') as DocsTopic;
+  const requested = (topic && (topic in TOPICS) ? topic : 'overview') as DocsTopic;
+  const key = topicAvailable(requested) ? requested : 'overview';
   return { topic: key, markdown: TOPICS[key].trim() + '\n' };
 }
 
 export function listDocsTopics(): DocsTopic[] {
-  return Object.keys(TOPICS) as DocsTopic[];
+  return (Object.keys(TOPICS) as DocsTopic[]).filter(topicAvailable);
 }

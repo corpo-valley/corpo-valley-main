@@ -107,6 +107,35 @@ export const GARAGE_IMAGE =
 export const POSTGRES_IMAGE =
   process.env.CV_POSTGRES_IMAGE || 'postgres:16-alpine';
 
+// ── cooldeps: optional package-manager gating proxy (npm / PyPI / Go) ──────
+// Whether this deployment runs the cooldeps supply-chain gate. The chart sets
+// COOLDEPS_ENABLED from `cooldeps.enabled`. When on, the portal surfaces the
+// /admin/cooldeps page, injects cooldeps reminders into the MCP instructions,
+// docs, tool results, and the seeded Community Center template, and reconciles
+// the cv-cooldeps ConfigMap (admin policy edits) + rolls the Deployment.
+export const COOLDEPS_ENABLED =
+  (process.env.COOLDEPS_ENABLED || 'false').toLowerCase() === 'true';
+
+// In-cluster cooldeps endpoint (chart default
+// http://cooldeps.cv-cooldeps.svc.cluster.local:8080). The base the CI runners
+// and project builds point their package managers at; the per-ecosystem
+// registry URLs the docs/template reference derive from it (…/npm, …/pypi/simple,
+// …/go).
+export const COOLDEPS_INTERNAL_URL =
+  (process.env.COOLDEPS_INTERNAL_URL || 'http://cooldeps.cv-cooldeps.svc.cluster.local:8080')
+    .replace(/\/+$/, '');
+
+// Namespace the cooldeps Deployment + cooldeps-config ConfigMap live in. The
+// portal patches the config and rolls the Deployment here when an admin saves
+// new policy from /admin/cooldeps.
+export const COOLDEPS_NAMESPACE =
+  process.env.COOLDEPS_NAMESPACE || 'cv-cooldeps';
+
+// Public cooldeps URL — set only when cooldeps.publicIngress is on (so dev
+// laptops can install through it). Empty string means "in-cluster only".
+export const COOLDEPS_PUBLIC_URL =
+  (process.env.COOLDEPS_PUBLIC_URL || '').replace(/\/+$/, '');
+
 // A Kubernetes resource "quantity": digits with an optional decimal/exponent
 // and one of the canonical unit suffixes (e.g. 64Mi, 2Gi, 250m, 2). Anchored,
 // and length-capped to keep a pathological input from reaching the regex.

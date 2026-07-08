@@ -207,6 +207,21 @@ export async function migrate(): Promise<void> {
   await pool.query('CREATE INDEX IF NOT EXISTS project_grants_subject_idx ON project_grants (subject_type, subject_id);');
   await pool.query('CREATE INDEX IF NOT EXISTS group_members_user_idx ON group_members (user_id);');
 
+  // Single-row store for the runtime cooldeps policy an admin edits on
+  // /admin/cooldeps. The chart seeds the initial cv-cooldeps ConfigMap; once an
+  // admin saves here this row is the source of truth and the portal reconciles
+  // the ConfigMap (+ rolls the Deployment) from it. Only used when the
+  // deployment runs cooldeps; absent row → built-in defaults.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS platform_cooldeps_config (
+      id integer primary key default 1,
+      config jsonb not null,
+      updated_at timestamptz not null default now(),
+      updated_by text,
+      constraint platform_cooldeps_config_singleton check (id = 1)
+    );
+  `);
+
   // Existing DBs: widen the subject_type CHECK to admit `everyone` and add the
   // no-org-wide-admin CHECK (both no-ops once already present). The inline
   // CHECKs above only take effect on a fresh CREATE.

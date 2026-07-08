@@ -9,6 +9,7 @@ import { cspNonce } from './lib/csp-nonce';
 import {
   GITEA_PUBLIC_URL, PROJECTS_DOMAIN, BASE_DOMAIN,
   PORTAL_PUBLIC_URL, MCP_ENDPOINT_URL, OAUTH_PUBLIC_URL,
+  COOLDEPS_ENABLED,
 } from './services/platform-config';
 
 const GOOGLE_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" style="vertical-align:middle;margin-right:8px;"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>`;
@@ -658,6 +659,7 @@ function dashboardLayout(
       <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>Services</a>
       <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
       <a href="/admin/projects/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Project Resources</a>
+      ${COOLDEPS_ENABLED ? `<a href="/admin/cooldeps"${activeNav === 'cooldeps' ? ' class="active"' : ''}>cooldeps</a>` : ''}
     `;
   }
 
@@ -2680,6 +2682,111 @@ export function renderAdminProjectResources(
     </form>`;
 
   return dashboardLayout('Project Resources', body, email, true, 'resources');
+}
+
+export interface CooldepsResultView { ok: boolean; message: string; }
+
+// /admin/cooldeps — edit the runtime cooldeps gating policy. `record` is the
+// stored config (or built-in defaults when never saved); on save the route
+// persists it and reconciles the cv-cooldeps ConfigMap + Deployment.
+export function renderAdminCooldeps(
+  record: import('./services/cooldeps-config').CooldepsConfigRecord,
+  result: CooldepsResultView | null,
+  email: string,
+  csrf: string = '',
+): string {
+  const cfg = record.config;
+  const p = cfg.policy;
+  let body = '';
+
+  if (result) {
+    const color = result.ok ? '#84a25a' : '#d9734a';
+    const bg = result.ok ? 'rgba(132,162,90,0.12)' : 'rgba(217,115,74,0.12)';
+    body += `<div style="margin-bottom:1rem; padding:0.75rem 1rem; border:1px solid ${color}; border-radius:4px; background:${bg};">`
+      + `${result.ok ? '✓' : '✗'} ${escapeHtml(result.message)}</div>`;
+  }
+
+  const meta = record.persisted && record.updatedAt
+    ? `Last saved ${escapeHtml(record.updatedAt)}${record.updatedBy ? ` by ${escapeHtml(record.updatedBy)}` : ''}.`
+    : `Showing built-in defaults — not yet customised for this deployment.`;
+
+  body += `<p>Tune the <strong>cooldeps</strong> dependency gate. These apply to
+    every npm/PyPI/Go install routed through the proxy (CI runners, and any build
+    or machine pointed at it). Saving rewrites the proxy's config and restarts it,
+    so changes take effect within a few seconds. <span style="color:#8a7a5a;">${meta}</span></p>`;
+
+  const checkbox = (name: string, label: string, checked: boolean, help: string) => `
+      <label style="display:flex; gap:0.5rem; align-items:flex-start; margin:0.4rem 0;">
+        <input type="checkbox" name="${name}" value="true"${checked ? ' checked' : ''} style="margin-top:0.2rem;">
+        <span>${escapeHtml(label)}<br><span style="font-size:0.8rem; color:#8a7a5a;">${escapeHtml(help)}</span></span>
+      </label>`;
+
+  const textarea = (name: string, label: string, items: string[], help: string) => `
+      <div class="field">
+        <label>${escapeHtml(label)}</label>
+        <textarea name="${name}" rows="4" autocomplete="off" spellcheck="false"
+          style="width:100%; font-family:monospace;">${escapeHtml(items.join('\n'))}</textarea>
+        <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">${escapeHtml(help)}</div>
+      </div>`;
+
+  const sevOptions = ['', 'NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
+    .map((s) => `<option value="${s}"${p.cve.maxSeverity === s ? ' selected' : ''}>${s === '' ? '(disabled)' : s}</option>`)
+    .join('');
+  const logOptions = ['debug', 'info', 'warn', 'error']
+    .map((s) => `<option value="${s}"${cfg.logLevel === s ? ' selected' : ''}>${s}</option>`)
+    .join('');
+
+  body += `
+    <form method="POST" action="/admin/cooldeps" style="max-width:40rem;">
+      ${csrf}
+      <fieldset style="border:1px solid #5a4a36; border-radius:6px; padding:1rem; margin-bottom:1rem;">
+        <legend style="padding:0 0.5rem; color:#c4b698;">Release age (the cooldown)</legend>
+        <div class="field">
+          <label>Cooldown window (days)</label>
+          <input type="number" name="minDays" min="0" max="3650" value="${p.releaseAge.minDays}" style="width:8rem;">
+          <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">Hold releases younger than this. 0 disables the cooldown.</div>
+        </div>
+        ${checkbox('releaseAgeWarnOnly', 'Warn only', p.releaseAge.warnOnly, 'Allow fresh releases but log a warning instead of blocking.')}
+        ${checkbox('releaseAgeBlockOnUnknown', 'Block on unknown age', p.releaseAge.blockOnUnknown, "Block versions whose publish date can't be determined.")}
+      </fieldset>
+
+      <fieldset style="border:1px solid #5a4a36; border-radius:6px; padding:1rem; margin-bottom:1rem;">
+        <legend style="padding:0 0.5rem; color:#c4b698;">Known vulnerabilities (CVE)</legend>
+        <div class="field">
+          <label>Max allowed severity</label>
+          <select name="cveMaxSeverity" style="width:12rem;">${sevOptions}</select>
+          <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">Block versions with a CVE at or above this. "(disabled)" turns off CVE checks.</div>
+        </div>
+        ${checkbox('cveWarnOnly', 'Warn only', p.cve.warnOnly, 'Allow vulnerable versions but log a warning instead of blocking.')}
+      </fieldset>
+
+      <fieldset style="border:1px solid #5a4a36; border-radius:6px; padding:1rem; margin-bottom:1rem;">
+        <legend style="padding:0 0.5rem; color:#c4b698;">License policy</legend>
+        ${textarea('licenseAllow', 'Allowed licenses', p.license.allow, 'One SPDX id per line. Leave empty to allow everything not in the block list.')}
+        ${textarea('licenseBlock', 'Blocked licenses', p.license.block, 'One SPDX id per line.')}
+        ${checkbox('licenseWarnOnUnknown', 'Warn on unknown license', p.license.warnOnUnknown, 'Warn (not block) when a version has no detectable license.')}
+      </fieldset>
+
+      <fieldset style="border:1px solid #5a4a36; border-radius:6px; padding:1rem; margin-bottom:1rem;">
+        <legend style="padding:0 0.5rem; color:#c4b698;">Override pins (incident response)</legend>
+        ${textarea('overridesAllow', 'Force-allow', p.overrides.allow, 'Let a specific release through the checks. e.g. npm:laps@1.0.1')}
+        ${textarea('overridesBlock', 'Force-block', p.overrides.block, 'Kill a known-bad release immediately. e.g. npm:left-pad@1.0.0')}
+      </fieldset>
+
+      <fieldset style="border:1px solid #5a4a36; border-radius:6px; padding:1rem; margin-bottom:1rem;">
+        <legend style="padding:0 0.5rem; color:#c4b698;">Behaviour</legend>
+        ${checkbox('failOpen', 'Fail open', p.failOpen, 'If the upstream registries / OSV are unreachable, allow installs (warn) instead of blocking. Off is safer.')}
+        <div class="field">
+          <label>Log level</label>
+          <select name="logLevel" style="width:10rem;">${logOptions}</select>
+        </div>
+        ${checkbox('statusEnabled', 'Expose /status endpoint', cfg.statusEnabled, 'Serve cooldeps runtime stats at /status. Off by default.')}
+      </fieldset>
+
+      <button type="submit" class="btn">Save &amp; apply</button>
+    </form>`;
+
+  return dashboardLayout('cooldeps', body, email, true, 'cooldeps');
 }
 
 // Help page for the case the storage reconciler can't handle automatically: a

@@ -9,7 +9,10 @@
 # into the runtime image so the npm cache never ships.
 FROM node:20-alpine AS deps
 WORKDIR /app
-COPY package*.json ./
+# .npmrc is copied with the manifests so `npm install` honors the platform's
+# cooldeps gating proxy when this deployment runs it (the file is empty
+# otherwise, so the default registry is used). Keep it before the install.
+COPY package*.json .npmrc ./
 RUN npm install --omit=dev
 
 FROM node:20-alpine

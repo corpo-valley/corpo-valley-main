@@ -168,6 +168,24 @@ export async function k8sDeleteNamespaced<T = any>(
   });
 }
 
+// JSON merge-patch (RFC 7386) a namespaced resource. Used by the cooldeps admin
+// reconcile to overwrite the ConfigMap's `cooldeps.yaml` key and to stamp a
+// rollout-restart annotation on the Deployment. The portal SA is granted patch
+// on exactly those two named objects in cv-cooldeps (chart RBAC).
+export async function k8sMergePatchNamespaced<T = any>(
+  ref: NamespacedRef, name: string, patch: unknown
+): Promise<T> {
+  if (!k8sEnabled()) {
+    throw new K8sApiError(0, { message: 'k8s integration disabled' });
+  }
+  return call<T>({
+    method: 'PATCH',
+    path: `${k8sPathBase(ref)}/namespaces/${encodeURIComponent(ref.namespace)}/${ref.plural}/${encodeURIComponent(name)}`,
+    body: patch,
+    contentType: 'application/merge-patch+json',
+  });
+}
+
 // Pod logs are served as text/plain, not JSON, so we make the request
 // ourselves rather than going through `call<T>` (which json-parses).
 export async function k8sPodLogs(opts: {
