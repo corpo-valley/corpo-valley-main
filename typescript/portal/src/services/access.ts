@@ -193,6 +193,19 @@ export async function findGrantBySubject(
   return rows[0] ?? null;
 }
 
+// Org-wide `everyone` REPO access is capped at read: an everyone-write grant
+// would give every signed-in member push access, and pushes auto-deploy into
+// the owner's namespace. Repo write/admin must be an explicit user/group grant.
+// This is the authoritative backstop for every grant write path (the dashboard
+// route also rejects it up-front with a friendly message). Site perms are
+// unaffected — org-wide site:write is a legitimate app-content posture.
+export class GrantPolicyError extends Error {}
+function assertEveryoneRepoCap(subjectType: SubjectType, repoPerm: GrantLevel | null): void {
+  if (subjectType === 'everyone' && repoPerm !== null && repoPerm !== 'read') {
+    throw new GrantPolicyError('org-wide “everyone” repo access is capped at read; grant repo write to specific users or groups instead.');
+  }
+}
+
 // Upsert: granting the same subject again replaces its levels rather than
 // erroring, which is what an owner adjusting access expects.
 export async function upsertProjectGrant(grant: {
@@ -204,6 +217,7 @@ export async function upsertProjectGrant(grant: {
   sitePerm: GrantLevel | null;
   repoPerm: GrantLevel | null;
 }): Promise<ProjectGrant> {
+  assertEveryoneRepoCap(grant.subjectType, grant.repoPerm);
   const { rows } = await pool.query<ProjectGrant>(
     `INSERT INTO project_grants (project_id, subject_type, subject_id, subject_name, gitea_username, site_perm, repo_perm)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -232,6 +246,7 @@ export async function setGrantFacet(input: {
   facet: GrantFacet;
   level: GrantLevel;
 }): Promise<ProjectGrant> {
+  if (input.facet === 'repo') assertEveryoneRepoCap(input.subjectType, input.level);
   const col = input.facet === 'site' ? 'site_perm' : 'repo_perm';
   const { rows } = await pool.query<ProjectGrant>(
     `INSERT INTO project_grants (project_id, subject_type, subject_id, subject_name, gitea_username, ${col})
