@@ -92,6 +92,7 @@ export function requiresPostgres(caps: Capabilities): boolean {
 export function capabilityList(caps: Capabilities): string[] {
   const list = ['website'];
   if (caps.database) list.push('database');
+  if (caps.storage) list.push('storage');
   if (caps.mcp) list.push('mcp');
   if (caps.shared) list.push('shared');
   return list;

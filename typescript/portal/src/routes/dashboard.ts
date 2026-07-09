@@ -327,10 +327,11 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
 
   // Visibility preset → the project's initial org-wide `everyone` grant.
   // `private` (default) seeds nothing — owner-only. `internal` grants every
-  // signed-in member write on both the site and the repo. Finer access is
-  // managed afterwards as explicit user/group/everyone grants on the project
-  // page. Corpo Valley has no `public` preset — neither repo nor deployed site
-  // can be exposed unauthenticated.
+  // signed-in member READ on the deployed site only (view-only); it grants NO
+  // repo access, so nobody can read or push the code — which auto-deploys —
+  // without an explicit grant. Anything more is managed afterwards as explicit
+  // user/group/everyone grants on the project page. Corpo Valley has no `public`
+  // preset — neither repo nor deployed site can be exposed unauthenticated.
   const visible = visibility === 'internal' ? 'internal' : 'private';
 
   try {
@@ -351,7 +352,7 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
       await upsertProjectGrant({
         projectId: project.id, subjectType: 'everyone',
         subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME,
-        sitePerm: 'write', repoPerm: 'write',
+        sitePerm: 'read', repoPerm: null,
       }).catch((e: any) => console.error('[dashboard] seed everyone grant failed:', e?.message));
     }
     if (!session.preferredUsername) {
@@ -875,9 +876,16 @@ router.post('/projects/:id/access', requireSession, requireVerifiedEmail, async 
     }
     const subject = resolved.subject;
 
-    // The org-wide `everyone` subject is capped at read/write on both areas.
+    // The org-wide `everyone` subject cannot be granted Admin on either area.
     if (subject.subjectType === 'everyone' && ops.some((o) => o.level === 'admin')) {
       res.status(400).send(renderError('Invalid Input', '“Everyone” cannot be granted Admin — use read or write for org-wide access.'));
+      return;
+    }
+    // …and org-wide REPO access is capped at read: everyone-write on the repo
+    // would give every member push access, and pushes auto-deploy into the
+    // owner's namespace. Grant repo write to specific users or groups instead.
+    if (subject.subjectType === 'everyone' && ops.some((o) => o.facet === 'repo' && o.level !== null && o.level !== 'read')) {
+      res.status(400).send(renderError('Invalid Input', '“Everyone” cannot be granted write on the repo — org-wide repo access is capped at read. Grant repo write to specific users or groups instead.'));
       return;
     }
 

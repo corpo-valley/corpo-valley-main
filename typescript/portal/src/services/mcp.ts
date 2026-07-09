@@ -13,16 +13,17 @@
 
 import * as crypto from 'crypto';
 import {
-  createProject, getProjectById, listProjectsByOwner, deleteProject,
+  createProject, getProjectById, getProjectBySlug, listProjectsByOwner, deleteProject,
   slugExists, isValidSlug,
   setGiteaRepo, clearPostgresPassword,
   claimOrGetPostgresPassword, decodePostgresPassword,
   clearGarageCredentials, claimOrGetGarageCredentials, decodeGarageCredentials,
-  setPinTokenHash,
-  type Project, type GrantLevel,
+  setPinTokenHash, maxPerm,
+  type Project, type GrantLevel, type EffectivePerm,
 } from './projects';
 import {
   upsertProjectGrant, getEveryoneGrants,
+  listProjectsSharedWith, effectiveRepoPerm, effectiveSitePerm,
   EVERYONE_SUBJECT_ID, EVERYONE_SUBJECT_NAME,
 } from './access';
 import { syncRepoAccess } from './repo-access';
@@ -168,17 +169,41 @@ interface ToolDef {
 
 const tools: Record<string, ToolDef> = {
   list_projects: {
-    description: 'List all Corpo Valley projects owned by the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-    async handler(ctx) {
-      const rows = await listProjectsByOwner(ctx.userId);
-      const everyone = await getEveryoneGrants(rows.map((p) => p.id)).catch(() => new Map());
-      return { projects: rows.map((p) => toToolProject(p, everyone.get(p.id))) };
+    description: 'List Corpo Valley projects the authenticated user OWNS or has been directly shared (a per-user or group grant). Each project carries `access`: "owner" (full/admin control) or "shared" (plus `your_site_perm`/`your_repo_perm` — your effective read/write/admin level on the deployed site and the repo). Projects shared only via an org-wide "everyone" grant (e.g. `internal` visibility) are NOT enumerated here — matching the dashboard — but you can still `get_project` them by slug. Pass `include_capabilities: true` to also return each project\'s `capabilities` and its `mcp` endpoint ({enabled, url}) so you can spot which projects expose an MCP — this costs one repo read per project, so omit it for a plain listing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        include_capabilities: { type: 'boolean', default: false, description: 'Detect and include each project\'s capabilities + mcp endpoint (one repo read per project).' },
+      },
+      additionalProperties: false,
+    },
+    async handler(ctx, args) {
+      const owned = await listProjectsByOwner(ctx.userId);
+      const shared = await listProjectsSharedWith(ctx.userId).catch(() => []);
+      const everyone = await getEveryoneGrants([...owned, ...shared].map((p) => p.id)).catch(() => new Map());
+      const rows = [
+        ...owned.map((p) => ({ p, extra: { access: 'owner' as const } })),
+        ...shared.map((p) => ({ p, extra: { access: 'shared' as const, your_site_perm: p.site_perm, your_repo_perm: p.repo_perm } })),
+      ];
+      const withCaps = args?.include_capabilities === true;
+      const projects = await Promise.all(rows.map(async ({ p, extra }) => {
+        const base = { ...toToolProject(p, everyone.get(p.id)), ...extra };
+        if (!withCaps) return base;
+        // Best-effort per-project detection: a failure leaves capabilities null
+        // (mcp.enabled null) rather than failing the whole listing.
+        let caps: Capabilities | null = null;
+        if (p.gitea_repo) {
+          const [o, r] = p.gitea_repo.split('/');
+          caps = await detectCapabilities({ owner: o, repo: r }).catch(() => null);
+        }
+        return { ...base, capabilities: caps ? capabilityList(caps) : null, mcp: mcpEndpoint(base.url, caps) };
+      }));
+      return { projects };
     },
   },
 
   get_project: {
-    description: 'Get the full record for a single project owned by the user, by uuid or slug. Includes the enabled `capabilities` (derived from the repo manifests), `postgres.enabled`, and `storage.enabled`. Returns null if not found or not owned by the caller.',
+    description: 'Get the full record for a single project the user can access (owns or has been granted), by uuid or slug. Includes the enabled `capabilities` (derived from the repo manifests), `postgres.enabled`, `storage.enabled`, and the caller\'s `access` ("owner"/"shared") + `your_repo_perm`. Returns null if not found or not accessible to the caller.',
     inputSchema: {
       type: 'object',
       required: ['id_or_slug'],
@@ -186,8 +211,16 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
-      const p = await resolveOwnedProject(ctx, args.id_or_slug);
+      if (!args.id_or_slug) return null;
+      const p = UUID_RE.test(args.id_or_slug) ? await getProjectById(args.id_or_slug) : await getProjectBySlug(args.id_or_slug);
       if (!p) return null;
+      const isOwner = p.owner_id === ctx.userId;
+      // The record is viewable with read on EITHER facet — a site-only viewer
+      // (e.g. an `internal` project's org-wide grant) sees the same row the
+      // dashboard already shows them. The repo/ops TOOLS still gate on repo perm.
+      const yourRepoPerm = isOwner ? 'admin' : await effectiveRepoPerm(p, ctx.userId);
+      const yourSitePerm = isOwner ? 'admin' : await effectiveSitePerm(p, ctx.userId);
+      if (!permAtLeast(maxPerm(yourRepoPerm, yourSitePerm), 'read')) return null;
       let pgEnabled = false;
       let storeEnabled = false;
       let caps = defaultCapabilities();
@@ -198,7 +231,8 @@ const tools: Record<string, ToolDef> = {
         caps = await detectCapabilities({ owner: o, repo: r }).catch(() => caps);
       }
       const everyone = await getEveryoneGrants([p.id]).catch(() => new Map());
-      return { ...toToolProject(p, everyone.get(p.id)), capabilities: capabilityList(caps), postgres: { enabled: pgEnabled }, storage: { enabled: storeEnabled } };
+      const base = toToolProject(p, everyone.get(p.id));
+      return { ...base, access: isOwner ? 'owner' : 'shared', your_repo_perm: yourRepoPerm, your_site_perm: yourSitePerm, capabilities: capabilityList(caps), postgres: { enabled: pgEnabled }, storage: { enabled: storeEnabled }, mcp: mcpEndpoint(base.url, caps) };
     },
   },
 
@@ -210,7 +244,7 @@ const tools: Record<string, ToolDef> = {
       properties: {
         name: { type: 'string', minLength: 1, description: 'Human-readable name.' },
         slug: { type: 'string', pattern: '^[a-z0-9-]+$', maxLength: 63, description: 'Optional URL slug; derived from name when omitted.' },
-        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Initial access posture. `private` (default) = owner-only. `internal` = every signed-in member gets read+write on BOTH the deployed site and the repo, seeded as the org-wide “everyone” grant. Finer access — per-user/group grants, read-only org-wide, and admins — is managed afterwards on the portal project page (the deployed project reads its caller’s level from `X-CV-Perm`). Corpo Valley never publishes projects unauthenticated.' },
+        visibility: { type: 'string', enum: ['private', 'internal'], description: 'Initial access posture. `private` (default) = owner-only. `internal` = every signed-in member gets read (view-only) access to the deployed SITE, seeded as the org-wide “everyone” grant; it does NOT grant any repo/code access. Anything beyond that — reading or pushing the repo, org-wide write, per-user/group grants, admins — is granted explicitly afterwards on the portal project page (the deployed project reads its caller’s level from `X-CV-Perm`). Corpo Valley never publishes projects unauthenticated.' },
         capabilities: {
           type: 'object',
           description: 'Which optional capabilities to enable. The website is always on.',
@@ -243,18 +277,19 @@ const tools: Record<string, ToolDef> = {
 
       const project = await createProject({ slug, name, ownerId: ctx.userId });
 
-      // `internal` seeds the org-wide everyone grant (read+write both areas)
-      // before provisioning so the repo collaborator fan-out picks it up;
-      // `private` seeds nothing (owner-only). Finer grants are managed in the
-      // portal.
+      // `internal` seeds a VIEW-ONLY org-wide everyone grant — read on the site,
+      // no repo access — so any member can view the deployed site but nobody
+      // gets to read or push the code (which auto-deploys) without an explicit
+      // grant. `private` seeds nothing (owner-only). Finer grants are managed in
+      // the portal.
       let everyone: { site: GrantLevel | null; repo: GrantLevel | null } | undefined;
       if (visibility === 'internal') {
         await upsertProjectGrant({
           projectId: project.id, subjectType: 'everyone',
           subjectId: EVERYONE_SUBJECT_ID, subjectName: EVERYONE_SUBJECT_NAME,
-          sitePerm: 'write', repoPerm: 'write',
+          sitePerm: 'read', repoPerm: null,
         }).catch(() => {});
-        everyone = { site: 'write', repo: 'write' };
+        everyone = { site: 'read', repo: null };
       }
 
       // Unified provisioning (shared with the dashboard): seals the namespace
@@ -266,12 +301,14 @@ const tools: Record<string, ToolDef> = {
       if (visibility === 'internal') {
         syncRepoAccess(project).catch(() => {});
       }
+      const base = toToolProject(project, everyone);
       return {
-        ...toToolProject(project, everyone),
+        ...base,
         application_registered: prov.argoRegistered,
         capabilities: capabilityList(caps),
         postgres: { enabled: prov.postgresEnabled },
         storage: { enabled: prov.storageEnabled },
+        mcp: mcpEndpoint(base.url, caps),
       };
     },
   },
@@ -291,8 +328,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.id_or_slug, 'admin');
+      if (!p) throw new ToolError('project not found, or you lack the admin access required to delete it.');
       if (args.confirm_slug !== p.slug) throw new ToolError('confirm_slug must equal the project slug exactly.');
       const purge = await purgeProjectResources(p, {
         keepRepo: !!args.keep_repo,
@@ -317,8 +354,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
       const { next, postgresEnabledNow } = await applyCapabilities(p, { database: true });
       return {
@@ -344,8 +381,12 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      // Non-destructive disable needs write (same as set_capabilities, which can
+      // do the identical toggle); only the data-purge path requires admin.
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, args.destroy_data ? 'admin' : 'write');
+      if (!p) throw new ToolError(args.destroy_data
+        ? 'project not found, or you lack the admin access required to purge data.'
+        : 'project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
       const { next } = await applyCapabilities(p, { database: false });
       let pvcDeleted = false;
@@ -376,8 +417,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
       const { next, storageEnabledNow } = await applyCapabilities(p, { storage: true });
       return {
@@ -403,8 +444,12 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      // Non-destructive disable needs write (same as set_capabilities, which can
+      // do the identical toggle); only the data-purge path requires admin.
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, args.destroy_data ? 'admin' : 'write');
+      if (!p) throw new ToolError(args.destroy_data
+        ? 'project not found, or you lack the admin access required to purge data.'
+        : 'project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
       const { next } = await applyCapabilities(p, { storage: false });
       let pvcDeleted = false;
@@ -441,8 +486,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
       const { next, postgresEnabledNow, storageEnabledNow } = await applyCapabilities(p, {
         database: args.database, storage: args.storage, mcp: args.mcp, shared: args.shared,
@@ -500,15 +545,23 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'read');
+      if (!p) throw new ToolError('project not found, or you don\'t have access to it.');
       if (!ctx.preferredUsername) throw new ToolError('your Corpo Valley account has no Gitea username paired with it.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
-      // Mint only for the account that owns this repo (see the dashboard
-      // cli-token route for the rationale). A user-wide PAT for a username that
-      // no longer owns the repo would be both over-broad and useless here.
+      // Mint the PAT on the CALLER's own Gitea account, whether they own the
+      // repo or reach it via a share. The token is user-wide; Gitea still gates
+      // it per-repo by the caller's collaborator level (repo grants are
+      // materialised as Gitea collaborators by syncRepoAccess), so a read-only
+      // grantee gets a token that can clone but not push here.
+      // Owner-only guard: if the caller OWNS the project but its repo lives under
+      // a different (renamed-away) username, a PAT on their current username
+      // can't reach `<oldname>/<slug>` — refuse rather than hand back a useless
+      // credential. A SHARED repo is owned by another account by definition, so
+      // this check only applies to owners (it's the same rule as the dashboard
+      // cli-token route).
       const repoOwner = p.gitea_repo.split('/')[0];
-      if (repoOwner !== ctx.preferredUsername) {
+      if (p.owner_id === ctx.userId && repoOwner !== ctx.preferredUsername) {
         throw new ToolError('this project repo is owned by a different Gitea account than your current username; ask an admin to reconcile.');
       }
       const suffix = crypto.randomBytes(3).toString('hex');
@@ -548,8 +601,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
       const name = String(args.name);
       if (!/^[a-z0-9-]+$/.test(name) || name.length > 63) throw new ToolError('secret name must be lowercase letters, digits, and hyphens (max 63 chars).');
@@ -586,8 +639,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
       const name = String(args.name);
       const [owner, repo] = p.gitea_repo.split('/');
@@ -611,8 +664,8 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'read');
+      if (!p) throw new ToolError('project not found, or you don\'t have access to it.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
       const [owner, repo] = p.gitea_repo.split('/');
       const ref = (typeof args.ref === 'string' && args.ref.trim()) ? args.ref.trim() : 'main';
@@ -662,8 +715,8 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'read');
+      if (!p) throw new ToolError('project not found, or you don\'t have access to it.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
       const [owner, repo] = p.gitea_repo.split('/');
       const state = (typeof args.state === 'string' ? args.state : 'open') as 'open' | 'closed' | 'all';
@@ -688,8 +741,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx); // merging a PR drives a build/deploy — same gate as every other mutating tool
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
       const [owner, repo] = p.gitea_repo.split('/');
       const pr = await createPullRequest({
@@ -719,8 +772,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx); // merging a PR drives a build/deploy — same gate as every other mutating tool
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
       const [owner, repo] = p.gitea_repo.split('/');
       await mergePullRequest({
@@ -749,8 +802,8 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'read');
+      if (!p) throw new ToolError('project not found, or you don\'t have access to it.');
       if (!p.gitea_repo) throw new ToolError('this project has no Gitea repository yet.');
       const [owner, repo] = p.gitea_repo.split('/');
       const ref = (typeof args.ref === 'string' && args.ref.trim()) ? args.ref.trim() : 'main';
@@ -822,8 +875,12 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      // Reading status needs read; also_sync triggers a real deploy sync, so
+      // that variant needs write.
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, args.also_sync ? 'write' : 'read');
+      if (!p) throw new ToolError(args.also_sync
+        ? 'project not found, or you lack the write access required to trigger a sync.'
+        : 'project not found, or you don\'t have access to it.');
       const app = await getArgoApplication({
         name: p.slug,
         namespace: CV_PROJECTS_ARGOCD_NAMESPACE,
@@ -906,8 +963,8 @@ const tools: Record<string, ToolDef> = {
     },
     async handler(ctx, args) {
       requireVerified(ctx);
-      const p = await resolveOwnedProject(ctx, args.project_id_or_slug);
-      if (!p) throw new ToolError('project not found or not owned by you.');
+      const p = await resolveAccessibleProject(ctx, args.project_id_or_slug, 'write');
+      if (!p) throw new ToolError('project not found, or you lack the write access required.');
       let labelSelector: string | undefined;
       if (typeof args.deployment === 'string' && args.deployment.trim()) {
         const dep = String(args.deployment).trim();
@@ -947,7 +1004,7 @@ const tools: Record<string, ToolDef> = {
   },
 
   kube_get: {
-    description: 'Read Kubernetes objects from a project\'s namespace. Use this to debug deploys: list pods to see if they\'re running, list events to see why a pod is pending, fetch a single deployment to see its image/replicas, etc. Read-only — no patch, apply, delete, exec, or port-forward. Secrets are not readable through here (use Sealed Secrets for the supported secret flow). The namespace must equal a project slug you own.',
+    description: 'Read Kubernetes objects from a project\'s namespace. Use this to debug deploys: list pods to see if they\'re running, list events to see why a pod is pending, fetch a single deployment to see its image/replicas, etc. Read-only — no patch, apply, delete, exec, or port-forward. Secrets are not readable through here (use Sealed Secrets for the supported secret flow). The namespace must equal the slug of a project you can access.',
     inputSchema: {
       type: 'object',
       required: ['namespace', 'kind'],
@@ -963,8 +1020,8 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
-      const p = await resolveOwnedProject(ctx, args.namespace);
-      if (!p) throw new ToolError(`namespace "${args.namespace}" doesn't match a project you own.`);
+      const p = await resolveAccessibleProject(ctx, args.namespace, 'read');
+      if (!p) throw new ToolError(`namespace "${args.namespace}" doesn't match a project you can access.`);
       const ref = kindToRef(String(args.kind || ''), p.slug);
       if (!ref) throw new ToolError(`unsupported kind "${args.kind}". See the tool description for the supported list.`);
 
@@ -999,7 +1056,7 @@ const tools: Record<string, ToolDef> = {
   },
 
   kube_logs: {
-    description: 'Fetch the most recent log lines from a pod in a project namespace. Tail size defaults to 200 lines, max 5000. Use `previous: true` to get logs from the prior crashed container. Namespace must equal a project slug you own.',
+    description: 'Fetch the most recent log lines from a pod in a project namespace. Tail size defaults to 200 lines, max 5000. Use `previous: true` to get logs from the prior crashed container. Namespace must equal the slug of a project you can access.',
     inputSchema: {
       type: 'object',
       required: ['namespace', 'pod'],
@@ -1014,8 +1071,8 @@ const tools: Record<string, ToolDef> = {
       additionalProperties: false,
     },
     async handler(ctx, args) {
-      const p = await resolveOwnedProject(ctx, args.namespace);
-      if (!p) throw new ToolError(`namespace "${args.namespace}" doesn't match a project you own.`);
+      const p = await resolveAccessibleProject(ctx, args.namespace, 'read');
+      if (!p) throw new ToolError(`namespace "${args.namespace}" doesn't match a project you can access.`);
       const pod = String(args.pod || '');
       if (!/^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/.test(pod)) {
         throw new ToolError('invalid pod name; expected DNS-1123-style identifier.');
@@ -1177,6 +1234,14 @@ function toToolProject(p: Project, everyone?: { site: GrantLevel | null; repo: G
   };
 }
 
+// The project's own MCP endpoint, for agent discoverability. `enabled` is null
+// when capabilities couldn't be detected; `url` is only populated when the mcp
+// capability is on (no fabricated endpoint for projects that don't expose one).
+function mcpEndpoint(baseUrl: string, caps: Capabilities | null): { enabled: boolean | null; url: string | null } {
+  const enabled = caps ? caps.mcp : null;
+  return { enabled, url: enabled ? `${baseUrl}/mcp` : null };
+}
+
 // The single source of truth for changing a project's capability set. Brings
 // the per-project Postgres/Garage backends in line with the requested caps
 // (secret BEFORE the container that references it), regenerates
@@ -1240,18 +1305,29 @@ async function applyCapabilities(
   return { next, postgresEnabledNow, storageEnabledNow };
 }
 
-// Resolve id-or-slug to a Project the caller owns. Returns null when not
-// found or not owned.
-async function resolveOwnedProject(ctx: McpContext, idOrSlug: string): Promise<Project | null> {
+// Ordering for effective perms, so a tool can require a minimum level.
+const REPO_PERM_RANK: Record<EffectivePerm, number> = { none: 0, read: 1, write: 2, admin: 3 };
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function permAtLeast(perm: EffectivePerm, min: GrantLevel): boolean {
+  return REPO_PERM_RANK[perm] >= REPO_PERM_RANK[min];
+}
+
+// Resolve id-or-slug to a Project the caller can access at >= `minPerm` on the
+// REPO area — the same effective perm the ingress uses (owner is always admin;
+// otherwise the max over direct, group, and org-wide `everyone` grants). Returns
+// null when the project doesn't exist OR the caller's effective perm is below
+// `minPerm`. The two cases are deliberately indistinguishable to the caller so a
+// non-collaborator can't probe which slugs exist.
+async function resolveAccessibleProject(
+  ctx: McpContext,
+  idOrSlug: string,
+  minPerm: GrantLevel = 'read',
+): Promise<Project | null> {
   if (!idOrSlug) return null;
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idOrSlug)) {
-    const p = await getProjectById(idOrSlug);
-    return p && p.owner_id === ctx.userId ? p : null;
-  }
-  // Slug lookup: list user's projects and match (cheaper than a new SQL
-  // for the typical case of a few projects per user).
-  const rows = await listProjectsByOwner(ctx.userId);
-  return rows.find((r) => r.slug === idOrSlug) || null;
+  const p = UUID_RE.test(idOrSlug) ? await getProjectById(idOrSlug) : await getProjectBySlug(idOrSlug);
+  if (!p) return null;
+  const perm = await effectiveRepoPerm(p, ctx.userId);
+  return permAtLeast(perm, minPerm) ? p : null;
 }
 
 // ── JSON-RPC dispatch ──────────────────────────────────────────────────────

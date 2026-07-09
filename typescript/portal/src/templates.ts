@@ -1202,7 +1202,7 @@ export function renderProjectCreate(
           <label>Who can see it?</label>
           <div id="cv-visibility-group" style="display:flex;flex-direction:column;gap:0.4rem;">
             ${radio('private', 'Private', 'Only you (and your bot). Grant individual members, groups, or everyone access later from the project page.')}
-            ${radio('internal', 'Internal', 'Every Corpo Valley member can use the site and edit the repo. Still sign-in-gated — Corpo Valley does not publish projects publicly.')}
+            ${radio('internal', 'Internal', 'Every Corpo Valley member can view the deployed site (read-only). No repo or code access — grant that to specific people or groups afterward. Still sign-in-gated — Corpo Valley does not publish projects publicly.')}
           </div>
           <p class="help" style="margin-top:0.4rem;">You can fine-tune access — per-user/group grants, read-only org-wide, admins — from the project page once it exists.</p>
         </div>

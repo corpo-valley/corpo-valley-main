@@ -6,7 +6,7 @@
 // not internal architecture trivia. If you change platform behaviour, edit
 // the relevant topic here so an MCP-connected agent learns about it.
 
-export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'resources' | 'database' | 'storage' | 'cooldeps';
+export type DocsTopic = 'overview' | 'projects' | 'gitea' | 'pipeline' | 'secrets' | 'deploy' | 'access' | 'kubernetes' | 'resources' | 'database' | 'storage' | 'mcp' | 'cooldeps';
 
 import {
   PROJECTS_DOMAIN, BASE_DOMAIN, GITEA_PUBLIC_URL, CV_REGISTRY, PORTAL_INTERNAL_URL,
@@ -461,11 +461,46 @@ scoping.)
    * **Repo** — the Gitea repository. Levels \`read\` / \`write\` / \`admin\`
      map 1:1 onto Gitea collaborator permissions.
    A grant targets a **user**, a **group**, or **everyone** — the virtual
-   org-wide subject covering every signed-in member. \`everyone\` may be granted
-   read or write, never admin. The effective level is the max of all applicable
-   grants; the project owner is always admin on both areas. Grants are managed
-   on the portal project page; \`create_project\`'s \`visibility\` seeds the
-   initial posture (\`private\` = no grant, \`internal\` = everyone read+write).
+   org-wide subject covering every signed-in member. \`everyone\` is capped: on
+   the site it may be read or write (never admin), and on the REPO it may be
+   **read only** (never write/admin — org-wide push would auto-deploy into the
+   owner's namespace, so repo write must be an explicit user/group grant). The
+   effective level is the max of all applicable grants; the project owner is
+   always admin on both areas. Grants are managed on the portal project page;
+   \`create_project\`'s \`visibility\` seeds the initial posture (\`private\` = no
+   grant, \`internal\` = everyone gets site read only — view the deployed site,
+   no repo/code access).
+`,
+  mcp: `# Project MCP endpoints
+
+Enabling the \`mcp\` capability on a project adds a per-project MCP server at
+\`https://<slug>.${PROJECTS_DOMAIN}/mcp\` — a Model Context Protocol endpoint an
+agent (Claude, Cursor, Codex, …) connects to in order to drive THAT project's
+own tools (whatever the project's \`mcp/server.js\` exposes). It is separate from
+this platform MCP: this one manages projects; a project MCP does whatever that
+project implements.
+
+**Finding them.** Call \`list_projects\` with \`include_capabilities: true\` —
+each project comes back with its \`capabilities\` and an \`mcp\` field
+\`{ enabled, url }\`. \`get_project\` and \`create_project\` return the same
+\`mcp\` field. When \`mcp.enabled\` is true, \`mcp.url\` is the connect URL; when
+it's false the project has no MCP endpoint. That's how you tell a user which of
+their projects expose an MCP and where.
+
+**Connecting (OAuth — not an open endpoint).** The \`/mcp\` URL is fronted by the
+platform's mcp-gateway, which runs the MCP OAuth flow. An MCP client points at
+\`mcp.url\`, gets redirected to Corpo Valley's OAuth server
+(\`https://oauth.${BASE_DOMAIN}\`), the user signs in with their Corpo Valley
+account, and the gateway then reverse-proxies authenticated requests to the
+project's MCP container carrying the caller's identity + \`X-CV-Perm\`. Dynamic
+Client Registration is supported, so OAuth-aware clients (Claude Code, Cursor, …)
+need only the URL — tell the user to "add an MCP server" pointed at \`mcp.url\`
+and complete the sign-in; there is no token to paste.
+
+**Enabling it.** Turn \`mcp\` on when you want an agent to interact with a
+project's own data/actions directly (beyond its website or \`/api\`). Toggle with
+\`set_capabilities({ mcp: true })\` (or \`{ mcp: false }\` to remove it); the
+platform provisions the container, the \`/mcp\` Ingress, and the gateway wiring.
 `,
   cooldeps: `# cooldeps — dependency gating
 
