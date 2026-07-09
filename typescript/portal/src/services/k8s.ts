@@ -453,11 +453,14 @@ export async function k8sDeletePodsByLabel(opts: {
 // baseline BEFORE the tenant's ArgoCD ever deploys into it: Pod Security
 // labels, a default-deny-egress NetworkPolicy (allow only DNS, the namespace's
 // own pods, Kratos identity, and the public internet — everything in-cluster
-// and the node/metadata are blocked), a ResourceQuota, and a LimitRange so
-// even a tenant pod that declares no resources is bounded. These are created
-// by the portal (not the tenant repo), so a tenant can't remove them; the
-// AppProject whitelist additionally forbids tenants from creating their own
-// NetworkPolicies to override the egress lock.
+// and the node/metadata are blocked), a default-deny-INGRESS NetworkPolicy
+// (admit only the ingress controller, same-namespace pods, and the node for
+// kubelet probes — a second belt so a forged X-CV-* request from another
+// tenant is refused even if the egress CIDRs are misconfigured), a
+// ResourceQuota, and a LimitRange so even a tenant pod that declares no
+// resources is bounded. These are created by the portal (not the tenant repo),
+// so a tenant can't remove them; the AppProject whitelist additionally forbids
+// tenants from creating their own NetworkPolicies to override the lock.
 //
 // CIDRs are cluster-specific; defaults match this microk8s/Calico install.
 const POD_CIDR = process.env.CV_POD_CIDR || '10.1.0.0/16';
@@ -499,6 +502,79 @@ function tenantEgressPolicyObject(slug: string) {
       ],
     },
   };
+}
+
+// The label the deploying chart stamps on whichever namespace hosts the ingress
+// controller (ingress-nginx on EKS, `ingress` on microk8s, kube-system on
+// default k3s, …). Selecting by this label instead of a hardcoded namespace
+// name keeps the ingress baseline CNI/distro-agnostic — the operator labels
+// their controller namespace and this policy follows.
+// Namespaces the ingress lock must admit (besides same-namespace + node),
+// selected by the auto-applied `kubernetes.io/metadata.name` label so no
+// namespace needs a custom label stamped on it (the ingress controller often
+// lives in an addon namespace the chart doesn't own):
+//  - the ingress controller — real user traffic. Default `ingress` (the
+//    microk8s addon ns); set CV_INGRESS_NAMESPACE for other clusters
+//    (`ingress-nginx` on EKS, `kube-system` for default k3s Traefik, …).
+//  - the mcp-gateway, which reverse-proxies DIRECTLY to the tenant `<slug>-mcp`
+//    pod cross-namespace (see mcp-gateway/src/index.ts) — admit it or every
+//    project's /mcp breaks. Default the portal namespace; set
+//    CV_MCP_GATEWAY_NAMESPACE if the platform uses a non-default namespacePrefix.
+const INGRESS_CONTROLLER_NAMESPACE = process.env.CV_INGRESS_NAMESPACE || 'ingress';
+const MCP_GATEWAY_NAMESPACE = process.env.CV_MCP_GATEWAY_NAMESPACE || 'cv-portal';
+
+function nsNameSelector(name: string) {
+  return { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': name } } };
+}
+
+// The INGRESS side of the tenant lock: flip tenant pods to default-deny inbound
+// and admit only (a) the ingress controller — real user traffic, auth-
+// subrequested with X-CV-* overwritten at the edge; (b) the mcp-gateway, which
+// proxies to the tenant /mcp pod; (c) same-namespace pods — the app container
+// reaching its OWN Postgres/Garage; and (d) the node CIDR, so kubelet
+// liveness/readiness probes are not dropped (a lock that blocks probes would
+// hang every rollout). This is a SECOND, independent belt to the egress
+// baseline: even if the egress CIDRs are misconfigured for a given cluster, a
+// forged X-CV-Perm request from another tenant's pod is refused here because its
+// source is none of the admitted origins.
+function tenantIngressPolicyObject(slug: string) {
+  return {
+    apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy',
+    metadata: { name: 'cv-tenant-ingress-baseline', namespace: slug,
+      labels: { 'corpo-valley.com/managed': 'baseline' } },
+    spec: {
+      podSelector: {},
+      policyTypes: ['Ingress'],
+      ingress: [
+        { from: [nsNameSelector(INGRESS_CONTROLLER_NAMESPACE)] },
+        { from: [nsNameSelector(MCP_GATEWAY_NAMESPACE)] },
+        { from: [{ podSelector: {} }] },
+        { from: [{ ipBlock: { cidr: NODE_CIDR } }] },
+      ],
+    },
+  };
+}
+
+// The tenant NetworkPolicies are cluster-specific in two ways operators must
+// configure off microk8s: the CIDRs above, and a policy-ENFORCING CNI (default
+// flannel on k3s and stock AWS VPC-CNI do not enforce NetworkPolicy, which would
+// silently disable the whole tenant lock). Warn once, loudly, if the CIDRs are
+// still the microk8s defaults so a misconfigured cluster is obvious rather than
+// silently unisolated.
+let cidrConfigWarned = false;
+function warnClusterNetpolConfigOnce(): void {
+  if (cidrConfigWarned) return;
+  cidrConfigWarned = true;
+  if (!process.env.CV_POD_CIDR || !process.env.CV_SERVICE_CIDR || !process.env.CV_NODE_CIDR) {
+    console.warn(
+      `[k8s] tenant NetworkPolicy baseline is using DEFAULT CIDRs for this microk8s/Calico install ` +
+      `(pod=${POD_CIDR}, service=${SERVICE_CIDR}, node=${NODE_CIDR}). On any other cluster set ` +
+      `CV_POD_CIDR/CV_SERVICE_CIDR/CV_NODE_CIDR (and, if they differ, CV_INGRESS_NAMESPACE / ` +
+      `CV_MCP_GATEWAY_NAMESPACE), or tenant isolation will be misconfigured. NetworkPolicy also ` +
+      `requires a policy-enforcing CNI (Calico/Cilium); default flannel (k3s) and stock AWS VPC-CNI ` +
+      `do NOT enforce it, which silently disables the tenant lock.`,
+    );
+  }
 }
 
 // Per-project resource overrides an admin may pass to reconcileTenantResources
@@ -910,6 +986,7 @@ export async function namespaceExists(slug: string): Promise<boolean> {
 
 export async function applyNamespaceBaseline(slug: string): Promise<void> {
   if (!k8sEnabled()) return;
+  warnClusterNetpolConfigOnce();
   await createOrIgnore('/api/v1/namespaces', tenantNamespaceObject(slug));
   // Always (re)assert the labels via PATCH — covers the case where the
   // namespace already existed (e.g. a recreate, or ArgoCD got there first) and
@@ -922,6 +999,7 @@ export async function applyNamespaceBaseline(slug: string): Promise<void> {
     contentType: 'application/merge-patch+json',
   });
   await createOrIgnore(`/apis/networking.k8s.io/v1/namespaces/${encodeURIComponent(slug)}/networkpolicies`, tenantEgressPolicyObject(slug));
+  await createOrIgnore(`/apis/networking.k8s.io/v1/namespaces/${encodeURIComponent(slug)}/networkpolicies`, tenantIngressPolicyObject(slug));
   await createOrIgnore(`/api/v1/namespaces/${encodeURIComponent(slug)}/resourcequotas`, tenantResourceQuotaObject(slug));
   await createOrIgnore(`/api/v1/namespaces/${encodeURIComponent(slug)}/limitranges`, tenantLimitRangeObject(slug));
 }
