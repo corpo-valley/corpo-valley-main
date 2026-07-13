@@ -14,10 +14,12 @@
 //   - OAEP label is `<namespace>/<name>` for the default "strict" scope; that
 //     binds the ciphertext to a specific destination Secret, so a stolen
 //     SealedSecret can't be replayed elsewhere.
-//   - The controller's cert is the RSA key wrapper. We fetch it from the
-//     controller's HTTP endpoint at startup and cache it.
+//   - The controller's cert is the RSA key wrapper. We fetch it through the
+//     Kubernetes API server's service-proxy (authenticated + TLS-verified) and
+//     cache it, refetching on a TTL so controller key rotation propagates.
 
 import * as crypto from 'crypto';
+import { k8sEnabled, k8sServiceProxyGet } from './k8s';
 
 const CONTROLLER_URL =
   process.env.SEALED_SECRETS_CONTROLLER_URL ||
@@ -29,18 +31,31 @@ const CONTROLLER_URL =
 const CERT_TTL_MS = 60 * 60 * 1000; // 1 hour
 let cachedCert: { pem: string; fetchedAt: number; sha256: string } | null = null;
 
-// SHA-256 fingerprint pin over the cert's SubjectPublicKeyInfo (NOT the PEM
-// text — see fingerprint()). Every fetched cert must hash to this value or we
-// refuse it, defeating an in-cluster MITM that swaps the controller's public
-// key. Rotation = operator updates this env + restarts the pod.
-const EXPECTED_CERT_SHA256 = (process.env.SEALED_SECRETS_CERT_SHA256 || '').trim().toLowerCase();
+// The controller's cert is fetched through the API server's service-proxy (see
+// fetchCert): an authenticated, TLS-verified channel. That removes the
+// in-cluster MITM the old static SPKI pin (SEALED_SECRETS_CERT_SHA256) defended
+// against, so the pin — and its every-30-days manual rotation — is gone.
+if ((process.env.SEALED_SECRETS_CERT_SHA256 || '').trim()) {
+  console.warn(
+    '[seal] SEALED_SECRETS_CERT_SHA256 is set but IGNORED: the portal now fetches the ' +
+    'sealed-secrets cert over the authenticated Kubernetes API server, so the manual SPKI ' +
+    'pin is neither needed nor maintained. Remove it from your values/env.'
+  );
+}
 
-// Pinning is MANDATORY by default. Trust-on-first-use (remember the first cert
-// seen this process) is a real downgrade — an attacker present before the first
-// fetch transparently wins — so it's only allowed when the operator explicitly
-// opts in via SEALED_SECRETS_ALLOW_TOFU=true. With neither the pin nor the TOFU
-// flag set, we refuse to seal rather than trust an unauthenticated key.
-const ALLOW_TOFU = process.env.SEALED_SECRETS_ALLOW_TOFU === 'true';
+// Parse the controller Service coordinates out of CONTROLLER_URL so we can
+// address it through the API server's service-proxy subresource. Defaults match
+// the stock sealed-secrets install (kube-system / :8080 / http).
+function controllerServiceRef(): { namespace: string; service: string; scheme: 'http' | 'https'; port: string } {
+  const u = new URL(CONTROLLER_URL);
+  const [service, namespace] = u.hostname.split('.');
+  return {
+    service: service || 'sealed-secrets-controller',
+    namespace: namespace || 'kube-system',
+    scheme: u.protocol === 'https:' ? 'https' : 'http',
+    port: u.port || '8080',
+  };
+}
 
 export class SealError extends Error {
   constructor(message: string, public cause?: unknown) {
@@ -54,6 +69,29 @@ export function sealEnabled(): boolean {
 }
 
 async function fetchCert(): Promise<string> {
+  // Preferred path: fetch cert.pem through the API server's service-proxy. The
+  // channel is TLS-verified + SA-authenticated (this is exactly what
+  // `kubeseal --fetch-cert` does), so an in-cluster MITM can't swap the
+  // controller's public key — no static pin required.
+  if (k8sEnabled()) {
+    const ref = controllerServiceRef();
+    const pem = await k8sServiceProxyGet({ ...ref, path: '/v1/cert.pem' })
+      .catch((err) => { throw new SealError('sealed-secrets cert fetch via k8s API proxy failed', err); });
+    if (!pem.includes('BEGIN CERTIFICATE')) {
+      throw new SealError('sealed-secrets controller returned non-PEM cert (via API proxy)');
+    }
+    return pem;
+  }
+
+  // Fallback (local dev only): no in-cluster ServiceAccount token, so reach the
+  // controller directly over plaintext HTTP. This is UNAUTHENTICATED, so we
+  // refuse it in production — a prod portal always has the SA mount.
+  if (process.env.NODE_ENV === 'production') {
+    throw new SealError(
+      'cannot fetch sealed-secrets cert: no in-cluster ServiceAccount token to reach the ' +
+      'Kubernetes API server, and the unauthenticated HTTP fallback is refused in production.'
+    );
+  }
   // Bounded timeout: a hung/black-holed controller must fail fast rather than
   // stall every seal operation (and the request handlers awaiting them)
   // indefinitely — global fetch (undici) has no default timeout.
@@ -85,60 +123,22 @@ export async function getCert(force = false): Promise<string> {
     return cachedCert.pem;
   }
 
-  // Fail closed: without an explicit pin, refuse to seal unless TOFU is opted in.
-  // TOFU trusts the first cert seen over a plaintext in-cluster HTTP channel, so
-  // it is a dev-only convenience — never honour it in production. Production must
-  // set an explicit SPKI pin.
-  if (!EXPECTED_CERT_SHA256) {
-    if (process.env.NODE_ENV === 'production') {
-      throw new SealError(
-        'sealed-secrets cert is not pinned and trust-on-first-use is not permitted in production: ' +
-        'set SEALED_SECRETS_CERT_SHA256 to the expected SPKI sha256.'
-      );
-    }
-    if (!ALLOW_TOFU) {
-      throw new SealError(
-        'sealed-secrets cert is not pinned: set SEALED_SECRETS_CERT_SHA256 to the ' +
-        'expected SPKI sha256, or set SEALED_SECRETS_ALLOW_TOFU=true (non-production only) ' +
-        'to explicitly accept trust-on-first-use. Refusing to seal against an unauthenticated key.'
-      );
-    }
-  }
-
   const pem = await fetchCert();
   const sha = fingerprint(pem);
 
-  // Explicit pin: a configured fingerprint must match the fetched cert.
-  // This protects against an in-cluster MITM swapping the controller's
-  // pubkey. Operator updates this env when sealed-secrets rotates keys.
-  if (EXPECTED_CERT_SHA256 && sha !== EXPECTED_CERT_SHA256) {
-    throw new SealError(
-      `sealed-secrets cert fingerprint mismatch: expected ${EXPECTED_CERT_SHA256}, got ${sha}. ` +
-      `Refusing to seal — either the controller's active key has rotated (update SEALED_SECRETS_CERT_SHA256 in the portal env) or the fetch was MITM'd.`
-    );
-  }
-
-  // Pin-on-first-use fallback: when no explicit pin is configured, we
-  // remember the first fingerprint we saw and refuse silent mid-process
-  // rotation. An attacker who arrives AFTER the portal has cached a
-  // benign cert can't transparently swap in their own. The cache TTL
-  // means a legitimate rotation forces a refetch — at which point a
-  // mismatch produces a loud failure that the operator must clear by
-  // restarting the portal (and ideally setting an explicit pin).
-  if (!EXPECTED_CERT_SHA256 && cachedCert && cachedCert.sha256 !== sha) {
-    throw new SealError(
-      `sealed-secrets cert fingerprint changed mid-process: was ${cachedCert.sha256}, now ${sha}. ` +
-      `Refusing the new cert — restart the portal after confirming the controller rotated its key intentionally.`
+  // A changed fingerprint across refetches is a legitimate ~30-day controller
+  // key rotation now that the fetch channel is authenticated — accept it and
+  // log, so rotation propagates on the next TTL with no operator action. (The
+  // old code refused this to guard the unauthenticated HTTP fetch; that guard
+  // is obsolete once we read through the API server.)
+  if (cachedCert && cachedCert.sha256 !== sha) {
+    console.warn(
+      `[seal] sealed-secrets controller cert rotated (SPKI sha256 ${cachedCert.sha256} -> ${sha}); ` +
+      'sealing new secrets against the new active key.'
     );
   }
 
   cachedCert = { pem, fetchedAt: now, sha256: sha };
-  if (!EXPECTED_CERT_SHA256) {
-    console.warn(
-      `[seal] SEALED_SECRETS_ALLOW_TOFU is set — trusting sealed-secrets cert on first use (SPKI sha256=${sha}). ` +
-      `Set SEALED_SECRETS_CERT_SHA256=${sha} for explicit pinning across restarts and remove the TOFU flag.`
-    );
-  }
   return pem;
 }
 
