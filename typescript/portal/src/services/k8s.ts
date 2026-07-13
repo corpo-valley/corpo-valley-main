@@ -238,6 +238,53 @@ export async function k8sPodLogs(opts: {
   });
 }
 
+// GET an arbitrary path on a Service through the API server's service-proxy
+// subresource (`/api/v1/namespaces/<ns>/services/<scheme>:<name>:<port>/proxy/<path>`).
+// Unlike hitting the Service's ClusterIP directly, this rides the API server's
+// TLS + our ServiceAccount token, so an in-cluster MITM can't impersonate the
+// target. The proxied endpoint may not return JSON (sealed-secrets serves PEM),
+// so — like k8sPodLogs — we read the raw body rather than going through call<T>.
+export async function k8sServiceProxyGet(opts: {
+  namespace: string;
+  service: string;
+  path: string; // must begin with '/'
+  scheme?: 'http' | 'https';
+  port?: string | number;
+}): Promise<string> {
+  if (!k8sEnabled()) {
+    throw new K8sApiError(0, { message: 'k8s integration disabled' });
+  }
+  // Service-proxy resource-name form: `<name>`, `<name>:<port>`, or
+  // `<scheme>:<name>:<port>`. Colons must stay literal, so this segment is NOT
+  // URL-encoded; service/scheme/port are operator-controlled (from the
+  // controller URL), never user input.
+  const svc =
+    opts.scheme && opts.port !== undefined ? `${opts.scheme}:${opts.service}:${opts.port}`
+    : opts.port !== undefined ? `${opts.service}:${opts.port}`
+    : opts.service;
+  const sub = opts.path.startsWith('/') ? opts.path : `/${opts.path}`;
+  const path = `/api/v1/namespaces/${encodeURIComponent(opts.namespace)}/services/${svc}/proxy${sub}`;
+
+  return new Promise<string>((resolve, reject) => {
+    const req = https.request(
+      { host: apiHost, port: Number(apiPort), method: 'GET', path, ca: readCa(),
+        headers: { Authorization: `Bearer ${readToken()}`, Accept: '*/*' } },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          const status = res.statusCode || 0;
+          if (status >= 200 && status < 300) resolve(body);
+          else reject(new K8sApiError(status, body));
+        });
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 // Delete an ArgoCD Application. The Application's
 // `resources-finalizer.argocd.argoproj.io` finalizer ensures the controller
 // prunes the project's workloads in the destination namespace BEFORE the
