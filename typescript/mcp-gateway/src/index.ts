@@ -101,10 +101,15 @@ function resourceMetadataUrl(host: string): string {
   return `https://${host}/.well-known/oauth-protected-resource`;
 }
 
-function challenge(res: express.Response, host: string): void {
+// RFC 6750: signal WHY via the `error` code so clients react correctly — an
+// `invalid_token` (present but expired/rejected) means "refresh and retry",
+// whereas a missing bearer means "start the OAuth flow". Mislabeling the former
+// as the latter pushes refresh-capable clients into a full re-auth (and, for
+// browserless clients, back into the interactive login they can't complete).
+function challenge(res: express.Response, host: string, error = 'invalid_request', bodyError = error): void {
   res.status(401)
-    .set('WWW-Authenticate', `Bearer realm="https://${host}/mcp", resource_metadata="${resourceMetadataUrl(host)}"`)
-    .json({ error: 'missing_bearer', resource_metadata: resourceMetadataUrl(host) });
+    .set('WWW-Authenticate', `Bearer realm="https://${host}/mcp", error="${error}", resource_metadata="${resourceMetadataUrl(host)}"`)
+    .json({ error: bodyError, resource_metadata: resourceMetadataUrl(host) });
 }
 
 interface Introspection { active: boolean; sub?: string; client_id?: string; aud?: string[]; token_use?: string; ext?: any; }
@@ -247,16 +252,16 @@ async function handleMcp(req: express.Request, res: express.Response) {
   if (!slug) { res.status(400).json({ error: 'unknown project host' }); return; }
 
   const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
-  if (!m) { challenge(res, host); return; }
+  if (!m) { challenge(res, host, 'invalid_request', 'missing_bearer'); return; }
 
   const intro = await introspect(m[1]);
-  if (!intro.active || !intro.sub) { challenge(res, host); return; }
+  if (!intro.active || !intro.sub) { challenge(res, host, 'invalid_token'); return; }
   // Reject non-access tokens (e.g. a refresh token) presented as a bearer.
   // Hydra reports `token_use` for OAuth2 tokens; when present it must say
   // access_token. Absent (older Hydra) → fall through, as before.
   if (intro.token_use && intro.token_use !== 'access_token') {
     console.warn('[gateway] rejecting non-access token', { slug, token_use: intro.token_use, client_id: intro.client_id });
-    challenge(res, host);
+    challenge(res, host, 'invalid_token');
     return;
   }
   const sub = intro.sub;

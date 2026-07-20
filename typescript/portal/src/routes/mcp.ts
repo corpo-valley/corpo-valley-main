@@ -69,9 +69,14 @@ async function fetchAndAugmentMetadata(): Promise<any> {
   const merged = {
     ...oidc,
     registration_endpoint: registrationEndpoint,
+    // Device Authorization Grant (RFC 8628): Hydra advertises this in its OIDC
+    // discovery once the grant is enabled, but restate it (RFC 8414 field) so
+    // clients that only parse RFC 8414 can find the endpoint and offer the
+    // browserless flow to headless MCP clients.
+    device_authorization_endpoint: oidc.device_authorization_endpoint || `${HYDRA_PUBLIC_URL}/oauth2/device/auth`,
     // RFC 8414 explicitly enumerates these; restate so clients that only
     // parse RFC 8414 fields see what they expect.
-    grant_types_supported: oidc.grant_types_supported || ['authorization_code', 'refresh_token', 'client_credentials'],
+    grant_types_supported: oidc.grant_types_supported || ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code'],
     code_challenge_methods_supported: oidc.code_challenge_methods_supported || ['S256'],
   };
   cachedMetadata = { fetched_at: now, body: merged };
@@ -194,21 +199,33 @@ router.get('/oauth2/register/:id', proxyRegister);
 router.put('/oauth2/register/:id', proxyRegister);
 router.delete('/oauth2/register/:id', proxyRegister);
 
+// RFC 9728 §5.1: spec-following clients read the protected-resource metadata
+// URL from the `WWW-Authenticate` header, not just the JSON body. Advertise it
+// in the header on every challenge so a client that gets a 401/403 can bootstrap
+// (or refresh) without guessing the well-known path. Mirrors the per-project
+// mcp-gateway, which already sets this.
+const RESOURCE_METADATA_URL = `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource`;
+function bearerChallenge(error: string, description?: string): string {
+  let h = `Bearer realm="${PUBLIC_MCP_URL}", error="${error}"`;
+  if (description) h += `, error_description="${description}"`;
+  return `${h}, resource_metadata="${RESOURCE_METADATA_URL}"`;
+}
+
 // Bearer token extraction + introspection → McpContext or 401.
 async function authenticate(req: Request, res: Response): Promise<McpContext | null> {
   const auth = req.header('authorization') || '';
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (!m) {
     res.status(401)
-      .set('WWW-Authenticate', `Bearer realm="${PUBLIC_MCP_URL}", error="invalid_request"`)
-      .json({ error: 'missing_bearer', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
+      .set('WWW-Authenticate', bearerChallenge('invalid_request'))
+      .json({ error: 'missing_bearer', resource_metadata: RESOURCE_METADATA_URL });
     return null;
   }
   const introspection = await introspectToken(m[1]);
   if (!introspection.active || !introspection.sub) {
     res.status(401)
-      .set('WWW-Authenticate', `Bearer realm="${PUBLIC_MCP_URL}", error="invalid_token"`)
-      .json({ error: 'invalid_token', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
+      .set('WWW-Authenticate', bearerChallenge('invalid_token'))
+      .json({ error: 'invalid_token', resource_metadata: RESOURCE_METADATA_URL });
     return null;
   }
   // Reject a non-access token (e.g. a refresh token) presented as a bearer.
@@ -217,8 +234,8 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   if (introspection.token_use && introspection.token_use !== 'access_token') {
     console.warn('[mcp] rejected non-access token', { token_use: introspection.token_use, client_id: introspection.client_id });
     res.status(401)
-      .set('WWW-Authenticate', `Bearer realm="${PUBLIC_MCP_URL}", error="invalid_token"`)
-      .json({ error: 'invalid_token', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
+      .set('WWW-Authenticate', bearerChallenge('invalid_token'))
+      .json({ error: 'invalid_token', resource_metadata: RESOURCE_METADATA_URL });
     return null;
   }
 
@@ -247,8 +264,8 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   if (introspection.client_id && DENY_CLIENT_IDS.includes(introspection.client_id)) {
     console.warn('[mcp] rejected token from non-MCP client', { client_id: introspection.client_id });
     res.status(403)
-      .set('WWW-Authenticate', `Bearer realm="${PUBLIC_MCP_URL}", error="invalid_token", error_description="this client is not authorized for the MCP resource"`)
-      .json({ error: 'unauthorized_client', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
+      .set('WWW-Authenticate', bearerChallenge('invalid_token', 'this client is not authorized for the MCP resource'))
+      .json({ error: 'unauthorized_client', resource_metadata: RESOURCE_METADATA_URL });
     return null;
   }
   // Audience binding (RFC 8707). Per the MCP authorization spec, clients send a
@@ -269,8 +286,8 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   if ((enforceAud && audMissingPlatform) || audNamesOtherResource) {
     console.warn('[mcp] rejected token: audience mismatch', { client_id: introspection.client_id, aud, required: requiredAud, enforceAud });
     res.status(403)
-      .set('WWW-Authenticate', `Bearer realm="${PUBLIC_MCP_URL}", error="invalid_token", error_description="token audience does not include this MCP resource"`)
-      .json({ error: 'invalid_audience', resource_metadata: `${PUBLIC_MCP_URL}/.well-known/oauth-protected-resource` });
+      .set('WWW-Authenticate', bearerChallenge('invalid_token', 'token audience does not include this MCP resource'))
+      .json({ error: 'invalid_audience', resource_metadata: RESOURCE_METADATA_URL });
     return null;
   }
 

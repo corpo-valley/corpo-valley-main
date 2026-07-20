@@ -7,6 +7,7 @@ import dashboardRouter from './routes/dashboard';
 import adminRouter from './routes/admin';
 import internalRouter from './routes/internal';
 import mcpRouter from './routes/mcp';
+import deviceRouter from './routes/device';
 import docsRouter from './routes/docs';
 import siteAccessRouter from './routes/site-access';
 import groupsRouter from './routes/groups';
@@ -116,6 +117,10 @@ app.use(cookieParser());
 app.use(healthRouter);
 app.use(kratosRouter);
 app.use(hydraRouter);
+// Device Authorization Grant UI (RFC 8628). Self-manages CSRF on its POST like
+// the kratos/hydra auth routers; no session required (login happens after the
+// user code is accepted).
+app.use(deviceRouter);
 
 // Internal webhooks (cluster-only, no CSRF, no session — Kratos posts here)
 app.use(internalRouter);

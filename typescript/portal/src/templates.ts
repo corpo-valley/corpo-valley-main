@@ -596,6 +596,31 @@ export function renderConsentPage(
   return layout('Authorize', body);
 }
 
+// Device Authorization Grant (RFC 8628) user-code entry. Hydra redirects the
+// browser here (from /oauth2/device/verify) with a device_challenge and,
+// optionally, a pre-filled user_code (when the device advertised the "complete"
+// verification URI). The human confirms the code to pair a headless/CLI client.
+export function renderDeviceCodePage(
+  deviceChallenge: string,
+  userCode: string = '',
+  csrfField: string = '',
+  messages: UiMessage[] = [],
+): string {
+  const body = `
+    <h1>Connect your device</h1>
+    <p style="color:#c4b698;margin-bottom:1rem;">Enter the code shown on the device or app you're connecting.</p>
+    ${renderMessages(messages)}
+    <form method="POST" action="/device/accept">
+      ${csrfField}
+      <input type="hidden" name="device_challenge" value="${escapeHtml(deviceChallenge)}">
+      <label for="user_code" style="display:block;color:#c4b698;margin-bottom:0.5rem;">Device code</label>
+      <input id="user_code" name="user_code" value="${escapeHtml(userCode)}" required autofocus autocomplete="off" autocapitalize="characters" spellcheck="false" style="text-transform:uppercase;letter-spacing:0.15em;">
+      <button type="submit" style="margin-top:1rem;">Continue</button>
+    </form>
+  `;
+  return layout('Connect your device', body);
+}
+
 export function renderLogoutConfirm(
   logoutChallenge: string,
   csrfField: string = ''
