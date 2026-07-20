@@ -8,7 +8,6 @@
 
 import { Router, Request, Response } from 'express';
 import * as crypto from 'crypto';
-import { Configuration, OAuth2Api } from '@ory/client';
 import { introspectToken } from '../services/hydra-introspect';
 import { dispatchJsonRpc, type McpContext } from '../services/mcp';
 import { getIdentity } from '../services/kratos-admin';
@@ -215,43 +214,6 @@ function bearerChallenge(error: string, description?: string): string {
   return `${h}, resource_metadata="${RESOURCE_METADATA_URL}"`;
 }
 
-// Confused-deputy defence, part 2 (see the DENY_CLIENT_IDS block in
-// authenticate for part 1): every legitimate MCP client registers via DCR as a
-// PUBLIC client (`token_endpoint_auth_method: 'none'`), while the tokens we're
-// defending against are minted to confidential first-party clients. So beyond
-// the deny list, require the token's client to be public: look it up on the
-// Hydra admin API and reject anything confidential. The auth method is static
-// per client, so cache lookups briefly instead of hitting Hydra every request.
-const hydraAdmin = new OAuth2Api(
-  new Configuration({ basePath: process.env.HYDRA_ADMIN_URL || 'http://localhost:4445' }),
-);
-const CLIENT_AUTH_METHOD_TTL_MS = 5 * 60 * 1000;
-const CLIENT_AUTH_METHOD_MAX_ENTRIES = 5000;
-const clientAuthMethodCache = new Map<string, { at: number; isPublic: boolean }>();
-
-// Whether `clientId` is a public client. Returns null when the client can't be
-// resolved (lookup error, unknown id) — callers must FAIL CLOSED on null.
-async function isPublicClient(clientId: string): Promise<boolean | null> {
-  const now = Date.now();
-  const cached = clientAuthMethodCache.get(clientId);
-  if (cached && now - cached.at < CLIENT_AUTH_METHOD_TTL_MS) return cached.isPublic;
-  try {
-    const { data } = await hydraAdmin.getOAuth2Client({ id: clientId });
-    const isPublic = data.token_endpoint_auth_method === 'none';
-    // Bound the cache (FIFO eviction) so a churn of distinct client ids can't
-    // grow it without limit.
-    if (clientAuthMethodCache.size >= CLIENT_AUTH_METHOD_MAX_ENTRIES && !clientAuthMethodCache.has(clientId)) {
-      const oldest = clientAuthMethodCache.keys().next().value;
-      if (oldest !== undefined) clientAuthMethodCache.delete(oldest);
-    }
-    clientAuthMethodCache.set(clientId, { at: now, isPublic });
-    return isPublic;
-  } catch (err) {
-    console.error('[mcp] hydra client lookup failed:', (err as Error)?.message);
-    return null;
-  }
-}
-
 // Bearer token extraction + introspection → McpContext or 401.
 async function authenticate(req: Request, res: Response): Promise<McpContext | null> {
   const auth = req.header('authorization') || '';
@@ -313,19 +275,16 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
       .json({ error: 'unauthorized_client', resource_metadata: RESOURCE_METADATA_URL });
     return null;
   }
-  // Public-client requirement (see isPublicClient above): a token from a
-  // CONFIDENTIAL client is by definition not from a DCR-registered MCP client,
-  // whatever its id — reject it even if it's not on the deny list. FAIL CLOSED
-  // when the client can't be resolved: a token we can't attribute to a public
-  // client never reaches the platform MCP.
-  const isPublic = introspection.client_id ? await isPublicClient(introspection.client_id) : null;
-  if (isPublic !== true) {
-    console.warn('[mcp] rejected token: client is confidential or unresolvable', { client_id: introspection.client_id });
-    res.status(403)
-      .set('WWW-Authenticate', bearerChallenge('invalid_token', 'this client is not authorized for the MCP resource'))
-      .json({ error: 'unauthorized_client', resource_metadata: RESOURCE_METADATA_URL });
-    return null;
-  }
+  // NOTE: we deliberately do NOT require the token's client to be a *public*
+  // (token_endpoint_auth_method=none) client. Legitimate MCP clients register
+  // via DCR and MANY are confidential — e.g. claude.ai's connector, which Hydra
+  // assigns a client_secret unless `none` is explicitly requested. The
+  // confused-deputy defence is the union deny-list above (every consent-skipping
+  // trusted client is denied); a public-only requirement would reject real MCP
+  // clients. RFC 8707 audience binding would be the stronger control, but Hydra
+  // v2.3.0 ignores the `resource` indicator, so MCP tokens have empty `aud` and
+  // enforcing it (MCP_ENFORCE_AUDIENCE) would reject all MCP clients.
+  //
   // Audience binding (RFC 8707). Per the MCP authorization spec, clients send a
   // `resource` indicator so Hydra stamps the resource into `aud`; we require it
   // here so a token minted for another resource (or with no audience) can't be
