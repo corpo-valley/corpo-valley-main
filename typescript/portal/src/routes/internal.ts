@@ -125,7 +125,7 @@ router.get('/internal/projects/:slug/owner', requireInternalSecret, requireInClu
 // effective site permission (none|read|write|admin) from the same grants engine
 // that backs GET /access/site/:slug — direct grants, group grants, the site
 // default, and owner=admin all included. The gateway compares it to its required
-// floor (write). Authenticated with the shared internal secret (same as /owner).
+// floor (read). Authenticated with the shared internal secret (same as /owner).
 router.get('/internal/projects/:slug/access/:sub', requireInternalSecret, requireInClusterCaller, async (req: Request, res: Response) => {
   const slug = String(req.params.slug || '');
   const sub = String(req.params.sub || '');

@@ -7,6 +7,8 @@
 // authorization server (Hydra) from just the MCP URL.
 
 import { Router, Request, Response } from 'express';
+import * as crypto from 'crypto';
+import { Configuration, OAuth2Api } from '@ory/client';
 import { introspectToken } from '../services/hydra-introspect';
 import { dispatchJsonRpc, type McpContext } from '../services/mcp';
 import { getIdentity } from '../services/kratos-admin';
@@ -21,8 +23,12 @@ const router = Router();
 // RFC 9728 — Protected Resource Metadata. MCP clients hit this from the
 // `WWW-Authenticate` Bearer realm header (or by appending the well-known
 // path to the MCP base URL) to learn which authorization server to drive.
+// CORS: browser-based MCP clients (claude.ai) fetch this cross-origin, same
+// as the AS-metadata endpoints below — it's public, cacheable metadata.
 router.get('/.well-known/oauth-protected-resource', (_req, res) => {
-  res.set('Cache-Control', 'public, max-age=3600').json({
+  res.set('Cache-Control', 'public, max-age=3600')
+    .set('Access-Control-Allow-Origin', '*')
+    .json({
     resource: PUBLIC_MCP_URL,
     authorization_servers: [HYDRA_PUBLIC_URL],
     scopes_supported: ['openid', 'offline', 'offline_access'],
@@ -72,7 +78,10 @@ async function fetchAndAugmentMetadata(): Promise<any> {
     // RFC 8414 explicitly enumerates these; restate so clients that only
     // parse RFC 8414 fields see what they expect.
     grant_types_supported: oidc.grant_types_supported || ['authorization_code', 'refresh_token', 'client_credentials'],
-    code_challenge_methods_supported: oidc.code_challenge_methods_supported || ['S256'],
+    // Pass Hydra's PKCE methods through AS-IS — never synthesize a fallback.
+    // If Hydra ever stopped advertising S256, fabricating it here would make
+    // the portal lie to clients about PKCE support.
+    code_challenge_methods_supported: oidc.code_challenge_methods_supported,
   };
   cachedMetadata = { fetched_at: now, body: merged };
   return merged;
@@ -206,6 +215,43 @@ function bearerChallenge(error: string, description?: string): string {
   return `${h}, resource_metadata="${RESOURCE_METADATA_URL}"`;
 }
 
+// Confused-deputy defence, part 2 (see the DENY_CLIENT_IDS block in
+// authenticate for part 1): every legitimate MCP client registers via DCR as a
+// PUBLIC client (`token_endpoint_auth_method: 'none'`), while the tokens we're
+// defending against are minted to confidential first-party clients. So beyond
+// the deny list, require the token's client to be public: look it up on the
+// Hydra admin API and reject anything confidential. The auth method is static
+// per client, so cache lookups briefly instead of hitting Hydra every request.
+const hydraAdmin = new OAuth2Api(
+  new Configuration({ basePath: process.env.HYDRA_ADMIN_URL || 'http://localhost:4445' }),
+);
+const CLIENT_AUTH_METHOD_TTL_MS = 5 * 60 * 1000;
+const CLIENT_AUTH_METHOD_MAX_ENTRIES = 5000;
+const clientAuthMethodCache = new Map<string, { at: number; isPublic: boolean }>();
+
+// Whether `clientId` is a public client. Returns null when the client can't be
+// resolved (lookup error, unknown id) — callers must FAIL CLOSED on null.
+async function isPublicClient(clientId: string): Promise<boolean | null> {
+  const now = Date.now();
+  const cached = clientAuthMethodCache.get(clientId);
+  if (cached && now - cached.at < CLIENT_AUTH_METHOD_TTL_MS) return cached.isPublic;
+  try {
+    const { data } = await hydraAdmin.getOAuth2Client({ id: clientId });
+    const isPublic = data.token_endpoint_auth_method === 'none';
+    // Bound the cache (FIFO eviction) so a churn of distinct client ids can't
+    // grow it without limit.
+    if (clientAuthMethodCache.size >= CLIENT_AUTH_METHOD_MAX_ENTRIES && !clientAuthMethodCache.has(clientId)) {
+      const oldest = clientAuthMethodCache.keys().next().value;
+      if (oldest !== undefined) clientAuthMethodCache.delete(oldest);
+    }
+    clientAuthMethodCache.set(clientId, { at: now, isPublic });
+    return isPublic;
+  } catch (err) {
+    console.error('[mcp] hydra client lookup failed:', (err as Error)?.message);
+    return null;
+  }
+}
+
 // Bearer token extraction + introspection → McpContext or 401.
 async function authenticate(req: Request, res: Response): Promise<McpContext | null> {
   const auth = req.header('authorization') || '';
@@ -224,9 +270,10 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
     return null;
   }
   // Reject a non-access token (e.g. a refresh token) presented as a bearer.
-  // Hydra reports `token_use`; when present it must say access_token. Absent
-  // (older Hydra) → fall through, preserving existing behaviour.
-  if (introspection.token_use && introspection.token_use !== 'access_token') {
+  // Hydra's fosite introspection ALWAYS returns `token_use` for OAuth2 access
+  // tokens, so absence is itself suspicious — fail closed and require it to
+  // say access_token.
+  if (introspection.token_use !== 'access_token') {
     console.warn('[mcp] rejected non-access token', { token_use: introspection.token_use, client_id: introspection.client_id });
     res.status(401)
       .set('WWW-Authenticate', bearerChallenge('invalid_token'))
@@ -246,18 +293,34 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   // flow auto-trusts — those are exactly the confused-deputy risk (their tokens
   // carry the user's sub and skip consent).
   //
-  // Set MCP_DENY_CLIENT_IDS EXPLICITLY in deployment (the chart wires it from
-  // `mcp.denyClientIds` to this portal AND the mcp-gateway, so the two enforce
-  // identically). The in-code fallback to TRUSTED_CLIENT_IDS is a safety net
-  // for non-chart deploys — but beware: it denies EVERY trusted client, and a
-  // deployment that trusts an MCP-driver client for consent (e.g. the static
-  // `claude-code-mcp`) would deny the one client that's supposed to reach MCP.
-  // That's why the chart's deny list is `argocd,gitea` (SSO clients only),
-  // not the trusted list. DCR clients aren't trusted-for-consent, so they pass.
-  const DENY_CLIENT_IDS = (process.env.MCP_DENY_CLIENT_IDS || process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea')
-    .split(',').map((s) => s.trim()).filter(Boolean);
-  if (introspection.client_id && DENY_CLIENT_IDS.includes(introspection.client_id)) {
+  // The deny set is the UNION of MCP_DENY_CLIENT_IDS (the chart wires it from
+  // `mcp.denyClientIds` to this portal AND the mcp-gateway) and
+  // TRUSTED_CLIENT_IDS — NOT a fallback chain. Trusted clients auto-consent
+  // (they skip the MCP consent screen), so their tokens were never explicitly
+  // authorized for MCP: every trusted client must be denied here, and taking
+  // the union keeps that self-maintaining as new trusted clients are added.
+  // DCR clients aren't trusted-for-consent, so they pass.
+  const DENY_CLIENT_IDS = new Set(
+    [
+      process.env.MCP_DENY_CLIENT_IDS || 'argocd,gitea',
+      process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea',
+    ].flatMap((v) => v.split(',')).map((s) => s.trim()).filter(Boolean),
+  );
+  if (introspection.client_id && DENY_CLIENT_IDS.has(introspection.client_id)) {
     console.warn('[mcp] rejected token from non-MCP client', { client_id: introspection.client_id });
+    res.status(403)
+      .set('WWW-Authenticate', bearerChallenge('invalid_token', 'this client is not authorized for the MCP resource'))
+      .json({ error: 'unauthorized_client', resource_metadata: RESOURCE_METADATA_URL });
+    return null;
+  }
+  // Public-client requirement (see isPublicClient above): a token from a
+  // CONFIDENTIAL client is by definition not from a DCR-registered MCP client,
+  // whatever its id — reject it even if it's not on the deny list. FAIL CLOSED
+  // when the client can't be resolved: a token we can't attribute to a public
+  // client never reaches the platform MCP.
+  const isPublic = introspection.client_id ? await isPublicClient(introspection.client_id) : null;
+  if (isPublic !== true) {
+    console.warn('[mcp] rejected token: client is confidential or unresolvable', { client_id: introspection.client_id });
     res.status(403)
       .set('WWW-Authenticate', bearerChallenge('invalid_token', 'this client is not authorized for the MCP resource'))
       .json({ error: 'unauthorized_client', resource_metadata: RESOURCE_METADATA_URL });
@@ -359,22 +422,27 @@ let sseOpenTotal = 0;
 // of N. Without this, a single tenant fanning out many channels drives
 // introspection load proportional to channel count.
 const REINTROSPECT_COALESCE_MS = 10_000;
+// Keyed by sha256(token), never the raw bearer — same rationale as the
+// introspection cache: a heap dump or accidental log of this map must not
+// expose live tokens. The raw token is only held transiently to make the
+// introspection call itself.
 const tokenLiveness = new Map<string, { at: number; active: boolean; sub?: string }>();
 const TOKEN_LIVENESS_MAX = 5000;
 async function coalescedIntrospect(token: string): Promise<{ active: boolean; sub?: string }> {
+  const key = crypto.createHash('sha256').update(token).digest('hex');
   const now = Date.now();
-  const cached = tokenLiveness.get(token);
+  const cached = tokenLiveness.get(key);
   if (cached && now - cached.at < REINTROSPECT_COALESCE_MS) {
     return { active: cached.active, sub: cached.sub };
   }
   const r = await introspectToken(token);
   // Bound the map (FIFO eviction) so a churn of distinct tokens can't grow it
   // without limit.
-  if (tokenLiveness.size >= TOKEN_LIVENESS_MAX && !tokenLiveness.has(token)) {
+  if (tokenLiveness.size >= TOKEN_LIVENESS_MAX && !tokenLiveness.has(key)) {
     const oldest = tokenLiveness.keys().next().value;
     if (oldest !== undefined) tokenLiveness.delete(oldest);
   }
-  tokenLiveness.set(token, { at: now, active: !!r.active, sub: r.sub });
+  tokenLiveness.set(key, { at: now, active: !!r.active, sub: r.sub });
   return { active: !!r.active, sub: r.sub };
 }
 

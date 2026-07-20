@@ -11,6 +11,7 @@ import docsRouter from './routes/docs';
 import siteAccessRouter from './routes/site-access';
 import groupsRouter from './routes/groups';
 import { validateCsrf } from './middleware/csrf';
+import { authLimiter, dcrLimiter, wellKnownLimiter } from './middleware/rateLimit';
 import { migrate } from './services/projects';
 import { reconcileAllProjects } from './services/repo-access';
 import { backfillPinTokens } from './services/pin-token-backfill';
@@ -111,6 +112,28 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
+
+// Per-IP rate limiting on the unauthenticated auth surface (findings #4/#5),
+// mounted by path BEFORE the routers so it applies regardless of which router
+// serves the path. Keyed on req.ip, which is correct because of the
+// `trust proxy` setting above (see middleware/rateLimit.ts for details).
+//   - dcrLimiter (strict): the Dynamic Client Registration proxy — open DCR
+//     with no throttle enables client-flooding and consent-phishing client spam.
+//     Mounted on the prefix so /oauth2/register/:id management calls are
+//     covered too, for every method.
+//   - wellKnownLimiter (lenient): the OAuth/OIDC discovery docs, including the
+//     /mcp/.well-known alias (this does NOT touch the /mcp data plane itself).
+//   - authLimiter (moderate): the interactive Kratos/Hydra flow pages.
+// Deliberately NOT rate-limited: /health (infra probes), /mcp (Bearer-authed
+// data plane), /internal (cluster-only webhooks), and the ingress site-access
+// auth subrequest path — throttling those would let an attacker starve
+// legitimate infra/API traffic instead of protecting it.
+app.use('/oauth2/register', dcrLimiter);
+app.use(['/.well-known', '/mcp/.well-known'], wellKnownLimiter);
+app.use(
+  ['/login', '/consent', '/registration', '/recovery', '/verification', '/settings', '/error'],
+  authLimiter,
+);
 
 // Auth flow routes (no session required — these ARE the auth UI)
 app.use(healthRouter);
