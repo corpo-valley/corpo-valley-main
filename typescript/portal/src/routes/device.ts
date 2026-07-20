@@ -5,6 +5,12 @@ import { validateCsrf, csrfHiddenField } from '../middleware/csrf';
 
 // OAuth 2.0 Device Authorization Grant (RFC 8628) — the browser side.
 //
+// STATUS: INERT on the current Ory Hydra v2.3.0 — that version has no device
+// config (no urls.device, no device endpoints), so Hydra never redirects here
+// and discovery does not advertise the grant (see routes/mcp.ts). This code is
+// complete and ready; it activates once Hydra is upgraded to a version with
+// device-flow support and the chart sets urls.device.{verification,success}.
+//
 // A headless/CLI client (e.g. an MCP client that can't complete an interactive
 // browser login) POSTs to Hydra's /oauth2/device/auth, gets a user_code +
 // verification URI, and long-polls /oauth2/token. The human opens the

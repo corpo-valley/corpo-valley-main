@@ -69,15 +69,16 @@ async function fetchAndAugmentMetadata(): Promise<any> {
   const merged = {
     ...oidc,
     registration_endpoint: registrationEndpoint,
-    // Device Authorization Grant (RFC 8628): Hydra advertises this in its OIDC
-    // discovery once the grant is enabled, but restate it (RFC 8414 field) so
-    // clients that only parse RFC 8414 can find the endpoint and offer the
-    // browserless flow to headless MCP clients.
-    device_authorization_endpoint: oidc.device_authorization_endpoint || `${HYDRA_PUBLIC_URL}/oauth2/device/auth`,
     // RFC 8414 explicitly enumerates these; restate so clients that only
     // parse RFC 8414 fields see what they expect.
-    grant_types_supported: oidc.grant_types_supported || ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code'],
+    grant_types_supported: oidc.grant_types_supported || ['authorization_code', 'refresh_token', 'client_credentials'],
     code_challenge_methods_supported: oidc.code_challenge_methods_supported || ['S256'],
+    // NOTE: the Device Authorization Grant (RFC 8628) is intentionally NOT
+    // advertised here. The device routes exist (routes/device.ts) but Ory Hydra
+    // v2.3.0 has no device-flow config (no urls.device / device endpoints), so
+    // advertising device_authorization_endpoint would send clients into a flow
+    // that can't complete. Re-enable once Hydra is upgraded to a version with
+    // device support (see the device-flow follow-up).
   };
   cachedMetadata = { fetched_at: now, body: merged };
   return merged;
