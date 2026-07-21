@@ -1,8 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { Configuration, OAuth2Api } from '@ory/client';
-import { renderError, renderInfo, renderConsentPage, renderLogoutConfirm, renderFormRedirect } from '../templates';
+import { renderError, renderInfo, renderConsentPage, renderLogoutConfirm, renderFormRedirect, renderAutoSubmitConsent } from '../templates';
 import { getIdentity } from '../services/kratos-admin';
 import { getProjectBySlug } from '../services/projects';
+import { effectiveSitePerm } from '../services/access';
 import { userCanAccessService } from '../services/keto';
 import { requireSession } from '../middleware/session';
 import { validateCsrf, csrfHiddenField } from '../middleware/csrf';
@@ -14,7 +15,7 @@ const hydraAdminUrl = process.env.HYDRA_ADMIN_URL || 'http://localhost:4445';
 
 // Parse the project slug out of a per-project MCP resource indicator
 // (`https://<slug>.<PROJECTS_DOMAIN>/mcp`). Returns null for any audience that
-// isn't a project-MCP resource — those pass through ownership filtering.
+// isn't a project-MCP resource — those pass through access filtering.
 function projectSlugFromResource(resource: string): string | null {
   try {
     const u = new URL(resource);
@@ -30,19 +31,35 @@ function projectSlugFromResource(resource: string): string | null {
 
 // Root-cause defense for the MCP confused-deputy: a client can request ANY
 // resource indicator, so before Hydra stamps a per-project MCP resource into a
-// token's `aud`, drop any such audience the consenting subject doesn't own.
-// Non-project audiences (the platform MCP, OIDC clients) pass through untouched.
-// The gateway re-checks ownership per request; this stops the token issuing at all.
-async function filterOwnedAudiences(requested: string[], subject: string): Promise<string[]> {
+// token's `aud`, drop any such audience the consenting subject has no effective
+// SITE access to. The keep/drop decision mirrors the per-project MCP gateway's
+// authorization model exactly (mcp-gateway sitePermission() with
+// MIN_SITE_PERM='read', backed by GET /internal/projects/:slug/access/:sub →
+// effectiveSitePerm): owner, direct user grants, group grants, and the
+// org-wide `everyone` grant (internal projects) all count — not just
+// ownership. Non-project audiences (the platform MCP, OIDC clients) pass
+// through untouched. Fails CLOSED: an unknown project or a failed lookup drops
+// the audience. The gateway re-checks access per request; this stops the token
+// issuing at all.
+async function filterAccessibleAudiences(requested: string[], subject: string): Promise<string[]> {
   const out: string[] = [];
   for (const aud of requested) {
     const slug = projectSlugFromResource(aud);
     if (!slug) { out.push(aud); continue; }
-    const project = await getProjectBySlug(slug);
-    if (project && project.owner_id === subject) {
+    let allowed = false;
+    try {
+      const project = await getProjectBySlug(slug);
+      // Effective site permission >= read (i.e. anything above 'none') is the
+      // same floor the gateway enforces (MIN_SITE_PERM = 'read').
+      allowed = !!project && (await effectiveSitePerm(project, subject)) !== 'none';
+    } catch (err: any) {
+      console.warn('[consent] audience access lookup failed — dropping audience (fail closed)', { aud, subject, error: err?.message });
+      continue;
+    }
+    if (allowed) {
       out.push(aud);
     } else {
-      console.warn('[consent] dropping audience for project not owned by subject', { aud, subject });
+      console.warn('[consent] dropping audience for project the subject has no site access to', { aud, subject });
     }
   }
   return out;
@@ -175,27 +192,21 @@ router.get('/consent', requireSession, async (req: Request, res: Response) => {
     if (!consentRequest) return;
 
     const grantScope = consentRequest.requested_scope || [];
-    const grantAccessTokenAudience = consentRequest.requested_access_token_audience || [];
     const clientId = consentRequest.client?.client_id;
     const clientName = consentRequest.client?.client_name || clientId || 'Unknown';
 
-    // Auto-accept for trusted first-party clients — only after the subject-
-    // equality check above has confirmed the session owns this challenge.
+    // Trusted first-party clients skip the consent QUESTION, but never the
+    // CSRF gate: accepting consent mints tokens (a state-changing side effect),
+    // so it must only happen via the CSRF-protected POST /consent/accept —
+    // never on this bare GET, which a cross-site link could forge against a
+    // logged-in victim. Render an auto-submitting form that immediately POSTs
+    // the challenge + CSRF token to /consent/accept, keeping the UX a seamless
+    // redirect; the POST handler (session + CSRF + subject-equality) does the
+    // actual accept.
     if (isTrustedClient(clientId)) {
-      const idTokenClaims = await buildIdTokenClaims(consentRequest.subject || '');
-      const { data: completedRequest } = await hydra.acceptOAuth2ConsentRequest({
-        consentChallenge,
-        acceptOAuth2ConsentRequest: {
-          grant_scope: grantScope,
-          grant_access_token_audience: await filterOwnedAudiences(grantAccessTokenAudience, consentRequest.subject || ''),
-          remember: true,
-          remember_for: 3600,
-          session: { id_token: idTokenClaims },
-        },
-      });
-      // Plain GET navigation (no form submission), so a 302 is not subject to
-      // the form-action enforcement that sendFormRedirect works around.
-      return res.redirect(completedRequest.redirect_to);
+      // The page embeds a live consent challenge — keep it out of caches.
+      res.set('Cache-Control', 'no-store');
+      return res.send(renderAutoSubmitConsent(consentChallenge, csrfHiddenField(req, res)));
     }
 
     // Admins-only gate: deny before showing consent if the service is restricted
@@ -237,7 +248,7 @@ router.post('/consent/accept', requireSession, validateCsrf, async (req: Request
       consentChallenge,
       acceptOAuth2ConsentRequest: {
         grant_scope: consentRequest.requested_scope || [],
-        grant_access_token_audience: await filterOwnedAudiences(consentRequest.requested_access_token_audience || [], consentRequest.subject || ''),
+        grant_access_token_audience: await filterAccessibleAudiences(consentRequest.requested_access_token_audience || [], consentRequest.subject || ''),
         remember: true,
         remember_for: 3600,
         session: { id_token: idTokenClaims },

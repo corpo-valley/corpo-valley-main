@@ -67,6 +67,25 @@ function stashPostLoginDest(req: Request, res: Response, returnTo?: string): str
   return `${kratosBrowserUrl}/self-service/login/browser`;
 }
 
+// A 403/404 from a Kratos flow fetch means the flow's anti-CSRF cookie was not
+// presented (or the flow id is unknown/foreign). For a cookie-jar-less client —
+// a headless MCP/OAuth client following redirects without storing cookies —
+// this is UNRECOVERABLE: re-minting a flow just 302s it back here to fail again,
+// an infinite redirect storm (incident 2026-07: 2,657×302 on /login?flow=). The
+// response MUST be terminal — no Location header — so a redirect-follower has
+// nothing to loop on. A real browser almost never lands here (Kratos sets the
+// flow cookie in the same 303 that issues the flow); when it does, the page tells
+// it where to restart, recovering with one human click. Only 410 (a genuinely
+// expired flow, cookie jar intact) is safe to re-mint.
+function terminalFlowError(res: Response, what: string, restartPath: string): void {
+  res.status(403).send(renderError(
+    `${what} session could not be verified`,
+    `Your ${what.toLowerCase()} session couldn't be verified because your client didn't send the flow cookie. ` +
+    `If you're connecting a headless or CLI client (e.g. an MCP client), this sign-in step must be completed in a real web browser.`,
+    `Open ${baseUrl}${restartPath} in a web browser to sign in.`,
+  ));
+}
+
 // GET /login
 router.get('/login', async (req: Request, res: Response) => {
   const flowId = req.query.flow as string | undefined;
@@ -96,6 +115,15 @@ router.get('/login', async (req: Request, res: Response) => {
     // No flow ID: redirect to Kratos to create one. Stash the (vetted) post-login
     // destination in a cookie rather than handing it to Kratos as return_to.
     return res.redirect(stashPostLoginDest(req, res, req.query.return_to as string | undefined));
+  }
+
+  // Fast-fail cookie-jar-less clients before a Kratos round-trip: a request that
+  // reaches /login?flow= carrying zero cookies can never satisfy the flow's CSRF
+  // check (a real browser always holds at least the Kratos flow cookie minted one
+  // hop earlier). Terminating here breaks the headless redirect storm at its
+  // cheapest point and spares Kratos a doomed getLoginFlow call.
+  if (!req.headers.cookie) {
+    return terminalFlowError(res, 'Login', '/login');
   }
 
   try {
@@ -128,9 +156,14 @@ router.get('/login', async (req: Request, res: Response) => {
       { googleOnly },
     ));
   } catch (err: any) {
-    if (err?.response?.status === 410 || err?.response?.status === 403) {
-      // Flow expired, start a new one (stash the vetted destination as above).
+    const status = err?.response?.status;
+    if (status === 410) {
+      // Genuinely expired flow — a cookie-capable browser restarts cleanly.
       return res.redirect(stashPostLoginDest(req, res, req.query.return_to as string | undefined));
+    }
+    if (status === 403 || status === 404) {
+      // Missing/foreign flow cookie — do NOT re-mint (that is the storm). Terminal.
+      return terminalFlowError(res, 'Login', '/login');
     }
     console.error('Login flow error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Login Error', 'Failed to load login flow.', err?.response?.data?.error?.message));
@@ -177,8 +210,13 @@ router.get('/registration', async (req: Request, res: Response) => {
       footer,
     ));
   } catch (err: any) {
-    if (err?.response?.status === 410 || err?.response?.status === 403 || err?.response?.status === 404) {
+    const status = err?.response?.status;
+    if (status === 410 || status === 404) {
       return res.redirect('/login');
+    }
+    if (status === 403) {
+      // Missing flow cookie (cookieless client) — terminal, not a redirect loop.
+      return terminalFlowError(res, 'Registration', '/login');
     }
     console.error('Registration flow error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Registration Error', 'Failed to load registration flow.', err?.response?.data?.error?.message));
@@ -207,8 +245,12 @@ router.get('/verification', async (req: Request, res: Response) => {
       flow.ui.messages as any,
     ));
   } catch (err: any) {
-    if (err?.response?.status === 410 || err?.response?.status === 403) {
+    const status = err?.response?.status;
+    if (status === 410) {
       return res.redirect(`${kratosBrowserUrl}/self-service/verification/browser`);
+    }
+    if (status === 403) {
+      return terminalFlowError(res, 'Verification', '/verification');
     }
     console.error('Verification flow error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Verification Error', 'Failed to load verification flow.', err?.response?.data?.error?.message));
@@ -240,8 +282,12 @@ router.get('/recovery', async (req: Request, res: Response) => {
       footer,
     ));
   } catch (err: any) {
-    if (err?.response?.status === 410 || err?.response?.status === 403) {
+    const status = err?.response?.status;
+    if (status === 410) {
       return res.redirect(`${kratosBrowserUrl}/self-service/recovery/browser`);
+    }
+    if (status === 403) {
+      return terminalFlowError(res, 'Recovery', '/recovery');
     }
     console.error('Recovery flow error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Recovery Error', 'Failed to load recovery flow.', err?.response?.data?.error?.message));
@@ -276,8 +322,12 @@ router.get('/settings', async (req: Request, res: Response) => {
       footer,
     ));
   } catch (err: any) {
-    if (err?.response?.status === 410 || err?.response?.status === 403) {
+    const status = err?.response?.status;
+    if (status === 410) {
       return res.redirect(`${kratosBrowserUrl}/self-service/settings/browser`);
+    }
+    if (status === 403) {
+      return terminalFlowError(res, 'Settings', '/settings');
     }
     console.error('Settings flow error:', err?.response?.data || err.message);
     res.status(500).send(renderError('Settings Error', 'Failed to load settings flow.', err?.response?.data?.error?.message));

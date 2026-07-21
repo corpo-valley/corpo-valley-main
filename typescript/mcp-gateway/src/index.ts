@@ -21,6 +21,7 @@
 // requests carrying a trusted X-User-Id, and needs no OAuth of its own.
 
 import express from 'express';
+import * as crypto from 'crypto';
 import * as http from 'http';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -101,10 +102,15 @@ function resourceMetadataUrl(host: string): string {
   return `https://${host}/.well-known/oauth-protected-resource`;
 }
 
-function challenge(res: express.Response, host: string): void {
+// RFC 6750: signal WHY via the `error` code so clients react correctly — an
+// `invalid_token` (present but expired/rejected) means "refresh and retry",
+// whereas a missing bearer means "start the OAuth flow". Mislabeling the former
+// as the latter pushes refresh-capable clients into a full re-auth (and, for
+// browserless clients, back into the interactive login they can't complete).
+function challenge(res: express.Response, host: string, error = 'invalid_request', bodyError = error): void {
   res.status(401)
-    .set('WWW-Authenticate', `Bearer realm="https://${host}/mcp", resource_metadata="${resourceMetadataUrl(host)}"`)
-    .json({ error: 'missing_bearer', resource_metadata: resourceMetadataUrl(host) });
+    .set('WWW-Authenticate', `Bearer realm="https://${host}/mcp", error="${error}", resource_metadata="${resourceMetadataUrl(host)}"`)
+    .json({ error: bodyError, resource_metadata: resourceMetadataUrl(host) });
 }
 
 interface Introspection { active: boolean; sub?: string; client_id?: string; aud?: string[]; token_use?: string; ext?: any; }
@@ -168,21 +174,50 @@ function permits(perm: SitePerm): boolean {
   return PERM_RANK[perm] >= PERM_RANK[MIN_SITE_PERM];
 }
 
+// Negative-result introspection cache. Every /mcp hit with a bearer costs a
+// Hydra admin round-trip, so without this an attacker spraying random bearers
+// amplifies load straight onto Hydra. Cache `active:false` outcomes briefly,
+// keyed by sha256(token) (never the raw bearer — keeps tokens out of heap
+// dumps). Positive results are NOT cached here — an inactive token can never
+// become active again, so the negative cache is safe, but extending a positive
+// result would delay revocation. Fail-closed semantics unchanged.
+const NEG_INTROSPECT_TTL_MS = 5_000;
+const NEG_INTROSPECT_MAX_ENTRIES = 5000;
+const negIntrospectCache = new Map<string, number>(); // sha256(token) → cachedAt
+
 async function introspect(token: string): Promise<Introspection> {
-  try {
-    const r = await fetch(`${HYDRA_ADMIN_URL}/admin/oauth2/introspect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      // Hint Hydra we expect an access token; the response's `token_use`
-      // discriminator lets us reject a refresh token presented as a bearer.
-      body: new URLSearchParams({ token, token_type_hint: 'access_token' }).toString(),
-    });
-    if (!r.ok) return { active: false };
-    return await r.json() as Introspection;
-  } catch (e) {
-    console.error('[gateway] introspect failed:', (e as Error).message);
-    return { active: false };
+  const key = crypto.createHash('sha256').update(token).digest('hex');
+  const negAt = negIntrospectCache.get(key);
+  if (negAt !== undefined) {
+    if (Date.now() - negAt < NEG_INTROSPECT_TTL_MS) return { active: false };
+    negIntrospectCache.delete(key);
   }
+  const result = await (async (): Promise<Introspection> => {
+    try {
+      const r = await fetch(`${HYDRA_ADMIN_URL}/admin/oauth2/introspect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        // Hint Hydra we expect an access token; the response's `token_use`
+        // discriminator lets us reject a refresh token presented as a bearer.
+        body: new URLSearchParams({ token, token_type_hint: 'access_token' }).toString(),
+      });
+      if (!r.ok) return { active: false };
+      return await r.json() as Introspection;
+    } catch (e) {
+      console.error('[gateway] introspect failed:', (e as Error).message);
+      return { active: false };
+    }
+  })();
+  if (!result.active) {
+    // Bound the map (FIFO eviction) so a flood of distinct bad tokens can't
+    // grow it without limit.
+    if (negIntrospectCache.size >= NEG_INTROSPECT_MAX_ENTRIES && !negIntrospectCache.has(key)) {
+      const oldest = negIntrospectCache.keys().next().value;
+      if (oldest !== undefined) negIntrospectCache.delete(oldest);
+    }
+    negIntrospectCache.set(key, Date.now());
+  }
+  return result;
 }
 
 // ── OAuth discovery (served unauthenticated so clients can bootstrap) ──────────
@@ -194,7 +229,9 @@ function protectedResource(req: express.Request, res: express.Response) {
   // is honoured.
   const slug = slugFromHost(host);
   if (!slug) { res.status(400).json({ error: 'unknown project host' }); return; }
-  res.set('Cache-Control', 'public, max-age=3600').json({
+  // CORS: browser-based MCP clients (claude.ai) fetch this cross-origin, same
+  // as the AS-metadata endpoints below — it's public, cacheable metadata.
+  res.set('Cache-Control', 'public, max-age=3600').set('Access-Control-Allow-Origin', '*').json({
     resource: resourceForSlug(slug),
     authorization_servers: [HYDRA_PUBLIC_URL],
     scopes_supported: ['openid', 'offline', 'offline_access'],
@@ -247,16 +284,17 @@ async function handleMcp(req: express.Request, res: express.Response) {
   if (!slug) { res.status(400).json({ error: 'unknown project host' }); return; }
 
   const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
-  if (!m) { challenge(res, host); return; }
+  if (!m) { challenge(res, host, 'invalid_request', 'missing_bearer'); return; }
 
   const intro = await introspect(m[1]);
-  if (!intro.active || !intro.sub) { challenge(res, host); return; }
+  if (!intro.active || !intro.sub) { challenge(res, host, 'invalid_token'); return; }
   // Reject non-access tokens (e.g. a refresh token) presented as a bearer.
-  // Hydra reports `token_use` for OAuth2 tokens; when present it must say
-  // access_token. Absent (older Hydra) → fall through, as before.
-  if (intro.token_use && intro.token_use !== 'access_token') {
+  // Hydra's fosite introspection ALWAYS returns `token_use` for OAuth2 access
+  // tokens, so absence is itself suspicious — fail closed and require it to
+  // say access_token.
+  if (intro.token_use !== 'access_token') {
     console.warn('[gateway] rejecting non-access token', { slug, token_use: intro.token_use, client_id: intro.client_id });
-    challenge(res, host);
+    challenge(res, host, 'invalid_token');
     return;
   }
   const sub = intro.sub;

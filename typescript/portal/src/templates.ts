@@ -596,6 +596,31 @@ export function renderConsentPage(
   return layout('Authorize', body);
 }
 
+// Auto-submitting interstitial for TRUSTED first-party OAuth clients
+// (argocd/gitea). Accepting consent mints tokens — a state-changing side
+// effect — so it must never happen on a bare GET (forgeable cross-site).
+// This page immediately POSTs the consent challenge + CSRF token to
+// /consent/accept, which does the real (session + CSRF + subject-checked)
+// accept, keeping the trusted-client UX a seamless redirect. With scripts
+// disabled it degrades to a single Continue button. Same nonce'd-script
+// pattern as renderFormRedirect above.
+export function renderAutoSubmitConsent(
+  consentChallenge: string,
+  csrfField: string = ''
+): string {
+  const body = `
+    <h1>Continuing sign-in&hellip;</h1>
+    <p style="color:#c4b698;margin-bottom:1rem;">Returning you to the application.</p>
+    <form id="consent-continue" method="POST" action="/consent/accept">
+      ${csrfField}
+      <input type="hidden" name="consent_challenge" value="${escapeHtml(consentChallenge)}">
+      <noscript><button type="submit">Continue</button></noscript>
+    </form>
+    <script nonce="${cspNonce()}">document.getElementById('consent-continue').submit();</script>
+  `;
+  return layout('Continuing sign-in', body);
+}
+
 export function renderLogoutConfirm(
   logoutChallenge: string,
   csrfField: string = ''
