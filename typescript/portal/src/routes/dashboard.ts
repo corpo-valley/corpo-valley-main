@@ -210,7 +210,13 @@ router.get('/achievements/u/:username', requireSession, async (req: Request, res
       return res.status(404).send(renderError('Not found', 'No resident found with that username.'));
     }
     const traits = (identity.traits as any) ?? {};
-    const displayName = traits.name || traits.preferred_username || username;
+    // Kratos stores `name` as an object ({first,last}), not a string — flatten
+    // it before it reaches escapeHtml() in the template.
+    const nm = traits.name;
+    const fullName = typeof nm === 'string'
+      ? nm
+      : [nm?.first, nm?.last].filter(Boolean).join(' ');
+    const displayName = fullName || traits.preferred_username || username;
     // Refresh their award cache so `since` dates and feed chips stay current.
     await reconcileAwards(identity.id);
     const badges = await computeBadges(identity.id);
