@@ -222,6 +222,40 @@ export async function migrate(): Promise<void> {
     );
   `);
 
+  // Achievements: the ONLY facts not already derivable from the tables above —
+  // pull requests to repos you don't own, and meaningful cross-project
+  // interactions. Everything else (First Post, Serial Founder, Shipped It, Good
+  // Neighbor, Team Builder) is derived on read from projects/project_grants/
+  // groups. actor_id/target_owner_id are Kratos identity ids; we only ever
+  // insert rows where target_owner_id <> actor_id (self-activity is never a
+  // "neighbor" achievement). See services/achievements.ts.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cv_activity_events (
+      id uuid primary key default gen_random_uuid(),
+      actor_id text not null,
+      kind text not null check (kind in ('pr_authored', 'project_interaction')),
+      project_id uuid references projects(id) on delete set null,
+      target_owner_id text not null,
+      created_at timestamptz not null default now(),
+      meta jsonb
+    );
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS cv_activity_actor_kind_idx ON cv_activity_events (actor_id, kind);');
+  await pool.query('CREATE INDEX IF NOT EXISTS cv_activity_actor_proj_idx ON cv_activity_events (actor_id, project_id);');
+  // Award cache: the first moment a user crosses a badge threshold. Drives the
+  // one-time "you earned a badge" toast (notified_at is stamped when shown).
+  // Reading these is how other people's earned badges are surfaced cheaply
+  // (one indexed lookup) on the Community Feed without recomputing.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cv_achievement_grants (
+      user_id text not null,
+      badge_key text not null,
+      awarded_at timestamptz not null default now(),
+      notified_at timestamptz,
+      primary key (user_id, badge_key)
+    );
+  `);
+
   // Existing DBs: widen the subject_type CHECK to admit `everyone` and add the
   // no-org-wide-admin CHECK (both no-ops once already present). The inline
   // CHECKs above only take effect on a fresh CREATE.

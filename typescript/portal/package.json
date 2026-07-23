@@ -1,6 +1,6 @@
 {
   "name": "portal",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Corpo Valley self-service portal: Ory auth UI, Hydra consent, API keys, and project registration",
   "main": "dist/index.js",
   "scripts": {

@@ -6,6 +6,7 @@
 // carried over from the reference portal.
 
 import { cspNonce } from './lib/csp-nonce';
+import type { Badge } from './services/achievements';
 import {
   GITEA_PUBLIC_URL, PROJECTS_DOMAIN, BASE_DOMAIN,
   PORTAL_PUBLIC_URL, MCP_ENDPOINT_URL, OAUTH_PUBLIC_URL,
@@ -212,6 +213,26 @@ const CSS = `
   .badge-ADMIN { background: #7f3d1d; color: #f3a5a5; }
   .badge-USER { background: #4d6624; color: #c3e0a0; }
   .badge-access { background: #4a3c2c; color: #c4b698; }
+  .badge-achievement { background: #4a3c2c; color: #e8b94a; text-transform: none; letter-spacing: 0; }
+
+  /* Achievements board */
+  .achv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1rem; margin-top: 1rem; }
+  .achv-card { border: 1px solid #5a4a36; border-radius: 8px; padding: 1rem; background: #322619; position: relative; }
+  .achv-card.earned { border-color: #e8b94a; background: #3a2f1c; }
+  .achv-card.locked { opacity: 0.72; }
+  .achv-emoji { font-size: 1.9rem; line-height: 1; filter: grayscale(1); }
+  .achv-card.earned .achv-emoji { filter: none; }
+  .achv-name { font-weight: 700; color: #f3ead9; margin: 0.4rem 0 0.15rem; }
+  .achv-rule { font-size: 0.82rem; color: #c4b698; margin: 0; }
+  .achv-meta { margin-top: 0.6rem; font-size: 0.75rem; color: #9c8a70; }
+  .achv-check { position: absolute; top: 0.75rem; right: 0.9rem; color: #84a25a; font-weight: 700; }
+  .achv-bar { height: 6px; border-radius: 9999px; background: #2b2118; margin-top: 0.55rem; overflow: hidden; }
+  .achv-bar > span { display: block; height: 100%; background: #84a25a; }
+  .chip-row { display: inline-flex; gap: 0.3rem; flex-wrap: wrap; vertical-align: middle; }
+
+  /* Badge-earned toast banner */
+  .toast-badges { border: 1px solid #e8b94a; background: #3a2f1c; color: #f3ead9; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.75rem; }
+  .toast-badges .toast-close { margin-left: auto; background: none; border: none; color: #c4b698; font-size: 1.1rem; cursor: pointer; line-height: 1; }
 
   /* Tables */
   .table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
@@ -657,6 +678,60 @@ export function roleBadge(isAdmin: boolean): string {
     : '<span class="badge badge-USER">User</span>';
 }
 
+export interface BadgeChip { key: string; name: string; emoji: string; }
+
+// A small pill used to surface an earned badge on other surfaces (project cards,
+// Community Feed). Pass already-shaped, trusted metadata (name/emoji from the
+// catalog) — never user input.
+export function badgeChip(c: BadgeChip): string {
+  return `<span class="badge badge-achievement" title="${escapeHtml(c.name)}">${c.emoji} ${escapeHtml(c.name)}</span>`;
+}
+
+function achievementsBoard(badges: Badge[]): string {
+  const earned = badges.filter((b) => b.earned).length;
+  const cards = badges.map((b) => {
+    const pct = Math.max(0, Math.min(100, Math.round((b.have / b.need) * 100)));
+    const progress = b.earned
+      ? (b.since ? `Earned ${escapeHtml(b.since.slice(0, 10))}` : 'Earned')
+      : `${b.have} / ${b.need}`;
+    const bar = b.earned ? '' : `<div class="achv-bar"><span style="width:${pct}%"></span></div>`;
+    return `
+      <div class="achv-card ${b.earned ? 'earned' : 'locked'}">
+        ${b.earned ? '<span class="achv-check">✓</span>' : ''}
+        <div class="achv-emoji">${b.emoji}</div>
+        <p class="achv-name">${escapeHtml(b.name)}</p>
+        <p class="achv-rule">${escapeHtml(b.rule)}</p>
+        <div class="achv-meta">${progress}</div>
+        ${bar}
+      </div>`;
+  }).join('');
+  return `
+    <p class="tagline">${earned} of ${badges.length} badges earned — keep planting and being a good neighbor.</p>
+    <div class="achv-grid">${cards}</div>`;
+}
+
+export function renderAchievements(
+  email: string,
+  badges: Badge[],
+  isAdmin: boolean,
+  newBadges: BadgeChip[] = [],
+): string {
+  return dashboardLayout('Achievements', achievementsBoard(badges), email, isAdmin, 'achievements', { newBadges });
+}
+
+export function renderPublicProfile(
+  email: string,
+  isAdmin: boolean,
+  displayName: string,
+  badges: Badge[],
+): string {
+  const body = `
+    <p class="tagline">${escapeHtml(displayName)}'s badges in the valley.</p>
+    ${achievementsBoard(badges)}
+    <div style="margin-top:1.5rem;"><a href="/community">← Back to Community</a></div>`;
+  return dashboardLayout(`${displayName}'s Achievements`, body, email, isAdmin, 'community');
+}
+
 interface NavItem { label: string; href: string; key: string; }
 
 function dashboardLayout(
@@ -667,15 +742,24 @@ function dashboardLayout(
   activeNav: string,
   // Optional extra markup injected into <head> (e.g. a no-JS meta refresh on
   // the initializing screen). Trusted, static, caller-supplied markup only —
-  // never interpolate user input here.
-  opts: { headExtra?: string } = {}
+  // never interpolate user input here. `newBadges` renders a one-time
+  // badge-earned toast (metadata is from the trusted catalog).
+  opts: { headExtra?: string; newBadges?: BadgeChip[] } = {}
 ): string {
   const navItems: NavItem[] = [
     { label: 'Projects', href: '/', key: 'projects' },
     { label: 'Community', href: '/community', key: 'community' },
+    { label: 'Achievements', href: '/achievements', key: 'achievements' },
     { label: 'Groups', href: '/groups', key: 'groups' },
     { label: 'Connect Claude Code', href: '/connect', key: 'connect' },
   ];
+  const toast = opts.newBadges && opts.newBadges.length
+    ? `<div class="toast-badges" data-toast>
+        <span style="font-size:1.4rem;">🏆</span>
+        <span>You earned <strong>${opts.newBadges.map((b) => `${b.emoji} ${escapeHtml(b.name)}`).join(', ')}</strong>! <a href="/achievements">View your board →</a></span>
+        <button class="toast-close" data-dismiss-toast aria-label="Dismiss">&times;</button>
+      </div>`
+    : '';
   let adminNav = '';
   if (isAdmin) {
     adminNav = `
@@ -712,6 +796,7 @@ function dashboardLayout(
     </nav>
     <main class="main">
       <h1>${escapeHtml(title)}</h1>
+      ${toast}
       ${bodyHtml}
 ${SITE_FOOTER}
     </main>
@@ -737,6 +822,13 @@ ${SITE_FOOTER}
         if (form && form.getAttribute && form.hasAttribute('data-confirm')) {
           if (!window.confirm(form.getAttribute('data-confirm'))) e.preventDefault();
         }
+      });
+      // Dismiss the badge-earned toast.
+      document.addEventListener('click', function(e){
+        var x = e.target && e.target.closest ? e.target.closest('[data-dismiss-toast]') : null;
+        if (!x) return;
+        var t = x.closest('[data-toast]');
+        if (t && t.parentNode) t.parentNode.removeChild(t);
       });
       // Copy-to-clipboard for buttons carrying data-copy-target="<elementId>".
       document.addEventListener('click', function(e){
@@ -833,6 +925,8 @@ export interface CommunityRow {
   updatedAt: string; // pre-formatted absolute date (tooltip)
   createdRel: string; // relative "2d ago" label
   updatedRel: string; // relative "3w ago" label
+  creatorUsername?: string; // owner's preferred_username, for the profile link
+  creatorBadges: BadgeChip[]; // owner's earned badges (from the grant cache)
 }
 
 export function renderCommunityFeed(
@@ -927,7 +1021,12 @@ export function renderCommunityFeed(
             <div class="help" style="margin:0;">${host}</div>
           </td>
           <td>${accessBadge(r.sitePerm)}</td>
-          <td>${escapeHtml(r.creator)}</td>
+          <td>
+            ${r.creatorUsername
+              ? `<a href="/achievements/u/${encodeURIComponent(r.creatorUsername)}">${escapeHtml(r.creator)}</a>`
+              : escapeHtml(r.creator)}
+            ${r.creatorBadges.length ? `<div class="chip-row" style="margin-top:0.3rem;">${r.creatorBadges.map(badgeChip).join('')}</div>` : ''}
+          </td>
           <td><span title="${escapeHtml(r.createdAt)}">${escapeHtml(r.createdRel)}</span></td>
           <td><span title="${escapeHtml(r.updatedAt)}">${escapeHtml(r.updatedRel)}</span></td>
         </tr>`;
@@ -980,7 +1079,8 @@ export function renderProjects(
   email: string,
   projects: ProjectRow[],
   isAdmin: boolean,
-  shared: SharedProjectRow[] = []
+  shared: SharedProjectRow[] = [],
+  newBadges: BadgeChip[] = []
 ): string {
   let body = `
     <p class="tagline">Your patch of the valley — every app starts as a project.${isAdmin ? ` ${roleBadge(true)}` : ''}</p>
@@ -1050,7 +1150,7 @@ export function renderProjects(
     body += '</div>';
   }
 
-  return dashboardLayout('Projects', body, email, isAdmin, 'projects');
+  return dashboardLayout('Projects', body, email, isAdmin, 'projects', { newBadges });
 }
 
 // The "project initializing" screen shown right after async creation (POST
