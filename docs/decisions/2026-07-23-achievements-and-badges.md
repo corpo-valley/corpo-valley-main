@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS cv_activity_events (
   actor_id       text NOT NULL,                 -- Kratos identity id
   kind           text NOT NULL CHECK (kind IN ('pr_authored','project_interaction',
                    'pr_merged','build_shipped','capability_enabled','secret_added',
-                   'key_connected','cli_token')),
+                   'key_connected','cli_token','project_view')),
   project_id     uuid REFERENCES projects(id) ON DELETE SET NULL,
   target_owner_id text NOT NULL,                -- project owner at event time
   created_at     timestamptz NOT NULL DEFAULT now(),
@@ -215,6 +215,28 @@ Identity enrichment (id → display name/username) uses
 there is no local `users` table.
 
 ---
+
+## Addendum — project engagement metrics (Community Feed)
+
+Fixes the "weak/broken" community metrics (the feed's only signal was the flaky
+Gitea repo mtime). The activity ledger doubles as per-project analytics:
+
+- **`project_view`** — a NEW kind recorded from the ingress edge
+  (`routes/site-access.ts`) when a non-owner is admitted to a project site.
+  Fire-and-forget, in-memory day-throttled per (viewer, slug) + DB day-capped,
+  and only inside the perm-cache-miss branch — so it adds ~nothing to the hot
+  path. It is a SEPARATE kind from `project_interaction`, so counting raw site
+  views does not change achievement semantics (Town Reporter et al. still use
+  `project_interaction` only).
+- **`projectMetrics(ids)`** (`services/achievements.ts`) — one grouped query
+  (indexed by `(project_id, kind)`) returns per project: views, distinct
+  visitors, 7-day views (trending), interactions, builds shipped, last-build
+  time, and distinct contributors.
+- **Community Feed** (`GET /community`) gains a **Popularity** column
+  (👀 visitors · 🚀 builds · 🤝 contributors · 🔥 trending), quick-sort chips
+  (Trending / Popular / Recently active / Newest), and a reliable **"Last
+  active"** = `max(last build, repo mtime)` replacing the flaky mtime-only
+  column. **Project detail** gains a metrics strip.
 
 ## Ship / deploy plan (v0.11.0 → v0.12.0)
 

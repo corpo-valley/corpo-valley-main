@@ -235,7 +235,8 @@ export async function migrate(): Promise<void> {
       actor_id text not null,
       kind text not null check (kind in (
         'pr_authored', 'project_interaction', 'pr_merged', 'build_shipped',
-        'capability_enabled', 'secret_added', 'key_connected', 'cli_token'
+        'capability_enabled', 'secret_added', 'key_connected', 'cli_token',
+        'project_view'
       )),
       project_id uuid references projects(id) on delete set null,
       target_owner_id text not null,
@@ -245,12 +246,16 @@ export async function migrate(): Promise<void> {
   `);
   await pool.query('CREATE INDEX IF NOT EXISTS cv_activity_actor_kind_idx ON cv_activity_events (actor_id, kind);');
   await pool.query('CREATE INDEX IF NOT EXISTS cv_activity_actor_proj_idx ON cv_activity_events (actor_id, project_id);');
-  // Existing DBs created cv_activity_events with the original 2-kind CHECK —
-  // widen it to admit the fuller activity vocabulary (no-op once present).
+  // Per-project aggregation (Community Feed popularity/activity) groups by
+  // project_id + kind — index it so the feed's batch metrics query stays cheap.
+  await pool.query('CREATE INDEX IF NOT EXISTS cv_activity_project_kind_idx ON cv_activity_events (project_id, kind);');
+  // Existing DBs created cv_activity_events with a narrower kind CHECK — widen
+  // it to admit the fuller activity vocabulary (no-op once present).
   await pool.query('ALTER TABLE cv_activity_events DROP CONSTRAINT IF EXISTS cv_activity_events_kind_check;');
   await pool.query(`ALTER TABLE cv_activity_events ADD CONSTRAINT cv_activity_events_kind_check CHECK (kind in (
       'pr_authored', 'project_interaction', 'pr_merged', 'build_shipped',
-      'capability_enabled', 'secret_added', 'key_connected', 'cli_token'
+      'capability_enabled', 'secret_added', 'key_connected', 'cli_token',
+      'project_view'
     ));`);
   // Award cache: the first moment a user crosses a badge threshold. Drives the
   // one-time "you earned a badge" toast (notified_at is stamped when shown).

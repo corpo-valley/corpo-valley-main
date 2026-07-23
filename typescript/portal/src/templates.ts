@@ -6,7 +6,7 @@
 // carried over from the reference portal.
 
 import { cspNonce } from './lib/csp-nonce';
-import type { Badge } from './services/achievements';
+import type { Badge, ProjectMetrics } from './services/achievements';
 import {
   GITEA_PUBLIC_URL, PROJECTS_DOMAIN, BASE_DOMAIN,
   PORTAL_PUBLIC_URL, MCP_ENDPOINT_URL, OAUTH_PUBLIC_URL,
@@ -231,6 +231,11 @@ const CSS = `
   .achv-bar { height: 6px; border-radius: 9999px; background: #2b2118; margin-top: 0.55rem; overflow: hidden; }
   .achv-bar > span { display: block; height: 100%; background: #84a25a; }
   .chip-row { display: inline-flex; gap: 0.3rem; flex-wrap: wrap; vertical-align: middle; }
+
+  /* Project engagement metrics strip */
+  .metric-strip { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin: 0.5rem 0 0.2rem; font-size: 0.85rem; color: #c4b698; }
+  .metric b { color: #f3ead9; font-weight: 700; }
+  .metric-hot { color: #e8b94a; }
 
   /* Badge-earned toast banner */
   .toast-badges { border: 1px solid #e8b94a; background: #3a2f1c; color: #f3ead9; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.75rem; }
@@ -921,7 +926,7 @@ function accessBadge(value: string): string {
 // The sort axes the feed offers. `created`/`updated` render newest-first;
 // `creator` is alphabetical by email. Shared with routes/dashboard.ts so the
 // route and template agree on the valid set.
-export const COMMUNITY_SORTS = ['created', 'creator', 'updated'] as const;
+export const COMMUNITY_SORTS = ['created', 'creator', 'updated', 'popular', 'trending'] as const;
 export type CommunitySort = (typeof COMMUNITY_SORTS)[number];
 
 // Sort direction. Validated by the route the same way `sort` is.
@@ -935,6 +940,8 @@ export const COMMUNITY_DEFAULT_DIR: Record<CommunitySort, CommunityDir> = {
   created: 'desc',
   updated: 'desc',
   creator: 'asc',
+  popular: 'desc',
+  trending: 'desc',
 };
 
 export interface CommunityRow {
@@ -948,6 +955,10 @@ export interface CommunityRow {
   updatedRel: string; // relative "3w ago" label
   creatorUsername?: string; // owner's preferred_username, for the profile link
   creatorBadges: BadgeChip[]; // owner's earned badges (from the grant cache)
+  visitors: number;   // distinct site visitors (popularity)
+  builds: number;     // deploys shipped
+  contributors: number; // distinct PR authors/mergers
+  trending: boolean;  // had views in the last 7 days
 }
 
 export function renderCommunityFeed(
@@ -977,8 +988,11 @@ export function renderCommunityFeed(
     };
   };
 
+  const quickSort = (key: CommunitySort, label: string) =>
+    `<a class="cf-quick${sort === key ? ' is-active' : ''}" href="/community?sort=${key}&dir=${COMMUNITY_DEFAULT_DIR[key]}">${label}</a>`;
   let body = `
     <p class="tagline">Internal projects shared across the valley. Open one to see what folks are building.</p>
+    <div class="cf-quicksort">Sort: ${quickSort('trending', '🔥 Trending')} ${quickSort('popular', '👀 Popular')} ${quickSort('updated', '🕒 Recently active')} ${quickSort('created', '🆕 Newest')}</div>
   `;
 
   if (rows.length === 0) {
@@ -993,8 +1007,9 @@ export function renderCommunityFeed(
   }
 
   const creatorH = sortHeader('creator', 'Creator');
+  const popularH = sortHeader('popular', 'Popularity');
   const createdH = sortHeader('created', 'Created');
-  const updatedH = sortHeader('updated', 'Last updated');
+  const updatedH = sortHeader('updated', 'Last active');
 
   body += `
     <style>
@@ -1018,6 +1033,13 @@ export function renderCommunityFeed(
       .table tr.cf-row:hover td { background: #3a2e22; }
       .cf-nomatch { display: none; }
       .cf-nomatch td { color: #a89878; text-align: center; padding: 1.5rem 0.75rem; font-style: italic; }
+      .cf-metrics { white-space: nowrap; color: #c4b698; font-size: 0.85rem; }
+      .cf-metrics span { margin-right: 0.35rem; }
+      .cf-trending { color: #e8b94a; }
+      .cf-quicksort { margin: 0.25rem 0 0.5rem; font-size: 0.85rem; color: #a89878; }
+      .cf-quick { display: inline-block; margin: 0 0.15rem; padding: 0.2rem 0.55rem; border-radius: 9999px; border: 1px solid #5a4a36; color: #c4b698; text-decoration: none; }
+      .cf-quick:hover { border-color: #e8b94a; color: #e8b94a; }
+      .cf-quick.is-active { background: #4a3c2c; color: #e8b94a; border-color: #e8b94a; }
     </style>
     <div class="cf-filter-wrap">
       <input type="text" id="cf-filter" class="cf-filter" placeholder="Filter by project or creator…"
@@ -1028,6 +1050,7 @@ export function renderCommunityFeed(
         <th class="col-static">Project</th>
         <th class="col-static">Access</th>
         <th aria-sort="${creatorH.ariaSort}">${creatorH.html}</th>
+        <th aria-sort="${popularH.ariaSort}">${popularH.html}</th>
         <th aria-sort="${createdH.ariaSort}">${createdH.html}</th>
         <th aria-sort="${updatedH.ariaSort}">${updatedH.html}</th>
       </tr></thead>
@@ -1047,6 +1070,12 @@ export function renderCommunityFeed(
               ? `<a href="/achievements/u/${encodeURIComponent(r.creatorUsername)}">${escapeHtml(r.creator)}</a>`
               : escapeHtml(r.creator)}
             ${r.creatorBadges.length ? `<div class="chip-row" style="margin-top:0.3rem;">${r.creatorBadges.map(badgeChip).join('')}</div>` : ''}
+          </td>
+          <td class="cf-metrics">
+            <span title="distinct visitors">👀 ${r.visitors}</span>
+            ${r.builds ? ` <span title="deploys shipped">🚀 ${r.builds}</span>` : ''}
+            ${r.contributors ? ` <span title="contributors">🤝 ${r.contributors}</span>` : ''}
+            ${r.trending ? ' <span class="cf-trending" title="active in the last 7 days">🔥</span>' : ''}
           </td>
           <td><span title="${escapeHtml(r.createdAt)}">${escapeHtml(r.createdRel)}</span></td>
           <td><span title="${escapeHtml(r.updatedAt)}">${escapeHtml(r.updatedRel)}</span></td>
@@ -1455,7 +1484,8 @@ export function renderProjectDetail(
   secrets: ProjectSecretRow[] = [],
   secretMessage: { type: 'error' | 'success'; text: string } | null = null,
   grants: ProjectGrantRow[] = [],
-  groups: GroupOptionRow[] = []
+  groups: GroupOptionRow[] = [],
+  metrics: ProjectMetrics | null = null
 ): string {
   const secretsList = secrets.length === 0
     ? '<div class="message info">No secrets yet.</div>'
@@ -1488,6 +1518,18 @@ cd ${escapeHtml(project.slug)}
 claude`
     : '';
 
+  // Engagement metrics strip (popularity/activity from the town's ledger).
+  const m = metrics;
+  const metricsStrip = m
+    ? `<div class="metric-strip">
+        <span class="metric" title="distinct site visitors"><b>👀 ${m.visitors}</b> visitors</span>
+        <span class="metric" title="total site views"><b>${m.views}</b> views</span>
+        <span class="metric" title="deploys shipped"><b>🚀 ${m.builds}</b> builds</span>
+        <span class="metric" title="contributors (PR authors)"><b>🤝 ${m.contributors}</b> contributors</span>
+        ${m.views7d ? `<span class="metric metric-hot" title="views in the last 7 days">🔥 ${m.views7d} this week</span>` : ''}
+      </div>`
+    : '';
+
   // ── Overview card: name + live URL as the focal point; repo + created
   // are secondary metadata below.
   const overviewCard = `
@@ -1498,6 +1540,7 @@ claude`
           ${escapeHtml(project.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗
         </a>
       </div>
+      ${metricsStrip}
       <div style="font-size:0.8rem;color:#a89878;">
         ${project.giteaRepo
           ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `

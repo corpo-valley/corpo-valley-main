@@ -67,7 +67,7 @@ import {
 } from '../templates';
 import {
   computeBadges, reconcileAwards, takePendingToasts, earnedBadgeKeys, BADGE_META,
-  recordActivity,
+  recordActivity, projectMetrics, emptyMetrics,
 } from '../services/achievements';
 import * as crypto from 'crypto';
 
@@ -260,6 +260,8 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       if (typeof t.email === 'string' && t.email) emailById.set(i.id, t.email);
       if (typeof t.preferred_username === 'string' && t.preferred_username) usernameById.set(i.id, t.preferred_username);
     }
+    // Per-project engagement metrics (popularity/activity) — one grouped query.
+    const metricsById = await projectMetrics(projects.map((p) => p.id));
     // Earned badges for every creator shown — one cached lookup, no recompute.
     const badgesByOwner = await earnedBadgeKeys(projects.map((p) => p.owner_id));
     const chipsFor = (ownerId: string): BadgeChip[] =>
@@ -267,11 +269,16 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
         .filter((k) => BADGE_META[k])
         .map((k) => ({ key: k, name: BADGE_META[k].name, emoji: BADGE_META[k].emoji }));
 
-    // Enrich each project. "Last updated" is the repo's Gitea updated_at; fall
-    // back to created_at for projects with no repo yet (or any the search
-    // omitted) so the column is never blank.
+    // Enrich each project. "Last active" is the most recent of the last build
+    // shipped (reliable, from our ledger) and the Gitea repo updated_at (flaky);
+    // fall back to created_at so the column is never blank.
     const enriched = projects.map((p) => {
-      const updatedIso = (p.gitea_repo && repoUpdated.get(p.gitea_repo)) || p.created_at;
+      const m = metricsById.get(p.id) ?? emptyMetrics();
+      const repoIso = (p.gitea_repo && repoUpdated.get(p.gitea_repo)) || null;
+      const candidates = [m.lastBuild, repoIso].filter(Boolean) as string[];
+      const updatedIso = candidates.length
+        ? candidates.reduce((a, b) => (new Date(a) > new Date(b) ? a : b))
+        : p.created_at;
       return {
         name: p.name,
         slug: p.slug,
@@ -280,6 +287,10 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
         sitePerm: p.everyone_site_perm,
         createdIso: p.created_at,
         updatedIso,
+        visitors: m.visitors,
+        builds: m.builds,
+        contributors: m.contributors,
+        views7d: m.views7d,
       };
     });
 
@@ -294,6 +305,8 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
     const cmp = (a: typeof enriched[number], b: typeof enriched[number]) => {
       if (sort === 'creator') return a.creator.localeCompare(b.creator, undefined, { sensitivity: 'base' });
       if (sort === 'updated') return ms(a.updatedIso) - ms(b.updatedIso);
+      if (sort === 'popular') return a.visitors - b.visitors;
+      if (sort === 'trending') return a.views7d - b.views7d;
       return ms(a.createdIso) - ms(b.createdIso);
     };
     enriched.sort((a, b) => (dir === 'asc' ? cmp(a, b) : -cmp(a, b)));
@@ -332,6 +345,10 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       updatedRel: rel(e.updatedIso),
       creatorUsername: usernameById.get(e.ownerId),
       creatorBadges: chipsFor(e.ownerId),
+      visitors: e.visitors,
+      builds: e.builds,
+      contributors: e.contributors,
+      trending: e.views7d > 0,
     }));
 
     res.send(renderCommunityFeed(session.email, rows, isAdmin, sort, dir));
@@ -488,6 +505,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
     const grants = await listProjectGrants(project.id).catch(() => []);
     const everyoneGrant = grants.find((g) => g.subject_type === 'everyone');
     const groups = await listGroups().catch(() => []);
+    const metrics = (await projectMetrics([project.id])).get(project.id) ?? emptyMetrics();
     res.send(renderProjectDetail(
       session.email, isAdmin,
       toProjectRow(project, {
@@ -496,6 +514,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       }),
       csrf, secrets, null,
       grants, groups.map((g) => ({ name: g.name, memberCount: g.member_count })),
+      metrics,
     ));
   } catch (err: any) {
     console.error('Project detail error:', err.message);

@@ -29,9 +29,17 @@ export type ActivityKind =
   | 'capability_enabled'
   | 'secret_added'
   | 'key_connected'
-  | 'cli_token';
+  | 'cli_token'
+  | 'project_view';
 
-const NEIGHBOR_KINDS = new Set<ActivityKind>(['pr_authored', 'project_interaction']);
+// Neighbor kinds are only recorded when the actor is NOT the target owner.
+const NEIGHBOR_KINDS = new Set<ActivityKind>(['pr_authored', 'project_interaction', 'project_view']);
+// Day-capped kinds record at most one row per (actor, project, UTC day).
+// project_view (site visits, popularity) and project_interaction (meaningful
+// engagement, achievements) are both high-volume, so both are capped. NB they
+// are SEPARATE kinds: only project_interaction feeds achievement metrics, so
+// counting raw site views doesn't change Town Reporter et al.
+const DAY_CAPPED_KINDS = new Set<ActivityKind>(['project_interaction', 'project_view']);
 
 export type BadgeCategory =
   | 'Founding' | 'Shipping' | 'Neighbors' | 'Teams' | 'Contributions'
@@ -156,17 +164,17 @@ export async function recordActivity(
     const owner = targetOwnerId || actorId;
     if (NEIGHBOR_KINDS.has(kind) && owner === actorId) return; // never self for neighbor events
     const metaJson = meta ? JSON.stringify(meta) : null;
-    if (kind === 'project_interaction') {
-      // One interaction per project per day.
+    if (DAY_CAPPED_KINDS.has(kind)) {
+      // At most one row per (actor, project, kind, UTC day).
       await pool.query(
         `INSERT INTO cv_activity_events (actor_id, kind, project_id, target_owner_id, meta)
-         SELECT $1, 'project_interaction', $2, $3, $4::jsonb
+         SELECT $1, $2, $3, $4, $5::jsonb
          WHERE NOT EXISTS (
            SELECT 1 FROM cv_activity_events
-           WHERE actor_id = $1 AND kind = 'project_interaction' AND project_id = $2
+           WHERE actor_id = $1 AND kind = $2 AND project_id = $3
              AND created_at >= date_trunc('day', now())
          )`,
-        [actorId, projectId, owner, metaJson],
+        [actorId, kind, projectId, owner, metaJson],
       );
     } else {
       await pool.query(
@@ -374,3 +382,54 @@ export async function earnedBadgeKeys(userIds: string[]): Promise<Map<string, st
   }
   return out;
 }
+
+export interface ProjectMetrics {
+  views: number;        // total site views (project_view)
+  visitors: number;     // distinct viewers
+  views7d: number;      // views in the last 7 days (drives "trending")
+  interactions: number; // meaningful engagement (project_interaction)
+  builds: number;       // deploys shipped (build_shipped)
+  lastBuild: string | null; // ISO time of the last build (a reliable "last active")
+  contributors: number; // distinct PR authors/mergers
+}
+
+const EMPTY_METRICS: ProjectMetrics = {
+  views: 0, visitors: 0, views7d: 0, interactions: 0, builds: 0, lastBuild: null, contributors: 0,
+};
+
+/**
+ * Batch per-project engagement metrics for the Community Feed / project detail.
+ * One grouped query over the activity ledger; best-effort ({} on error). NOT
+ * epoch-gated — these are live popularity/activity counters, not achievements.
+ */
+export async function projectMetrics(projectIds: string[]): Promise<Map<string, ProjectMetrics>> {
+  const out = new Map<string, ProjectMetrics>();
+  const ids = Array.from(new Set(projectIds.filter(Boolean)));
+  if (!ids.length) return out;
+  try {
+    const res = await pool.query(
+      `SELECT project_id,
+         COUNT(*) FILTER (WHERE kind='project_view')::int AS views,
+         COUNT(DISTINCT actor_id) FILTER (WHERE kind='project_view')::int AS visitors,
+         COUNT(*) FILTER (WHERE kind='project_view' AND created_at > now() - interval '7 days')::int AS views_7d,
+         COUNT(*) FILTER (WHERE kind='project_interaction')::int AS interactions,
+         COUNT(*) FILTER (WHERE kind='build_shipped')::int AS builds,
+         MAX(created_at) FILTER (WHERE kind='build_shipped') AS last_build,
+         COUNT(DISTINCT actor_id) FILTER (WHERE kind IN ('pr_authored','pr_merged'))::int AS contributors
+       FROM cv_activity_events WHERE project_id = ANY($1) GROUP BY project_id`,
+      [ids],
+    );
+    for (const r of res.rows as any[]) {
+      out.set(r.project_id, {
+        views: r.views, visitors: r.visitors, views7d: r.views_7d, interactions: r.interactions,
+        builds: r.builds, lastBuild: r.last_build ? new Date(r.last_build).toISOString() : null,
+        contributors: r.contributors,
+      });
+    }
+  } catch (err) {
+    console.error('[achievements] projectMetrics failed (ignored):', (err as Error).message);
+  }
+  return out;
+}
+
+export function emptyMetrics(): ProjectMetrics { return { ...EMPTY_METRICS }; }
