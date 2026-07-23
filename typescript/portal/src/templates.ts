@@ -216,6 +216,8 @@ const CSS = `
   .badge-achievement { background: #4a3c2c; color: #e8b94a; text-transform: none; letter-spacing: 0; }
 
   /* Achievements board */
+  .achv-cat { font-size: 1rem; color: #e8b94a; margin: 1.6rem 0 0.2rem; border-bottom: 1px solid #4a3c2c; padding-bottom: 0.3rem; }
+  .achv-cat-count { color: #9c8a70; font-weight: 500; font-size: 0.85rem; }
   .achv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1rem; margin-top: 1rem; }
   .achv-card { border: 1px solid #5a4a36; border-radius: 8px; padding: 1rem; background: #322619; position: relative; }
   .achv-card.earned { border-color: #e8b94a; background: #3a2f1c; }
@@ -687,27 +689,46 @@ export function badgeChip(c: BadgeChip): string {
   return `<span class="badge badge-achievement" title="${escapeHtml(c.name)}">${c.emoji} ${escapeHtml(c.name)}</span>`;
 }
 
+function achievementCard(b: Badge): string {
+  const pct = Math.max(0, Math.min(100, Math.round((b.have / b.need) * 100)));
+  const progress = b.earned
+    ? (b.since ? `Earned ${escapeHtml(b.since.slice(0, 10))}` : 'Earned')
+    : `${b.have} / ${b.need}`;
+  const bar = b.earned ? '' : `<div class="achv-bar"><span style="width:${pct}%"></span></div>`;
+  return `
+    <div class="achv-card ${b.earned ? 'earned' : 'locked'}">
+      ${b.earned ? '<span class="achv-check">✓</span>' : ''}
+      <div class="achv-emoji">${b.emoji}</div>
+      <p class="achv-name">${escapeHtml(b.name)}</p>
+      <p class="achv-rule">${escapeHtml(b.rule)}</p>
+      <div class="achv-meta">${progress}</div>
+      ${bar}
+    </div>`;
+}
+
 function achievementsBoard(badges: Badge[]): string {
   const earned = badges.filter((b) => b.earned).length;
-  const cards = badges.map((b) => {
-    const pct = Math.max(0, Math.min(100, Math.round((b.have / b.need) * 100)));
-    const progress = b.earned
-      ? (b.since ? `Earned ${escapeHtml(b.since.slice(0, 10))}` : 'Earned')
-      : `${b.have} / ${b.need}`;
-    const bar = b.earned ? '' : `<div class="achv-bar"><span style="width:${pct}%"></span></div>`;
-    return `
-      <div class="achv-card ${b.earned ? 'earned' : 'locked'}">
-        ${b.earned ? '<span class="achv-check">✓</span>' : ''}
-        <div class="achv-emoji">${b.emoji}</div>
-        <p class="achv-name">${escapeHtml(b.name)}</p>
-        <p class="achv-rule">${escapeHtml(b.rule)}</p>
-        <div class="achv-meta">${progress}</div>
-        ${bar}
-      </div>`;
-  }).join('');
+  // badges arrive in catalog order (already grouped by category); emit a
+  // section heading whenever the category changes.
+  const sections: string[] = [];
+  let current = '';
+  let open = false;
+  for (const b of badges) {
+    if (b.category !== current) {
+      if (open) sections.push('</div>');
+      const done = badges.filter((x) => x.category === b.category && x.earned).length;
+      const total = badges.filter((x) => x.category === b.category).length;
+      sections.push(`<h2 class="achv-cat">${escapeHtml(b.category)} <span class="achv-cat-count">${done}/${total}</span></h2>`);
+      sections.push('<div class="achv-grid">');
+      current = b.category;
+      open = true;
+    }
+    sections.push(achievementCard(b));
+  }
+  if (open) sections.push('</div>');
   return `
     <p class="tagline">${earned} of ${badges.length} badges earned — keep planting and being a good neighbor.</p>
-    <div class="achv-grid">${cards}</div>`;
+    ${sections.join('\n')}`;
 }
 
 export function renderAchievements(

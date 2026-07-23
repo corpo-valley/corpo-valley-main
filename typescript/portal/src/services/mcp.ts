@@ -304,6 +304,9 @@ const tools: Record<string, ToolDef> = {
       if (visibility === 'internal') {
         syncRepoAccess(project).catch(() => {});
       }
+      for (const cap of ['database', 'storage', 'mcp'] as const) {
+        if ((caps as any)[cap]) void recordActivity(ctx.userId, 'capability_enabled', project.id, ctx.userId, { cap });
+      }
       const base = toToolProject(project, everyone);
       return {
         ...base,
@@ -361,6 +364,7 @@ const tools: Record<string, ToolDef> = {
       if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
       const { next, postgresEnabledNow } = await applyCapabilities(p, { database: true });
+      if (postgresEnabledNow) void recordActivity(ctx.userId, 'capability_enabled', p.id, ctx.userId, { cap: 'database' });
       return {
         ok: true,
         slug: p.slug,
@@ -424,6 +428,7 @@ const tools: Record<string, ToolDef> = {
       if (!p) throw new ToolError('project not found, or you lack the write access required.');
       if (!p.gitea_repo) throw new ToolError('project has no Gitea repo yet.');
       const { next, storageEnabledNow } = await applyCapabilities(p, { storage: true });
+      if (storageEnabledNow) void recordActivity(ctx.userId, 'capability_enabled', p.id, ctx.userId, { cap: 'storage' });
       return {
         ok: true,
         slug: p.slug,
@@ -789,6 +794,7 @@ const tools: Record<string, ToolDef> = {
         title: typeof args.title === 'string' ? args.title : undefined,
         message: typeof args.message === 'string' ? args.message : undefined,
       });
+      void recordActivity(ctx.userId, 'pr_merged', p.id, p.owner_id);
       return { project: p.slug, merged: true, number: Number(args.number) };
     },
   },

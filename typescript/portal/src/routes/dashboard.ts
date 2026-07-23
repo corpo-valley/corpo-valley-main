@@ -67,6 +67,7 @@ import {
 } from '../templates';
 import {
   computeBadges, reconcileAwards, takePendingToasts, earnedBadgeKeys, BADGE_META,
+  recordActivity,
 } from '../services/achievements';
 import * as crypto from 'crypto';
 
@@ -566,6 +567,7 @@ router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, asy
       tokenName,
       scopes: ['write:repository'],
     });
+    void recordActivity(session.id, 'cli_token', project.id, session.id);
     const isAdmin = await isUserAdmin(session.id).catch(() => false);
     res.send(renderGiteaCliTokenReveal(
       session.email, isAdmin, toProjectRow(project), username, token, tokenName
@@ -645,6 +647,7 @@ router.post('/projects/:id/secrets', requireSession, requireVerifiedEmail, async
         : `Corpo Valley: add sealed secret ${rawName}`,
       sha: existingFile?.sha,
     });
+    void recordActivity(session.id, 'secret_added', project.id, session.id);
 
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
@@ -719,6 +722,7 @@ router.post('/projects/:id/postgres/enable', requireSession, requireVerifiedEmai
       ? { password: existingPw }
       : await claimOrGetPostgresPassword(project.id, generatePostgresPassword());
     await enableProjectPostgres({ owner, repo, slug: project.slug, password });
+    void recordActivity(session.id, 'capability_enabled', project.id, session.id, { cap: 'database' });
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
     console.error('Postgres enable error:', err?.message);
@@ -790,6 +794,7 @@ router.post('/projects/:id/storage/enable', requireSession, requireVerifiedEmail
       ? { creds: existing }
       : await claimOrGetGarageCredentials(project.id, generateGarageCredentials());
     await enableProjectGarage({ owner, repo, slug: project.slug, creds });
+    void recordActivity(session.id, 'capability_enabled', project.id, session.id, { cap: 'storage' });
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
     console.error('Storage enable error:', err?.message);
@@ -1078,6 +1083,7 @@ router.post('/keys', requireSession, requireVerifiedEmail, async (req: Request, 
   try {
     const isAdmin = await isUserAdmin(session.id);
     const { clientId, clientSecret } = await createApiKey(session.id);
+    void recordActivity(session.id, 'key_connected', null, session.id);
     res.send(renderNewKeyDisplay(clientId, clientSecret, session.email, isAdmin, hydraPublicUrl));
   } catch (err: any) {
     console.error('Key create error:', err.message);

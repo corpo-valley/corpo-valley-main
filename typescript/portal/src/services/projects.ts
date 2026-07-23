@@ -233,7 +233,10 @@ export async function migrate(): Promise<void> {
     CREATE TABLE IF NOT EXISTS cv_activity_events (
       id uuid primary key default gen_random_uuid(),
       actor_id text not null,
-      kind text not null check (kind in ('pr_authored', 'project_interaction')),
+      kind text not null check (kind in (
+        'pr_authored', 'project_interaction', 'pr_merged', 'build_shipped',
+        'capability_enabled', 'secret_added', 'key_connected', 'cli_token'
+      )),
       project_id uuid references projects(id) on delete set null,
       target_owner_id text not null,
       created_at timestamptz not null default now(),
@@ -242,6 +245,13 @@ export async function migrate(): Promise<void> {
   `);
   await pool.query('CREATE INDEX IF NOT EXISTS cv_activity_actor_kind_idx ON cv_activity_events (actor_id, kind);');
   await pool.query('CREATE INDEX IF NOT EXISTS cv_activity_actor_proj_idx ON cv_activity_events (actor_id, project_id);');
+  // Existing DBs created cv_activity_events with the original 2-kind CHECK —
+  // widen it to admit the fuller activity vocabulary (no-op once present).
+  await pool.query('ALTER TABLE cv_activity_events DROP CONSTRAINT IF EXISTS cv_activity_events_kind_check;');
+  await pool.query(`ALTER TABLE cv_activity_events ADD CONSTRAINT cv_activity_events_kind_check CHECK (kind in (
+      'pr_authored', 'project_interaction', 'pr_merged', 'build_shipped',
+      'capability_enabled', 'secret_added', 'key_connected', 'cli_token'
+    ));`);
   // Award cache: the first moment a user crosses a badge threshold. Drives the
   // one-time "you earned a badge" toast (notified_at is stamped when shown).
   // Reading these is how other people's earned badges are surfaced cheaply

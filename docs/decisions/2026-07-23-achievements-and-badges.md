@@ -76,25 +76,47 @@ render).
 
 ---
 
-## Achievement catalog (v1)
+## Achievement catalog (v1 — 54 badges, 9 categories)
 
 All rules are gated on `created_at >= ACHIEVEMENTS_EPOCH` per D3. "You" = the
-Kratos identity id (`req.portalSession.id` / MCP `ctx.userId`).
+Kratos identity id (`req.portalSession.id` / MCP `ctx.userId`). The board renders
+as category sections; each badge shows emoji, name, rule, **earned/locked**
+state, **progress** (e.g. "3 / 5"), and an "earned <date>" when awarded. The
+source of truth is the `CATALOG` array in `services/achievements.ts`.
 
-| Badge | Emoji | Rule | Data source |
-|---|---|---|---|
-| First Post | 🌱 | Own ≥1 project | `projects` (owner_id, created_at) |
-| Serial Founder | 🏗️ | Own ≥5 projects | `projects` count |
-| Shipped It | 🚀 | ≥1 owned project reaches `status='ready'` | `projects.status` |
-| Good Neighbor | 🤝 | Share an owned project with a user/group/everyone | `project_grants` |
-| Team Builder | 👥 | Create a group and add ≥1 other member | `groups` + `group_members` |
-| Contributor | 🔧 | Open ≥1 PR against a repo you don't own | `cv_activity_events` kind=`pr_authored` |
-| Prolific Contributor | 🛠️ | Open PRs to ≥5 repos you don't own | `cv_activity_events` distinct project_id |
-| Neighborhood Watch | 👀 | Interact with ≥5 different non-owned projects | `cv_activity_events` kind=`project_interaction` |
-| Town Reporter | 📰 | Interact ≥3× with each of ≥20 non-owned projects | `cv_activity_events` grouped |
+**Founding** (`projects`): First Post 🌱 (1) · Homesteader 🏠 (3) · Serial Founder
+🏗️ (5) · Land Baron 🏰 (10) · Valley Tycoon 👑 (25) projects owned.
 
-Each badge renders with: emoji, name, one-line rule, **earned/locked** state,
-**progress** (e.g. "3 / 5 projects"), and an "earned <date>" when awarded.
+**Shipping** (`projects.status='ready'` + `build_shipped`): Shipped It 🚀 (1) ·
+Launch Party 🎉 (3) · Fleet Commander 🛰️ (10) deployed · First Build 🔨 (1) · Ship
+Shape 📦 (10) · Build Baron 🏭 (50) builds shipped.
+
+**Contributions** (`pr_authored`, `pr_merged`): Contributor 🔧 (1 PR to a repo you
+don't own) · Prolific Contributor 🛠️ (5 repos) · Open Source Hero 🦸 (15 repos) ·
+Merge Master 🔀 (1) · Merge Machine ⚙️ (10) · Peer Reviewer 👓 (merge a non-owned PR).
+
+**Exploration** (`project_interaction`): Neighborly 👋 (1) · Neighborhood Watch 👀
+(5) · Explorer 🧭 (10) · Cartographer 🗺️ (25) distinct non-owned projects · Town
+Reporter 📰 (3×20) · Town Crier 📣 (3×40) · Busybody 🐝 (100 total).
+
+**Neighbors** (`project_grants`): Good Neighbor 🤝 (share 1) · Open Door 🚪 (share
+to everyone) · Philanthropist 🎁 (share 5).
+
+**Teams** (`groups`/`group_members`): Team Builder 👥 (group + 1 member) · Guild
+Leader 🛡️ (5) · Kingmaker 🤴 (10) · Joiner 🧩 (join a group) · Social Butterfly 🦋 (3 groups).
+
+**Capabilities** (`capability_enabled` meta.cap): Data Wrangler 🗄️ (database) · Pack
+Rat 📦 (storage) · Tool Maker 🔌 (MCP) · Full Stack 🍔 (DB+storage on one) · Triple Threat 🎯 (all three).
+
+**Craft** (`secret_added`, `key_connected`, `cli_token`): Secret Keeper 🔐 (1) ·
+Locksmith 🗝️ (3 projects) · Connected 🔗 (1 key) · Power User ⚡ (3 keys) · CLI Cowboy 🤠 (mint a CLI token).
+
+**Milestones** (welcome/time/meta from event timestamps): Welcome to the Valley 🌄
+· Night Owl 🦉 · Early Bird 🐦 · Lunch Break Hacker 🥪 · Weekend Warrior 🏕️ · Streak
+Starter 🔥 (3 days) · On Fire 🌶️ (7) · Dedicated 📅 (30) · Veteran 🎖️ (6mo) ·
+Anniversary 🎂 (1yr) · Completionist 🏆 (25 badges) · Overachiever 🌟 (40 badges).
+
+> Time-of-day badges bucket on the event's UTC hour (container TZ).
 
 **Identity rule (critical):** the actor for `pr_authored` is captured as the
 Kratos id at the MCP handler (`ctx.userId`). The Gitea PR author is `cvportal`
@@ -113,7 +135,9 @@ never the Gitea username (different identity namespace).
 CREATE TABLE IF NOT EXISTS cv_activity_events (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   actor_id       text NOT NULL,                 -- Kratos identity id
-  kind           text NOT NULL CHECK (kind IN ('pr_authored','project_interaction')),
+  kind           text NOT NULL CHECK (kind IN ('pr_authored','project_interaction',
+                   'pr_merged','build_shipped','capability_enabled','secret_added',
+                   'key_connected','cli_token')),
   project_id     uuid REFERENCES projects(id) ON DELETE SET NULL,
   target_owner_id text NOT NULL,                -- project owner at event time
   created_at     timestamptz NOT NULL DEFAULT now(),
