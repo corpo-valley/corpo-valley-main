@@ -281,3 +281,23 @@ Gitea repo mtime). The activity ledger doubles as per-project analytics:
   pin are three hand-maintained values with no machine source of truth — bump
   all three; the PR covers package.json, the release + pin are steps 3–4.
 ```
+
+## Security hardening (post-review)
+
+Applied after a security review of the branch:
+
+- **Public-profile endpoint** (`/achievements/u/:username`): added a per-IP
+  `profileLimiter` (60/min), a short-TTL username→identity cache (so it no
+  longer scans the full Kratos identity list per hit), and **removed the
+  write-on-read** `reconcileAwards(target)` — profiles are now purely
+  read-only (badges derive live; the target's own page loads keep their grant
+  cache current). Closes the amplification + cross-user-write finding.
+- **Reconcile throttle**: `/` and `/achievements` call `maybeReconcile()`
+  (once per `CV_RECONCILE_COOLDOWN_MS`/user, default 5 min) instead of an eager
+  reconcile every load — the cheap pending-toast read still runs every load, so
+  awards/toasts surface within the window. (`/` never needed an eager reconcile.)
+- **Retention**: `pruneActivity()` deletes `project_view` rows older than
+  `CV_VIEW_RETENTION_DAYS` (default 180), scheduled daily in `index.ts`
+  (`CV_PRUNE_INTERVAL_MS`). `project_view` feeds only popularity counters, never
+  achievements, so pruning is badge-safe; it bounds the who-viewed-what tracking
+  window and table growth.

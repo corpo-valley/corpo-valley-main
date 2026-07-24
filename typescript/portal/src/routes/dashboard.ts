@@ -66,9 +66,10 @@ import {
   COMMUNITY_DIRS, CommunityDir, COMMUNITY_DEFAULT_DIR,
 } from '../templates';
 import {
-  computeBadges, reconcileAwards, takePendingToasts, earnedBadgeKeys, BADGE_META,
+  computeBadges, maybeReconcile, takePendingToasts, earnedBadgeKeys, BADGE_META,
   recordActivity, projectMetrics, emptyMetrics,
 } from '../services/achievements';
+import { profileLimiter } from '../middleware/rateLimit';
 import * as crypto from 'crypto';
 
 const router = Router();
@@ -158,9 +159,9 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
     const projects = await listProjectsByOwner(session.id);
     const shared = await listProjectsSharedWith(session.id).catch(() => []);
     const everyone = await getEveryoneGrants(projects.map((p) => p.id)).catch(() => new Map());
-    // Award any newly-crossed badge thresholds and surface a one-time toast for
-    // them on the way in. Best-effort — never blocks the projects list.
-    await reconcileAwards(session.id);
+    // Award any newly-crossed badge thresholds (throttled per user) and surface
+    // a one-time toast. Best-effort — never blocks the projects list.
+    await maybeReconcile(session.id);
     const newBadges: BadgeChip[] = await takePendingToasts(session.id);
     res.send(renderProjects(
       session.email,
@@ -185,7 +186,7 @@ router.get('/achievements', requireSession, async (req: Request, res: Response) 
   const session = req.portalSession!;
   try {
     const isAdmin = await isUserAdmin(session.id);
-    await reconcileAwards(session.id);
+    await maybeReconcile(session.id);
     const [badges, newBadges] = await Promise.all([
       computeBadges(session.id),
       takePendingToasts(session.id),
@@ -197,30 +198,49 @@ router.get('/achievements', requireSession, async (req: Request, res: Response) 
   }
 });
 
+// Short-TTL cache for username → resolved identity, so viewing profiles doesn't
+// re-scan the full Kratos identity list on every hit (a member could otherwise
+// loop this to load Kratos). Negatives are cached briefly too, so bad-username
+// probing doesn't force a full scan each time.
+interface CachedIdentity { id: string; displayName: string; }
+const profileCache = new Map<string, { val: CachedIdentity | null; exp: number }>();
+const PROFILE_CACHE_TTL_MS = 60_000;
+const PROFILE_NEG_TTL_MS = 15_000;
+
+async function resolveProfileIdentity(username: string): Promise<CachedIdentity | null> {
+  const key = username.toLowerCase();
+  const hit = profileCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.val;
+  let val: CachedIdentity | null = null;
+  const identity = await findIdentityByUsername(username).catch(() => null);
+  if (identity) {
+    const traits = (identity.traits as any) ?? {};
+    // Kratos stores `name` as an object ({first,last}), not a string.
+    const nm = traits.name;
+    const fullName = typeof nm === 'string' ? nm : [nm?.first, nm?.last].filter(Boolean).join(' ');
+    val = { id: identity.id, displayName: fullName || traits.preferred_username || username };
+  }
+  if (profileCache.size > 10_000) profileCache.clear();
+  profileCache.set(key, { val, exp: Date.now() + (val ? PROFILE_CACHE_TTL_MS : PROFILE_NEG_TTL_MS) });
+  return val;
+}
+
 // GET /achievements/u/:username — a resident's public, read-only badge profile.
 // Reachable from the Community Feed creator link. Resolves the username to a
-// Kratos identity; 404s if unknown.
-router.get('/achievements/u/:username', requireSession, async (req: Request, res: Response) => {
+// Kratos identity; 404s if unknown. Rate-limited + identity-cached, and it does
+// NOT write (badges are derived read-only; the target's own page loads keep
+// their grant cache current) so a viewer can't drive writes for other users.
+router.get('/achievements/u/:username', profileLimiter, requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
     const isAdmin = await isUserAdmin(session.id);
     const username = String(req.params.username || '');
-    const identity = await findIdentityByUsername(username).catch(() => null);
+    const identity = await resolveProfileIdentity(username);
     if (!identity) {
       return res.status(404).send(renderError('Not found', 'No resident found with that username.'));
     }
-    const traits = (identity.traits as any) ?? {};
-    // Kratos stores `name` as an object ({first,last}), not a string — flatten
-    // it before it reaches escapeHtml() in the template.
-    const nm = traits.name;
-    const fullName = typeof nm === 'string'
-      ? nm
-      : [nm?.first, nm?.last].filter(Boolean).join(' ');
-    const displayName = fullName || traits.preferred_username || username;
-    // Refresh their award cache so `since` dates and feed chips stay current.
-    await reconcileAwards(identity.id);
     const badges = await computeBadges(identity.id);
-    res.send(renderPublicProfile(session.email, isAdmin, displayName, badges));
+    res.send(renderPublicProfile(session.email, isAdmin, identity.displayName, badges));
   } catch (err: any) {
     console.error('Public profile error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load profile.'));

@@ -332,6 +332,48 @@ export async function reconcileAwards(userId: string): Promise<string[]> {
   }
 }
 
+// Per-user reconcile throttle. reconcileAwards is ~10 queries + an upsert, so we
+// don't run it on every dashboard page load. maybeReconcile runs it at most once
+// per CV_RECONCILE_COOLDOWN_MS per user (in-memory, per process). The pending-
+// toast read stays on every load and is cheap, so a newly-earned badge still
+// surfaces within the cooldown window (default 5 min) without recomputing on
+// every request — this is why /  doesn't need an eager reconcile.
+const RECONCILE_COOLDOWN_MS = parseInt(process.env.CV_RECONCILE_COOLDOWN_MS || '300000', 10);
+const lastReconcile = new Map<string, number>();
+
+export async function maybeReconcile(userId: string): Promise<void> {
+  if (!userId) return;
+  const now = Date.now();
+  const prev = lastReconcile.get(userId);
+  if (prev !== undefined && now - prev < RECONCILE_COOLDOWN_MS) return;
+  if (lastReconcile.size > 50_000) lastReconcile.clear();
+  lastReconcile.set(userId, now);
+  await reconcileAwards(userId); // best-effort, never throws
+}
+
+// Retention for the high-volume, privacy-sensitive site-view tracking.
+// project_view rows record who visited which project; they feed ONLY the
+// popularity counters (never achievements), so pruning old ones is safe for
+// badges while bounding both the tracking window and table growth. Other kinds
+// are low-volume and achievement-bearing, so they are retained. Window is
+// CV_VIEW_RETENTION_DAYS (default 180); set to 0 to disable pruning.
+const VIEW_RETENTION_DAYS = parseInt(process.env.CV_VIEW_RETENTION_DAYS || '180', 10);
+
+export async function pruneActivity(): Promise<number> {
+  if (!(VIEW_RETENTION_DAYS > 0)) return 0;
+  try {
+    const res = await pool.query(
+      `DELETE FROM cv_activity_events
+        WHERE kind = 'project_view' AND created_at < now() - make_interval(days => $1)`,
+      [VIEW_RETENTION_DAYS],
+    );
+    return res.rowCount ?? 0;
+  } catch (err) {
+    console.error('[achievements] pruneActivity failed (ignored):', (err as Error).message);
+    return 0;
+  }
+}
+
 export interface ToastBadge { key: string; name: string; emoji: string; }
 
 /**
