@@ -3,6 +3,7 @@ import { getFile, upsertRepoFile, getBranchHead, getCommitStatus } from '../serv
 import { getProjectBySlug, getProjectByPinTokenHash } from '../services/projects';
 import { effectiveSitePerm } from '../services/access';
 import { hashPinToken, pinTokenHashMatches } from '../services/pin-token';
+import { recordActivity } from '../services/achievements';
 import { requireInternalSecret } from '../middleware/internalAuth';
 import { ensureProvisionedById } from '../services/provisioning';
 
@@ -305,6 +306,8 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
       message: `chore: pin image to ${tag} [skip ci]`,
     });
 
+    // A new pin = a build the project owner just shipped (Shipping badges).
+    void recordActivity(project.owner_id, 'build_shipped', project.id, project.owner_id);
     res.json({ ok: true, changed: true, tag, slug });
   } catch (err: any) {
     // Keep raw upstream (Gitea) error detail in the server log only; don't

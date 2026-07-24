@@ -61,9 +61,15 @@ import {
   renderProjectInitializing,
   renderKeyManagement, renderNewKeyDisplay, renderError,
   renderGiteaCliTokenReveal, renderCommunityFeed,
+  renderAchievements, renderPublicProfile, BadgeChip,
   ProjectRow, ApiKeyRow, CommunityRow, COMMUNITY_SORTS, CommunitySort,
   COMMUNITY_DIRS, CommunityDir, COMMUNITY_DEFAULT_DIR,
 } from '../templates';
+import {
+  computeBadges, maybeReconcile, takePendingToasts, earnedBadgeKeys, BADGE_META,
+  recordActivity, projectMetrics, emptyMetrics,
+} from '../services/achievements';
+import { profileLimiter } from '../middleware/rateLimit';
 import * as crypto from 'crypto';
 
 const router = Router();
@@ -153,6 +159,10 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
     const projects = await listProjectsByOwner(session.id);
     const shared = await listProjectsSharedWith(session.id).catch(() => []);
     const everyone = await getEveryoneGrants(projects.map((p) => p.id)).catch(() => new Map());
+    // Award any newly-crossed badge thresholds (throttled per user) and surface
+    // a one-time toast. Best-effort — never blocks the projects list.
+    await maybeReconcile(session.id);
+    const newBadges: BadgeChip[] = await takePendingToasts(session.id);
     res.send(renderProjects(
       session.email,
       projects.map((p) => {
@@ -161,10 +171,79 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
       }),
       isAdmin,
       shared.map((p) => ({ ...toProjectRow(p), sitePerm: p.site_perm, repoPerm: p.repo_perm })),
+      newBadges,
     ));
   } catch (err: any) {
     console.error('Projects list error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load projects.'));
+  }
+});
+
+// GET /achievements — the signed-in resident's own badge board. Awards any
+// newly-crossed thresholds, then renders the full catalog (earned + locked with
+// progress). GET-only: no CSRF prefix, no verified-email gate to view.
+router.get('/achievements', requireSession, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const isAdmin = await isUserAdmin(session.id);
+    await maybeReconcile(session.id);
+    const [badges, newBadges] = await Promise.all([
+      computeBadges(session.id),
+      takePendingToasts(session.id),
+    ]);
+    res.send(renderAchievements(session.email, badges, isAdmin, newBadges));
+  } catch (err: any) {
+    console.error('Achievements error:', err.message);
+    res.status(500).send(renderError('Error', 'Failed to load achievements.'));
+  }
+});
+
+// Short-TTL cache for username → resolved identity, so viewing profiles doesn't
+// re-scan the full Kratos identity list on every hit (a member could otherwise
+// loop this to load Kratos). Negatives are cached briefly too, so bad-username
+// probing doesn't force a full scan each time.
+interface CachedIdentity { id: string; displayName: string; }
+const profileCache = new Map<string, { val: CachedIdentity | null; exp: number }>();
+const PROFILE_CACHE_TTL_MS = 60_000;
+const PROFILE_NEG_TTL_MS = 15_000;
+
+async function resolveProfileIdentity(username: string): Promise<CachedIdentity | null> {
+  const key = username.toLowerCase();
+  const hit = profileCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.val;
+  let val: CachedIdentity | null = null;
+  const identity = await findIdentityByUsername(username).catch(() => null);
+  if (identity) {
+    const traits = (identity.traits as any) ?? {};
+    // Kratos stores `name` as an object ({first,last}), not a string.
+    const nm = traits.name;
+    const fullName = typeof nm === 'string' ? nm : [nm?.first, nm?.last].filter(Boolean).join(' ');
+    val = { id: identity.id, displayName: fullName || traits.preferred_username || username };
+  }
+  if (profileCache.size > 10_000) profileCache.clear();
+  profileCache.set(key, { val, exp: Date.now() + (val ? PROFILE_CACHE_TTL_MS : PROFILE_NEG_TTL_MS) });
+  return val;
+}
+
+// GET /achievements/u/:username — a resident's public, read-only badge profile.
+// Reachable from the Community Feed creator link. Resolves the username to a
+// Kratos identity; 404s if unknown. Rate-limited + identity-cached, and it does
+// NOT write (badges are derived read-only; the target's own page loads keep
+// their grant cache current) so a viewer can't drive writes for other users.
+router.get('/achievements/u/:username', profileLimiter, requireSession, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const isAdmin = await isUserAdmin(session.id);
+    const username = String(req.params.username || '');
+    const identity = await resolveProfileIdentity(username);
+    if (!identity) {
+      return res.status(404).send(renderError('Not found', 'No resident found with that username.'));
+    }
+    const badges = await computeBadges(identity.id);
+    res.send(renderPublicProfile(session.email, isAdmin, identity.displayName, badges));
+  } catch (err: any) {
+    console.error('Public profile error:', err.message);
+    res.status(500).send(renderError('Error', 'Failed to load profile.'));
   }
 });
 
@@ -195,23 +274,43 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       getRepoUpdatedAtMap().catch(() => new Map<string, string>()),
     ]);
     const emailById = new Map<string, string>();
+    const usernameById = new Map<string, string>();
     for (const i of identities) {
-      const e = (i.traits as any)?.email;
-      if (typeof e === 'string' && e) emailById.set(i.id, e);
+      const t = (i.traits as any) ?? {};
+      if (typeof t.email === 'string' && t.email) emailById.set(i.id, t.email);
+      if (typeof t.preferred_username === 'string' && t.preferred_username) usernameById.set(i.id, t.preferred_username);
     }
+    // Per-project engagement metrics (popularity/activity) — one grouped query.
+    const metricsById = await projectMetrics(projects.map((p) => p.id));
+    // Earned badges for every creator shown — one cached lookup, no recompute.
+    const badgesByOwner = await earnedBadgeKeys(projects.map((p) => p.owner_id));
+    const chipsFor = (ownerId: string): BadgeChip[] =>
+      (badgesByOwner.get(ownerId) ?? [])
+        .filter((k) => BADGE_META[k])
+        .map((k) => ({ key: k, name: BADGE_META[k].name, emoji: BADGE_META[k].emoji }));
 
-    // Enrich each project. "Last updated" is the repo's Gitea updated_at; fall
-    // back to created_at for projects with no repo yet (or any the search
-    // omitted) so the column is never blank.
+    // Enrich each project. "Last active" is the most recent of the last build
+    // shipped (reliable, from our ledger) and the Gitea repo updated_at (flaky);
+    // fall back to created_at so the column is never blank.
     const enriched = projects.map((p) => {
-      const updatedIso = (p.gitea_repo && repoUpdated.get(p.gitea_repo)) || p.created_at;
+      const m = metricsById.get(p.id) ?? emptyMetrics();
+      const repoIso = (p.gitea_repo && repoUpdated.get(p.gitea_repo)) || null;
+      const candidates = [m.lastBuild, repoIso].filter(Boolean) as string[];
+      const updatedIso = candidates.length
+        ? candidates.reduce((a, b) => (new Date(a) > new Date(b) ? a : b))
+        : p.created_at;
       return {
         name: p.name,
         slug: p.slug,
+        ownerId: p.owner_id,
         creator: emailById.get(p.owner_id) || '—',
         sitePerm: p.everyone_site_perm,
         createdIso: p.created_at,
         updatedIso,
+        visitors: m.visitors,
+        builds: m.builds,
+        contributors: m.contributors,
+        views7d: m.views7d,
       };
     });
 
@@ -226,6 +325,8 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
     const cmp = (a: typeof enriched[number], b: typeof enriched[number]) => {
       if (sort === 'creator') return a.creator.localeCompare(b.creator, undefined, { sensitivity: 'base' });
       if (sort === 'updated') return ms(a.updatedIso) - ms(b.updatedIso);
+      if (sort === 'popular') return a.visitors - b.visitors;
+      if (sort === 'trending') return a.views7d - b.views7d;
       return ms(a.createdIso) - ms(b.createdIso);
     };
     enriched.sort((a, b) => (dir === 'asc' ? cmp(a, b) : -cmp(a, b)));
@@ -262,6 +363,12 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       updatedAt: fmt(e.updatedIso),
       createdRel: rel(e.createdIso),
       updatedRel: rel(e.updatedIso),
+      creatorUsername: usernameById.get(e.ownerId),
+      creatorBadges: chipsFor(e.ownerId),
+      visitors: e.visitors,
+      builds: e.builds,
+      contributors: e.contributors,
+      trending: e.views7d > 0,
     }));
 
     res.send(renderCommunityFeed(session.email, rows, isAdmin, sort, dir));
@@ -418,6 +525,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
     const grants = await listProjectGrants(project.id).catch(() => []);
     const everyoneGrant = grants.find((g) => g.subject_type === 'everyone');
     const groups = await listGroups().catch(() => []);
+    const metrics = (await projectMetrics([project.id])).get(project.id) ?? emptyMetrics();
     res.send(renderProjectDetail(
       session.email, isAdmin,
       toProjectRow(project, {
@@ -426,6 +534,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       }),
       csrf, secrets, null,
       grants, groups.map((g) => ({ name: g.name, memberCount: g.member_count })),
+      metrics,
     ));
   } catch (err: any) {
     console.error('Project detail error:', err.message);
@@ -503,6 +612,7 @@ router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, asy
       tokenName,
       scopes: ['write:repository'],
     });
+    void recordActivity(session.id, 'cli_token', project.id, session.id);
     const isAdmin = await isUserAdmin(session.id).catch(() => false);
     res.send(renderGiteaCliTokenReveal(
       session.email, isAdmin, toProjectRow(project), username, token, tokenName
@@ -582,6 +692,7 @@ router.post('/projects/:id/secrets', requireSession, requireVerifiedEmail, async
         : `Corpo Valley: add sealed secret ${rawName}`,
       sha: existingFile?.sha,
     });
+    void recordActivity(session.id, 'secret_added', project.id, session.id);
 
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
@@ -656,6 +767,7 @@ router.post('/projects/:id/postgres/enable', requireSession, requireVerifiedEmai
       ? { password: existingPw }
       : await claimOrGetPostgresPassword(project.id, generatePostgresPassword());
     await enableProjectPostgres({ owner, repo, slug: project.slug, password });
+    void recordActivity(session.id, 'capability_enabled', project.id, session.id, { cap: 'database' });
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
     console.error('Postgres enable error:', err?.message);
@@ -727,6 +839,7 @@ router.post('/projects/:id/storage/enable', requireSession, requireVerifiedEmail
       ? { creds: existing }
       : await claimOrGetGarageCredentials(project.id, generateGarageCredentials());
     await enableProjectGarage({ owner, repo, slug: project.slug, creds });
+    void recordActivity(session.id, 'capability_enabled', project.id, session.id, { cap: 'storage' });
     res.redirect(`/projects/${project.id}`);
   } catch (err: any) {
     console.error('Storage enable error:', err?.message);
@@ -1015,6 +1128,7 @@ router.post('/keys', requireSession, requireVerifiedEmail, async (req: Request, 
   try {
     const isAdmin = await isUserAdmin(session.id);
     const { clientId, clientSecret } = await createApiKey(session.id);
+    void recordActivity(session.id, 'key_connected', null, session.id);
     res.send(renderNewKeyDisplay(clientId, clientSecret, session.email, isAdmin, hydraPublicUrl));
   } catch (err: any) {
     console.error('Key create error:', err.message);

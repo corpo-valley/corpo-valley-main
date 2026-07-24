@@ -25,6 +25,7 @@ import { Router, Request, Response } from 'express';
 import { Configuration, FrontendApi } from '@ory/client';
 import { getProjectBySlug } from '../services/projects';
 import { effectiveSitePerm } from '../services/access';
+import { recordActivity } from '../services/achievements';
 
 const router = Router();
 
@@ -58,6 +59,20 @@ function cacheSet<T>(map: Map<string, CacheEntry<T>>, key: string, val: T, ttl: 
   // Bounded: a flush is fine, entries are cheap to refill.
   if (map.size > 5000) map.clear();
   map.set(key, { val, exp: Date.now() + ttl });
+}
+
+// In-memory throttle for the site-view counter: at most one recordActivity
+// attempt per (viewer, slug) per UTC day per process. The DB day-cap (see
+// recordActivity) is the durable backstop; this just keeps us from touching the
+// DB on the hot path more than once a day per viewer/project.
+const viewedToday = new Set<string>();
+
+function markViewed(userId: string, slug: string): boolean {
+  const key = `${userId}:${slug}:${Math.floor(Date.now() / 86_400_000)}`;
+  if (viewedToday.has(key)) return false;
+  if (viewedToday.size > 50_000) viewedToday.clear();
+  viewedToday.add(key);
+  return true;
 }
 
 function sessionToken(cookieHeader: string): string | null {
@@ -109,6 +124,13 @@ router.get('/access/site/:slug', async (req: Request, res: Response) => {
       const project = await getProjectBySlug(slug);
       perm = project ? await effectiveSitePerm(project, user.id) : 'none';
       cacheSet(permCache, permKey, perm, PERM_TTL_MS);
+      // Popularity: count a site view when a non-owner is admitted. Fire-and-
+      // forget + in-memory day-throttle + DB day-cap, so it never blocks or
+      // materially loads this ingress auth hot path. Only runs on perm-cache
+      // misses (~once per 5s per viewer/slug), never on the memoized fast path.
+      if (project && perm !== 'none' && project.owner_id !== user.id && markViewed(user.id, slug)) {
+        void recordActivity(user.id, 'project_view', project.id, project.owner_id);
+      }
     }
     if (perm === 'none') {
       res.status(403).end();

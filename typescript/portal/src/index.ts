@@ -12,6 +12,7 @@ import siteAccessRouter from './routes/site-access';
 import groupsRouter from './routes/groups';
 import { validateCsrf } from './middleware/csrf';
 import { authLimiter, dcrLimiter, wellKnownLimiter } from './middleware/rateLimit';
+import { pruneActivity } from './services/achievements';
 import { migrate } from './services/projects';
 import { reconcileAllProjects } from './services/repo-access';
 import { backfillPinTokens } from './services/pin-token-backfill';
@@ -235,6 +236,21 @@ async function start() {
     }, reconcileMs);
     timer.unref();
     console.log(`Repo-access reconcile sweep every ${Math.round(reconcileMs / 1000)}s`);
+  }
+
+  // Periodic retention prune for the site-view tracking ledger (privacy + table
+  // growth): drops project_view rows older than CV_VIEW_RETENTION_DAYS. Runs a
+  // minute after boot and then on CV_PRUNE_INTERVAL_MS (default 24h; 0 disables).
+  // Best-effort; unref() so it never holds the process open.
+  const pruneMs = parseInt(process.env.CV_PRUNE_INTERVAL_MS || '86400000', 10);
+  if (pruneMs > 0) {
+    const runPrune = () => pruneActivity()
+      .then((n) => { if (n > 0) console.log(`[achievements] pruned ${n} old project_view row(s)`); })
+      .catch((err: any) => console.error('[achievements] prune failed:', err?.message));
+    setTimeout(runPrune, 60_000).unref();
+    const pruneTimer = setInterval(runPrune, pruneMs);
+    pruneTimer.unref();
+    console.log(`Activity retention prune every ${Math.round(pruneMs / 1000)}s`);
   }
 
   app.listen(port, '0.0.0.0', () => {

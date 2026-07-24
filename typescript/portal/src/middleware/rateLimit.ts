@@ -48,6 +48,16 @@ export const dcrLimiter = rateLimit({
   limit: 20, // 20 requests / 10 min / IP
 });
 
+// Public badge-profile lookups (/achievements/u/:username). Authenticated, but
+// each hit does a Kratos identity scan + badge derivation, so any member could
+// loop it to load Kratos/Postgres. Cap it per IP; a human browsing profiles
+// stays well under, a scraper does not.
+export const profileLimiter = rateLimit({
+  ...common,
+  windowMs: 60 * 1000, // 1 minute
+  limit: 60, // 60 profile views / min / IP
+});
+
 // OAuth/OIDC discovery documents (/.well-known/*). Lenient but present:
 // clients fetch these on every connect, so the ceiling is high — it only
 // exists to stop the discovery docs being used as a free amplification /
