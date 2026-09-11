@@ -312,6 +312,8 @@ router.get('/apps', async (req: Request, res: Response) => {
         clientId: c.client_id || '',
         clientName: c.client_name || c.client_id || '',
         adminOnly: adminOnlyServices.has(c.client_id || ''),
+        redirectUris: c.redirect_uris || [],
+        createdAt: c.created_at || '',
       }));
 
     apps.sort((a, b) => a.clientId.localeCompare(b.clientId));
