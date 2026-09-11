@@ -3,8 +3,10 @@
 //
 // Lifecycle model: the baseline in code is the FACTORY DEFAULT. The portal
 // pushes it to Gitea exactly once — on startup, only when the Gitea repo is
-// missing, empty, or lacks the SEED_SENTINEL marking a completed seed (an
-// interrupted seed is resumed). Once seeded, Gitea is the source of truth:
+// missing, empty, or lacks the SEED_SENTINEL marking a completed seed. A repo
+// with files but no sentinel (interrupted seed, or seeded before the sentinel
+// existed) is ADOPTED: only missing baseline files are written, existing
+// content is never touched. Once seeded, Gitea is the source of truth:
 // platform admins edit the template there, and every new project generates from
 // whatever it currently holds. The baseline is pushed again only on an
 // explicit reset (POST /admin/template/reset), which makes the Gitea repo
@@ -208,8 +210,15 @@ export async function seedCommunityCenterTemplate(
   if (!created && seeded && !opts.force) {
     return { action: 'skipped', reason: 'template repo already seeded (admin-owned)' };
   }
-  if (!created && !seeded && existing.some((e) => e.path !== 'README.md')) {
-    console.warn(`[template-seed] ${owner}/${repoName} has files but no ${SEED_SENTINEL} — resuming an interrupted seed`);
+  // Files but no sentinel: either an interrupted seed, or a repo seeded before
+  // the sentinel existed (every pre-upgrade deployment). We can't tell which,
+  // and the latter may hold admin edits — so ADOPT rather than reset: write
+  // only missing baseline files, never overwrite or delete what's there, then
+  // mark it seeded. A force reset keeps full overwrite+sweep semantics.
+  const adopt = !created && !seeded && !opts.force
+    && existing.some((e) => e.path !== 'README.md');
+  if (adopt) {
+    console.warn(`[template-seed] ${owner}/${repoName} has files but no ${SEED_SENTINEL} — adopting: writing missing baseline files only, existing content untouched`);
   }
 
   // The generate endpoint refuses non-template sources; make sure the flag is
@@ -226,6 +235,7 @@ export async function seedCommunityCenterTemplate(
   for (const [relPath, content] of baseline) {
     const prevSha = existingByPath.get(relPath);
     if (prevSha && prevSha === gitBlobSha(content)) continue;
+    if (adopt && prevSha) continue; // adopting — never clobber existing content
     await upsertRepoFile({
       owner, repo: repoName, path: relPath, content,
       sha: prevSha,
@@ -234,6 +244,7 @@ export async function seedCommunityCenterTemplate(
     written++;
   }
   for (const e of existing) {
+    if (adopt) break; // adopting — extra files are (potential) admin content
     if (baseline.has(e.path)) continue;
     // Never sweep the sentinel — it's platform metadata, not baseline content,
     // and it's (re)written below as the seed's final commit.
@@ -252,8 +263,9 @@ export async function seedCommunityCenterTemplate(
     owner, repo: repoName, path: SEED_SENTINEL,
     content:
       `Written by the Corpo Valley portal as the FINAL step of a template ${opts.force ? 'reset' : 'seed'}.\n`
-      + `Its presence marks the seed complete — don't delete it, or the next portal\n`
-      + `startup will re-push the baseline over any admin edits.\n`
+      + `Its presence marks the seed complete (repo is admin-owned). If deleted, the\n`
+      + `next portal startup re-adds any missing baseline files (existing files are\n`
+      + `left alone) and rewrites this marker.\n`
       + `completed_at: ${new Date().toISOString()}\n`,
     sha: existingByPath.get(SEED_SENTINEL),
     message: `platform: mark template ${opts.force ? 'reset' : 'seed'} complete`,
