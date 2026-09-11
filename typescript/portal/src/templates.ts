@@ -798,7 +798,7 @@ function dashboardLayout(
     adminNav = `
       <div class="nav-section">Admin</div>
       <a href="/admin/users"${activeNav === 'users' ? ' class="active"' : ''}>Users</a>
-      <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>Services</a>
+      <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>SSO Apps</a>
       <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
       <a href="/admin/projects/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Project Resources</a>
       ${COOLDEPS_ENABLED ? `<a href="/admin/cooldeps"${activeNav === 'cooldeps' ? ' class="active"' : ''}>cooldeps</a>` : ''}
@@ -2583,6 +2583,8 @@ export interface AppRow {
   clientId: string;
   clientName: string;
   adminOnly: boolean;
+  redirectUris: string[];
+  createdAt: string;
 }
 
 export function renderAdminApps(
@@ -2590,15 +2592,37 @@ export function renderAdminApps(
   email: string,
   csrf: string = ''
 ): string {
-  let body = `<p style="margin-bottom:1rem;"><a href="/admin/apps/register" class="btn btn-primary">Register New Service</a></p>`;
+  let body = `
+    <p style="color:#c4b698;margin-bottom:0.75rem;">
+      SSO apps are external tools (dashboards, chat apps, anything OAuth2/OIDC-capable)
+      that let residents sign in with their Corpo Valley account. Registering one issues
+      a client ID + secret to paste into that tool's OIDC settings.
+    </p>
+    <p style="color:#c4b698;margin-bottom:1rem;">
+      <strong>Access</strong> is enforced at sign-in: <em>All users</em> lets any
+      signed-in resident into the app; <em>Admins only</em> refuses everyone else
+      before a token is ever issued. Built-in platform clients (ArgoCD, Gitea) and
+      residents' personal API keys are managed elsewhere and not listed here.
+    </p>
+    <p style="margin-bottom:1rem;"><a href="/admin/apps/register" class="btn btn-primary">Register SSO App</a></p>`;
 
-  body += `<div class="table-wrap"><table class="table">
-    <thead><tr><th>Client ID</th><th>Name</th><th>Access</th><th>Actions</th></tr></thead>
+  if (apps.length === 0) {
+    body += `<div class="message info">No SSO apps registered yet. Register one to let an external tool use Corpo Valley sign-in.</div>`;
+  } else {
+    body += `<div class="table-wrap"><table class="table">
+    <thead><tr><th>App</th><th>Sign-in redirect</th><th>Registered</th><th>Who can sign in</th><th>Actions</th></tr></thead>
     <tbody>`;
-  for (const app of apps) {
-    body += `<tr>
-      <td><code>${escapeHtml(app.clientId)}</code></td>
-      <td>${escapeHtml(app.clientName)}</td>
+    for (const app of apps) {
+      // Redirect URIs identify what/where the app actually is — the most useful
+      // clue on this page. Show them in full; they're admin-entered, not secret.
+      const redirects = app.redirectUris.length
+        ? app.redirectUris.map((u) => `<code>${escapeHtml(u)}</code>`).join('<br>')
+        : '<span style="color:#c4b698;">—</span>';
+      const registered = app.createdAt ? new Date(app.createdAt).toLocaleDateString() : '—';
+      body += `<tr>
+      <td>${escapeHtml(app.clientName)}<br><code style="font-size:0.75rem;color:#c4b698;">${escapeHtml(app.clientId)}</code></td>
+      <td>${redirects}</td>
+      <td>${escapeHtml(registered)}</td>
       <td>
         <form method="POST" action="/admin/apps/${escapeHtml(app.clientId)}/access" class="inline-form">
           ${csrf}
@@ -2611,16 +2635,17 @@ export function renderAdminApps(
       </td>
       <td>
         <form method="POST" action="/admin/apps/${escapeHtml(app.clientId)}/delete" class="inline-form"
-              data-confirm="Delete ${escapeHtml(app.clientId)}?">
+              data-confirm="Delete ${escapeHtml(app.clientId)}? The app will no longer be able to sign users in.">
           ${csrf}
           <button type="submit" class="btn btn-danger btn-sm">Delete</button>
         </form>
       </td>
     </tr>`;
+    }
+    body += '</tbody></table></div>';
   }
-  body += '</tbody></table></div>';
 
-  return dashboardLayout('Services', body, email, true, 'apps');
+  return dashboardLayout('SSO Apps', body, email, true, 'apps');
 }
 
 export interface TemplateStatusView {
@@ -3029,19 +3054,26 @@ export function renderStorageHelp(email: string): string {
 
 export function renderAdminRegisterForm(email: string, csrf: string = ''): string {
   const body = `
-    <p style="margin-bottom:1rem;"><a href="/admin/apps" class="btn btn-secondary btn-sm">Back to Services</a></p>
+    <p style="margin-bottom:1rem;"><a href="/admin/apps" class="btn btn-secondary btn-sm">Back to SSO Apps</a></p>
+    <p style="color:#c4b698;margin-bottom:1rem;">
+      Register an external tool so it can sign residents in with their Corpo
+      Valley account. You'll get a client ID + secret to paste into the tool's
+      OIDC/OAuth2 settings.
+    </p>
     <form method="POST" action="/admin/apps/register">
       ${csrf}
       <div class="field">
         <label>App Name (client ID)</label>
-        <input type="text" name="appName" required placeholder="e.g. gitea">
+        <input type="text" name="appName" required placeholder="e.g. grafana">
+        <p class="help">Short machine name; becomes the OAuth client ID.</p>
       </div>
       <div class="field">
         <label>Display Name</label>
-        <input type="text" name="displayName" required placeholder="e.g. Gitea">
+        <input type="text" name="displayName" required placeholder="e.g. Grafana">
+        <p class="help">Shown to residents on the sign-in consent screen.</p>
       </div>
       <div class="field">
-        <label>Access</label>
+        <label>Who can sign in</label>
         <select name="access">
           <option value="all">All users</option>
           <option value="admin">Admins only</option>
@@ -3050,11 +3082,12 @@ export function renderAdminRegisterForm(email: string, csrf: string = ''): strin
       <div class="field">
         <label>Redirect URI</label>
         <input type="text" name="redirectUri" required placeholder="https://app.example.com/auth/callback">
+        <p class="help">The app's OAuth callback URL — its docs will call it the redirect or callback URI.</p>
       </div>
       <button type="submit" class="btn btn-primary" style="width:auto;">Register</button>
     </form>
   `;
-  return dashboardLayout('Register Service', body, email, true, 'apps');
+  return dashboardLayout('Register SSO App', body, email, true, 'apps');
 }
 
 export function renderAdminRegisterResult(
@@ -3064,16 +3097,16 @@ export function renderAdminRegisterResult(
   email: string
 ): string {
   const body = `
-    <div class="message success">Service registered successfully.</div>
+    <div class="message success">SSO app registered. Paste these into the app's OIDC/OAuth2 settings.</div>
     <p class="key-warning">Save these credentials now. The secret will not be shown again.</p>
     <div class="key-display">
       <strong>Client ID:</strong><br>${escapeHtml(clientId)}<br><br>
       <strong>Client Secret:</strong><br>${escapeHtml(clientSecret)}<br><br>
-      <strong>Access:</strong><br>${adminOnly ? 'Admins only' : 'All users'}
+      <strong>Who can sign in:</strong><br>${adminOnly ? 'Admins only' : 'All users'}
     </div>
-    <p style="margin-top:1rem;"><a href="/admin/apps" class="btn btn-secondary">Back to Services</a></p>
+    <p style="margin-top:1rem;"><a href="/admin/apps" class="btn btn-secondary">Back to SSO Apps</a></p>
   `;
-  return dashboardLayout('Service Registered', body, email, true, 'apps');
+  return dashboardLayout('SSO App Registered', body, email, true, 'apps');
 }
 
 // ── Bespoke auth page renderers ────────────────────────────
