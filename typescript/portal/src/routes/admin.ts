@@ -15,9 +15,11 @@ import {
   renderAdminUsers, renderAdminUserDetail, renderAdminUserCreate,
   renderAdminRecoveryResult, renderAdminApps,
   renderAdminRegisterForm, renderAdminRegisterResult, renderAdminTemplate,
-  renderAdminProjectResources, renderStorageHelp, renderError,
+  renderAdminResourcesIndex, renderAdminProjectResourceDetail,
+  renderStorageHelp, renderError,
   renderAdminCooldeps,
-  UserRow, AppRow, ResourceGroupView, ProjectResourcesResultView,
+  UserRow, AppRow, DefaultsGroupView, ResourceProjectRow, ResourcesResultView,
+  ProjectResourceDetailView,
 } from '../templates';
 import {
   cooldepsEnabled, loadCooldepsConfig, saveCooldepsConfig,
@@ -32,19 +34,20 @@ import {
   applyAdminRoleToRepo,
 } from '../services/community-center';
 import {
-  reconcileTenantResources, reconcileTenantStorage,
-  TenantResourceOverrides, StorageReconcileEntry,
+  reconcileTenantResources, reconcileTenantStorage, readTenantQuota,
+  TenantResourceOverrides, StorageReconcileEntry, TenantQuotaState,
 } from '../services/k8s';
-import { getProjectBySlug } from '../services/projects';
 import {
-  isQuantity, isCount, quantityToNumber,
-  TENANT_MAX_MEMORY, TENANT_MAX_MEMORY_REQUESTS, TENANT_MAX_MEMORY_PER_CONTAINER,
-  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
-  TENANT_MAX_CPU, TENANT_MAX_CPU_REQUESTS, TENANT_MAX_CPU_PER_CONTAINER,
-  TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST,
-  TENANT_MAX_STORAGE, TENANT_DEFAULT_STORAGE, TENANT_MAX_PVC_SIZE,
-  TENANT_MAX_PODS, TENANT_MAX_PVCS,
+  getProjectBySlug, listAllProjects, setProjectResourceOverrides, Project,
+} from '../services/projects';
+import {
+  isQuantity, isCount, quantityToNumber, TENANT_MAX_PVC_SIZE,
 } from '../services/platform-config';
+import {
+  TenantDefaults, CHART_TENANT_DEFAULTS, tenantDefaults, loadTenantDefaults,
+  saveTenantDefaults, effectiveForProject, validateTenantDefaults,
+  TenantDefaultsError, recordResourceAudit, listResourceAudit,
+} from '../services/tenant-defaults';
 
 const router = Router();
 
@@ -516,64 +519,71 @@ router.post('/template/access/revoke', async (req: Request, res: Response) => {
   }
 });
 
-// ── Project Resources (per-project resource budget) ────────
+// ── Resource management (platform defaults + per-project overrides) ────────
 //
-// Baseline ResourceQuota/LimitRange are created write-once at project creation,
-// so a changed platform default — or a one-off per-project bump — only reaches
-// an existing project when an admin applies it here. Patch is per-project on
-// request; we never sweep every namespace. Overrides are UP-ONLY: an admin may
-// raise a project above the platform default but not restrict it below.
+// /admin/resources follows the cooldeps pattern: the chart values seed the
+// platform defaults, the platform_tenant_defaults row is the source of truth
+// once saved, and each project's bump lives on projects.resource_overrides.
+// Saving defaults NEVER sweeps existing namespaces — that's the explicit
+// "Apply defaults to all existing projects" button, or a project's own page.
+// Overrides are UP-ONLY relative to the CURRENT defaults; Clear is the way
+// down. Every save/clear/sweep appends a cv_resource_audit row.
 
 type FieldKind = 'quantity' | 'count';
 interface ResourceFieldSpec {
-  key: keyof TenantResourceOverrides;
+  key: keyof TenantDefaults;
   group: string;
   label: string;
-  def: string;   // chart default — shown as placeholder and the up-only floor
   kind: FieldKind;
   help: string;
+  // Exposed as a per-project override knob on the detail page. The LimitRange
+  // default/defaultRequest pairs and the volume provision size are
+  // defaults-page only — they shape NEW containers/volumes, not one project's
+  // ceiling.
+  perProject: boolean;
+  // Where the detail page's "Live now" column reads this field from: a
+  // ResourceQuota spec.hard key, or the LimitRange per-container max.
+  liveSource?: { kind: 'quota'; key: string } | { kind: 'limitMax'; key: 'cpu' | 'memory' };
 }
 
-// Every ResourceQuota/LimitRange field, in display order. PVC *size* is handled
-// separately (it grows volumes, not the quota) — see PVC_SIZE below.
+// Every operator-tunable field, in display order. PVC *size* is handled
+// separately (it grows volumes, not the quota) — see the pvcSize handling in
+// the per-project POST.
 const RESOURCE_FIELDS: ResourceFieldSpec[] = [
-  { key: 'max', group: 'Memory', label: 'Max memory (ResourceQuota limits.memory)', def: TENANT_MAX_MEMORY, kind: 'quantity', help: 'Total memory across all the project\'s pods.' },
-  { key: 'maxRequests', group: 'Memory', label: 'Memory request budget (requests.memory)', def: TENANT_MAX_MEMORY_REQUESTS, kind: 'quantity', help: 'Sum of pod memory requests.' },
-  { key: 'maxPerContainer', group: 'Memory', label: 'Per-container memory ceiling (LimitRange max)', def: TENANT_MAX_MEMORY_PER_CONTAINER, kind: 'quantity', help: 'Most any single container may request.' },
-  { key: 'default', group: 'Memory', label: 'Default container memory limit', def: TENANT_DEFAULT_MEMORY, kind: 'quantity', help: 'Applied to a container that declares no memory limit.' },
-  { key: 'defaultRequest', group: 'Memory', label: 'Default container memory request', def: TENANT_DEFAULT_MEMORY_REQUEST, kind: 'quantity', help: 'Applied to a container that declares no memory request.' },
-  { key: 'cpuMax', group: 'CPU', label: 'Max CPU (ResourceQuota limits.cpu)', def: TENANT_MAX_CPU, kind: 'quantity', help: 'Total CPU across all pods, in cores (4) or millicores (500m).' },
-  { key: 'cpuMaxRequests', group: 'CPU', label: 'CPU request budget (requests.cpu)', def: TENANT_MAX_CPU_REQUESTS, kind: 'quantity', help: 'Sum of pod CPU requests.' },
-  { key: 'cpuMaxPerContainer', group: 'CPU', label: 'Per-container CPU ceiling (LimitRange max)', def: TENANT_MAX_CPU_PER_CONTAINER, kind: 'quantity', help: 'Most any single container may request.' },
-  { key: 'cpuDefault', group: 'CPU', label: 'Default container CPU limit', def: TENANT_DEFAULT_CPU, kind: 'quantity', help: 'Applied to a container that declares no CPU limit.' },
-  { key: 'cpuDefaultRequest', group: 'CPU', label: 'Default container CPU request', def: TENANT_DEFAULT_CPU_REQUEST, kind: 'quantity', help: 'Applied to a container that declares no CPU request.' },
-  { key: 'maxPods', group: 'Counts & storage', label: 'Max pods', def: TENANT_MAX_PODS, kind: 'count', help: 'Integer. Caps total pods in the namespace.' },
-  { key: 'maxPvcs', group: 'Counts & storage', label: 'Max PersistentVolumeClaims', def: TENANT_MAX_PVCS, kind: 'count', help: 'Integer. Caps total PVCs, including any added via the project repo.' },
-  { key: 'maxStorage', group: 'Counts & storage', label: 'Max total storage (requests.storage)', def: TENANT_MAX_STORAGE, kind: 'quantity', help: 'Sum of every PVC in the namespace. Raise this before growing a volume.' },
+  { key: 'max', group: 'Memory', label: 'Max memory (ResourceQuota limits.memory)', kind: 'quantity', perProject: true, liveSource: { kind: 'quota', key: 'limits.memory' }, help: 'Total memory across all the project\'s pods.' },
+  { key: 'maxRequests', group: 'Memory', label: 'Memory request budget (requests.memory)', kind: 'quantity', perProject: true, liveSource: { kind: 'quota', key: 'requests.memory' }, help: 'Sum of pod memory requests.' },
+  { key: 'maxPerContainer', group: 'Memory', label: 'Per-container memory ceiling (LimitRange max)', kind: 'quantity', perProject: true, liveSource: { kind: 'limitMax', key: 'memory' }, help: 'Most any single container may request.' },
+  { key: 'default', group: 'Memory', label: 'Default container memory limit', kind: 'quantity', perProject: false, help: 'Applied to a container that declares no memory limit.' },
+  { key: 'defaultRequest', group: 'Memory', label: 'Default container memory request', kind: 'quantity', perProject: false, help: 'Applied to a container that declares no memory request.' },
+  { key: 'cpuMax', group: 'CPU', label: 'Max CPU (ResourceQuota limits.cpu)', kind: 'quantity', perProject: true, liveSource: { kind: 'quota', key: 'limits.cpu' }, help: 'Total CPU across all pods, in cores (4) or millicores (500m).' },
+  { key: 'cpuMaxRequests', group: 'CPU', label: 'CPU request budget (requests.cpu)', kind: 'quantity', perProject: true, liveSource: { kind: 'quota', key: 'requests.cpu' }, help: 'Sum of pod CPU requests.' },
+  { key: 'cpuMaxPerContainer', group: 'CPU', label: 'Per-container CPU ceiling (LimitRange max)', kind: 'quantity', perProject: true, liveSource: { kind: 'limitMax', key: 'cpu' }, help: 'Most any single container may request.' },
+  { key: 'cpuDefault', group: 'CPU', label: 'Default container CPU limit', kind: 'quantity', perProject: false, help: 'Applied to a container that declares no CPU limit.' },
+  { key: 'cpuDefaultRequest', group: 'CPU', label: 'Default container CPU request', kind: 'quantity', perProject: false, help: 'Applied to a container that declares no CPU request.' },
+  { key: 'maxPods', group: 'Counts & storage', label: 'Max pods', kind: 'count', perProject: true, liveSource: { kind: 'quota', key: 'pods' }, help: 'Integer. Caps total pods in the namespace.' },
+  { key: 'maxPvcs', group: 'Counts & storage', label: 'Max PersistentVolumeClaims', kind: 'count', perProject: true, liveSource: { kind: 'quota', key: 'persistentvolumeclaims' }, help: 'Integer. Caps total PVCs, including any added via the project repo.' },
+  { key: 'maxStorage', group: 'Counts & storage', label: 'Max total storage (requests.storage)', kind: 'quantity', perProject: true, liveSource: { kind: 'quota', key: 'requests.storage' }, help: 'Sum of every PVC in the namespace. Raise this before growing a volume.' },
+  { key: 'defaultStorage', group: 'Counts & storage', label: 'Data volume size at provision', kind: 'quantity', perProject: false, help: 'Size each capability data volume (Postgres/Garage PVC) is created at. Capped by the chart\'s per-volume admission bound.' },
 ];
 
-// The grow-volumes control. Distinct key (not a TenantResourceOverrides field)
-// because it patches the PVCs, not the quota.
-const PVC_SIZE = {
-  key: 'pvcSize', group: 'Counts & storage',
-  label: 'Grow data volumes to', def: TENANT_DEFAULT_STORAGE,
-  help: 'Resize the Postgres/Garage PVCs (grow-only; needs an expandable StorageClass — otherwise see the storage help page).',
-};
+const RESOURCE_GROUP_ORDER = ['Memory', 'CPU', 'Counts & storage'];
 
-const ALL_FORM_KEYS = ['slug', ...RESOURCE_FIELDS.map((f) => f.key), PVC_SIZE.key];
+// Validate one submitted value against its field's kind, throwing the same
+// admin-facing error shape everywhere.
+function checkFieldValue(f: ResourceFieldSpec, v: string): void {
+  const valid = f.kind === 'count' ? isCount(v) : isQuantity(v);
+  if (!valid) {
+    throw new TenantDefaultsError(f.kind === 'count'
+      ? `"${v}" is not a valid integer for "${f.label}".`
+      : `"${v}" is not a valid quantity for "${f.label}" (e.g. 512Mi, 2, 500m).`);
+  }
+}
 
-// Group the field specs into the view the template renders, threading the
-// admin's raw input back into each input's value.
-function resourceGroups(form: Record<string, string>): ResourceGroupView[] {
-  const order = ['Memory', 'CPU', 'Counts & storage'];
-  const specs = [...RESOURCE_FIELDS, PVC_SIZE];
-  return order.map((title) => ({
-    title,
-    fields: specs.filter((f) => f.group === title).map((f) => ({
-      key: f.key, label: f.label, placeholder: f.def, help: f.help,
-      value: form[f.key] || '',
-    })),
-  }));
+// The override keys a project has set (in field display order, for the
+// "customised" summary on the index).
+function overriddenKeys(overrides: Record<string, string> | null): string[] {
+  if (!overrides) return [];
+  return RESOURCE_FIELDS.filter((f) => typeof overrides[f.key] === 'string').map((f) => f.key);
 }
 
 // Render a one-line summary of what a storage grow did, per volume.
@@ -588,87 +598,337 @@ function storageDetail(e: StorageReconcileEntry): string {
   }
 }
 
-router.get('/projects/resources', (req: Request, res: Response) => {
-  res.send(renderAdminProjectResources(
-    resourceGroups({}), null, req.portalSession!.email, csrfHiddenField(req, res),
+// Human summary of a cv_resource_audit change blob for the detail page.
+function auditSummary(change: Record<string, unknown>): string {
+  const action = typeof change.action === 'string' ? change.action : '';
+  if (action === 'save-overrides') {
+    const ov = (change.overrides ?? {}) as Record<string, string>;
+    const parts = Object.entries(ov).map(([k, v]) => `${k}=${v}`);
+    const set = parts.length ? `set ${parts.join(', ')}` : 'reset to platform defaults';
+    return typeof change.pvcSize === 'string' ? `${set}; grow volumes to ${change.pvcSize}` : set;
+  }
+  if (action === 'clear-overrides') return 'cleared overrides (back to platform defaults)';
+  if (action === 'apply-all') return `apply-all defaults sweep (${change.applied ?? '?'} applied, ${change.failures ?? 0} failed)`;
+  if (action === 'save-defaults') return 'platform defaults saved';
+  return JSON.stringify(change).slice(0, 200);
+}
+
+// Owner ids → emails for the projects table, best-effort (a Kratos hiccup
+// falls back to the raw id rather than failing the page).
+async function resolveOwnerEmails(projects: Project[]): Promise<Map<string, string>> {
+  const owners = new Map<string, string>();
+  await Promise.all([...new Set(projects.map((p) => p.owner_id))].map(async (id) => {
+    try {
+      const identity = await getIdentity(id);
+      owners.set(id, ((identity.traits ?? {}) as Record<string, any>).email || id);
+    } catch { owners.set(id, id); }
+  }));
+  return owners;
+}
+
+// Render the /admin/resources index. `form` (when given) carries the admin's
+// raw defaults-card input back after a validation error; otherwise the card
+// shows the current effective defaults.
+async function renderResourcesIndex(
+  req: Request, res: Response, status: number,
+  result: ResourcesResultView | null, form?: Record<string, string>,
+): Promise<void> {
+  const record = await loadTenantDefaults();
+  const groups: DefaultsGroupView[] = RESOURCE_GROUP_ORDER.map((title) => ({
+    title,
+    fields: RESOURCE_FIELDS.filter((f) => f.group === title).map((f) => ({
+      key: f.key, label: f.label, help: f.help,
+      value: form?.[f.key] ?? record.config[f.key],
+      chartSeed: CHART_TENANT_DEFAULTS[f.key],
+    })),
+  }));
+  const projects = await listAllProjects();
+  const owners = await resolveOwnerEmails(projects);
+  const rows: ResourceProjectRow[] = projects.map((p) => {
+    const keys = overriddenKeys(p.resource_overrides);
+    return {
+      slug: p.slug, name: p.name,
+      owner: owners.get(p.owner_id) || p.owner_id,
+      customised: keys.length > 0,
+      overriddenKeys: keys,
+      updatedAt: p.resource_overrides_updated_at
+        ? new Date(p.resource_overrides_updated_at).toISOString() : null,
+      updatedBy: p.resource_overrides_updated_by,
+    };
+  });
+  res.status(status).send(renderAdminResourcesIndex(
+    groups, { persisted: record.persisted, updatedAt: record.updatedAt, updatedBy: record.updatedBy },
+    rows, result, req.portalSession!.email, csrfHiddenField(req, res),
   ));
+}
+
+// Build the per-project detail view: platform default | stored override (or a
+// live value worth capturing) | live now, with drift markers.
+async function buildProjectResourceView(project: Project): Promise<ProjectResourceDetailView> {
+  const defaults = tenantDefaults();
+  const overrides = project.resource_overrides ?? {};
+  const expected = effectiveForProject(overrides);
+  let live: TenantQuotaState | null = null;
+  try {
+    live = await readTenantQuota(project.slug);
+  } catch (err: any) {
+    console.error(`[admin] readTenantQuota(${project.slug}) failed:`, err?.message);
+  }
+
+  const fields = RESOURCE_FIELDS.filter((f) => f.perProject).map((f) => {
+    let liveVal: string | undefined;
+    let used: string | null = null;
+    if (live && f.liveSource) {
+      if (f.liveSource.kind === 'quota') {
+        liveVal = live.hard[f.liveSource.key];
+        used = live.used[f.liveSource.key] ?? null;
+      } else {
+        liveVal = live.limitMax[f.liveSource.key];
+      }
+    }
+    const drift = liveVal !== undefined
+      && quantityToNumber(liveVal) !== quantityToNumber(expected[f.key]);
+    const stored = typeof overrides[f.key] === 'string' ? overrides[f.key] : undefined;
+    // Pre-fill priority: the stored override; else, when the live value has
+    // drifted ABOVE the platform default with nothing stored (a bump made
+    // before overrides were persisted), pre-fill from live so the admin can
+    // capture it by saving. Below-default drift is only flagged — capturing it
+    // would violate up-only.
+    const prefill = stored === undefined && drift && liveVal !== undefined
+      && quantityToNumber(liveVal) > quantityToNumber(defaults[f.key]);
+    return {
+      key: f.key, label: f.label, help: f.help,
+      platformDefault: defaults[f.key],
+      overrideValue: stored ?? (prefill ? liveVal! : ''),
+      prefilledFromLive: !!prefill,
+      live: liveVal ?? null,
+      used,
+      drift,
+    };
+  });
+
+  const audit = (await listResourceAudit(project.slug, 10)).map((a) => ({
+    createdAt: a.createdAt, actor: a.actorEmail, summary: auditSummary(a.change),
+  }));
+
+  return {
+    slug: project.slug, name: project.name,
+    customised: overriddenKeys(project.resource_overrides).length > 0,
+    updatedAt: project.resource_overrides_updated_at
+      ? new Date(project.resource_overrides_updated_at).toISOString() : null,
+    updatedBy: project.resource_overrides_updated_by,
+    fields,
+    pvcSizeFloor: defaults.defaultStorage,
+    pvcSizeMax: TENANT_MAX_PVC_SIZE,
+    liveAvailable: live !== null,
+    audit,
+  };
+}
+
+// The old URL, kept as a redirect so bookmarks and stale nav links land right.
+router.get('/projects/resources', (req: Request, res: Response) => {
+  res.redirect(302, '/admin/resources');
 });
 
-router.post('/projects/resources', async (req: Request, res: Response) => {
+router.get('/resources', async (req: Request, res: Response) => {
+  try {
+    await renderResourcesIndex(req, res, 200, null);
+  } catch (err: any) {
+    console.error('Admin resources index error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load resource management.'));
+  }
+});
+
+// Save the platform defaults. A blank field reverts that knob to the chart
+// seed. NEVER touches existing namespaces — new projects pick the values up at
+// provision time; existing ones via apply-all or their own page.
+router.post('/resources/defaults', async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const body = (req.body || {}) as Record<string, unknown>;
-  const csrf = csrfHiddenField(req, res);
-  // Keep the admin's raw input so the form re-renders with what they typed.
   const form: Record<string, string> = {};
-  for (const k of ALL_FORM_KEYS) {
-    const v = body[k];
-    if (typeof v === 'string') form[k] = v;
-  }
-
-  const fail = (slug: string, message: string, status = 400) =>
-    res.status(status).send(renderAdminProjectResources(
-      resourceGroups(form),
-      { ok: false, slug, message } as ProjectResourcesResultView,
-      session.email, csrf, form.slug || '',
-    ));
-
-  const slug = typeof body.slug === 'string' ? body.slug.trim() : '';
-  if (!slug) { fail('', 'Project slug is required.'); return; }
-
-  // Only patch a real project — and use its canonical slug as the namespace.
-  const project = await getProjectBySlug(slug).catch(() => null);
-  if (!project) { fail(slug, 'No project with that slug.', 404); return; }
-
-  // Build overrides from the supplied fields. Blank → omit (keep the platform
-  // default). Each value must (a) be a valid quantity/count and (b) be ≥ the
-  // platform default — overrides are up-only. Reject the whole request on any
-  // bad field so the admin gets a clear error, not a half-applied patch.
-  const overrides: TenantResourceOverrides = {};
   for (const f of RESOURCE_FIELDS) {
-    const raw = body[f.key];
-    if (raw === undefined || raw === null) continue;
-    if (typeof raw !== 'string') { fail(slug, `Invalid value for "${f.label}".`); return; }
-    const v = raw.trim();
-    if (v === '') continue;
-    const valid = f.kind === 'count' ? isCount(v) : isQuantity(v);
-    if (!valid) {
-      fail(slug, f.kind === 'count'
-        ? `"${v}" is not a valid integer for "${f.label}".`
-        : `"${v}" is not a valid quantity for "${f.label}" (e.g. 512Mi, 2, 500m).`);
-      return;
-    }
-    if (quantityToNumber(v) < quantityToNumber(f.def)) {
-      fail(slug, `"${v}" is below the platform default of ${f.def} for "${f.label}" — overrides are up-only.`);
-      return;
-    }
-    overrides[f.key] = v;
-  }
-
-  // PVC grow target (optional). Bounded below by the chart default (grow-only)
-  // and above by the per-volume admission cap — exceeding it would be denied by
-  // the cv-projects-*-bounds VAP, so reject up front instead of half-applying.
-  let pvcSize: string | undefined;
-  const rawSize = typeof body[PVC_SIZE.key] === 'string' ? (body[PVC_SIZE.key] as string).trim() : '';
-  if (rawSize !== '') {
-    if (!isQuantity(rawSize)) { fail(slug, `"${rawSize}" is not a valid storage quantity (e.g. 10Gi).`); return; }
-    if (quantityToNumber(rawSize) < quantityToNumber(PVC_SIZE.def)) {
-      fail(slug, `"${rawSize}" is below the platform default of ${PVC_SIZE.def} — storage is grow-only.`); return;
-    }
-    if (quantityToNumber(rawSize) > quantityToNumber(TENANT_MAX_PVC_SIZE)) {
-      fail(slug, `"${rawSize}" exceeds the per-volume cap of ${TENANT_MAX_PVC_SIZE} (admission would reject it) — raise tenant.storage.maxPerVolume in the chart.`); return;
-    }
-    pvcSize = rawSize;
+    const v = body[f.key];
+    if (typeof v === 'string') form[f.key] = v.trim();
   }
 
   try {
-    // Quota/LimitRange first — so a raised requests.storage ceiling is in place
-    // before we try to grow a volume into it.
+    const config: TenantDefaults = { ...CHART_TENANT_DEFAULTS };
+    for (const f of RESOURCE_FIELDS) {
+      const v = form[f.key] ?? '';
+      if (v === '') continue;
+      checkFieldValue(f, v);
+      config[f.key] = v;
+    }
+    validateTenantDefaults(config);
+
+    const before = { ...tenantDefaults() };
+    await saveTenantDefaults(config, session.email);
+    await recordResourceAudit(session.email, 'defaults', {
+      action: 'save-defaults', before, after: config,
+    });
+    console.log(`[admin] platform resource defaults saved by ${session.email}`);
+    await renderResourcesIndex(req, res, 200, {
+      ok: true,
+      message: 'Platform defaults saved. Existing projects are unchanged until you apply them — per project, or via "Apply defaults to all existing projects".',
+    });
+  } catch (err: any) {
+    if (err instanceof TenantDefaultsError) {
+      await renderResourcesIndex(req, res, 400, { ok: false, message: err.message }, form)
+        .catch(() => res.status(500).send(renderError('Error', 'Failed to render resource management.')));
+      return;
+    }
+    console.error('Admin resource defaults save error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to save defaults — see portal logs.'));
+  }
+});
+
+// Sweep EVERY existing project's quota/limits to the current defaults (plus
+// each project's stored overrides). Explicit-only — never triggered by a
+// defaults save. Sequential on purpose: parallel patches would hammer the
+// apiserver and garble per-project reporting.
+router.post('/resources/apply-all', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const projects = await listAllProjects();
+    const details: string[] = [];
+    let applied = 0;
+    let failures = 0;
+    let k8sDisabled = false;
+    for (const p of projects) {
+      try {
+        const r = await reconcileTenantResources(
+          p.slug, (p.resource_overrides ?? {}) as TenantResourceOverrides,
+        );
+        if (r === null) { k8sDisabled = true; break; }
+        applied++;
+        details.push(`${p.slug}: quota ${r.quota}, limits ${r.limits}`
+          + (overriddenKeys(p.resource_overrides).length ? ' (kept its overrides)' : ''));
+      } catch (err: any) {
+        failures++;
+        details.push(`${p.slug}: FAILED — ${err?.message || 'see portal logs'}`);
+      }
+    }
+    if (k8sDisabled) {
+      await renderResourcesIndex(req, res, 503, {
+        ok: false, message: 'Kubernetes integration is disabled on this deployment — nothing applied.',
+      });
+      return;
+    }
+    await recordResourceAudit(session.email, 'defaults', {
+      action: 'apply-all', projects: projects.length, applied, failures,
+    });
+    console.log(`[admin] apply-all resource sweep by ${session.email}: `
+      + `${applied} applied, ${failures} failed of ${projects.length}`);
+    await renderResourcesIndex(req, res, failures ? 500 : 200, {
+      ok: failures === 0,
+      message: failures
+        ? `Applied defaults to ${applied} project(s); ${failures} failed — see below.`
+        : `Applied defaults to ${applied} project(s).`,
+      details,
+    });
+  } catch (err: any) {
+    console.error('Admin apply-all resources error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to apply defaults — see portal logs.'));
+  }
+});
+
+router.get('/resources/:slug', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const project = await getProjectBySlug(req.params.slug);
+    if (!project) {
+      res.status(404).send(renderError('Not Found', 'No project with that slug.'));
+      return;
+    }
+    res.send(renderAdminProjectResourceDetail(
+      await buildProjectResourceView(project), null, session.email, csrfHiddenField(req, res),
+    ));
+  } catch (err: any) {
+    console.error('Admin project resources error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load project resources.'));
+  }
+});
+
+// Save & apply one project's overrides: persist the full override set (blank
+// field = inherit), then reconcile the live quota/limits and optionally grow
+// the data volumes.
+router.post('/resources/:slug', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const csrf = csrfHiddenField(req, res);
+  const project = await getProjectBySlug(req.params.slug).catch(() => null);
+  if (!project) {
+    res.status(404).send(renderError('Not Found', 'No project with that slug.'));
+    return;
+  }
+
+  const fail = async (message: string, status = 400) => {
+    const view = await buildProjectResourceView(project);
+    res.status(status).send(renderAdminProjectResourceDetail(
+      view, { ok: false, message }, session.email, csrf,
+    ));
+  };
+
+  try {
+    const defaults = tenantDefaults();
+
+    // Build the override set. Blank → inherit. Each value must (a) be a valid
+    // quantity/count and (b) be ABOVE the current platform default — up-only;
+    // a value equal to the default is stored as "inherit" so the customised
+    // badge stays truthful. Reject the whole request on any bad field so the
+    // admin gets a clear error, not a half-applied patch.
+    const overrides: TenantResourceOverrides = {};
+    for (const f of RESOURCE_FIELDS) {
+      if (!f.perProject) continue;
+      const raw = body[f.key];
+      if (raw === undefined || raw === null) continue;
+      if (typeof raw !== 'string') { await fail(`Invalid value for "${f.label}".`); return; }
+      const v = raw.trim();
+      if (v === '') continue;
+      checkFieldValue(f, v);
+      if (quantityToNumber(v) < quantityToNumber(defaults[f.key])) {
+        await fail(`"${v}" is below the platform default of ${defaults[f.key]} for "${f.label}" — overrides are up-only (Clear overrides is the way down).`);
+        return;
+      }
+      if (quantityToNumber(v) === quantityToNumber(defaults[f.key])) continue;
+      (overrides as Record<string, string>)[f.key] = v;
+    }
+
+    // Cross-field sanity on the EFFECTIVE result (defaults ⊕ overrides), so a
+    // bump can't create an internally inconsistent quota (e.g. a request
+    // budget above the limit budget).
+    validateTenantDefaults(effectiveForProject(overrides));
+
+    // PVC grow target (optional). Bounded below by the current default volume
+    // size (grow-only) and above by the per-volume admission cap — exceeding
+    // it would be denied by the cv-projects-*-bounds VAP, so reject up front
+    // instead of half-applying.
+    let pvcSize: string | undefined;
+    const rawSize = typeof body.pvcSize === 'string' ? body.pvcSize.trim() : '';
+    if (rawSize !== '') {
+      if (!isQuantity(rawSize)) { await fail(`"${rawSize}" is not a valid storage quantity (e.g. 10Gi).`); return; }
+      if (quantityToNumber(rawSize) < quantityToNumber(defaults.defaultStorage)) {
+        await fail(`"${rawSize}" is below the platform default of ${defaults.defaultStorage} — storage is grow-only.`); return;
+      }
+      if (quantityToNumber(rawSize) > quantityToNumber(TENANT_MAX_PVC_SIZE)) {
+        await fail(`"${rawSize}" exceeds the per-volume cap of ${TENANT_MAX_PVC_SIZE} (admission would reject it) — raise tenant.storage.maxPerVolume in the chart.`); return;
+      }
+      pvcSize = rawSize;
+    }
+
+    // Persist first — the DB row is the source of truth — then reconcile.
+    // Quota/LimitRange before volumes, so a raised requests.storage ceiling is
+    // in place before we try to grow a volume into it.
+    const stored = overriddenKeys(overrides as Record<string, string>).length
+      ? (overrides as Record<string, string>) : null;
+    const before = project.resource_overrides ?? null;
+    await setProjectResourceOverrides(project.id, stored, session.email);
+
     const result = await reconcileTenantResources(project.slug, overrides);
-    if (result === null) { fail(project.slug, 'Kubernetes integration is disabled on this deployment.', 503); return; }
 
     const details: string[] = [];
     let helpLink = false;
-    if (pvcSize) {
+    if (pvcSize && result !== null) {
       const entries = (await reconcileTenantStorage(project.slug, pvcSize)) || [];
       for (const e of entries) {
         details.push(storageDetail(e));
@@ -676,29 +936,70 @@ router.post('/projects/resources', async (req: Request, res: Response) => {
       }
     }
 
-    const setFields = RESOURCE_FIELDS.filter((f) => overrides[f.key]);
-    const applied = setFields.length || pvcSize
-      ? `custom budget (${[
-          ...setFields.map((f) => `${f.key}=${overrides[f.key]}`),
-          ...(pvcSize ? [`pvcSize=${pvcSize}`] : []),
-        ].join(', ')})`
-      : 'current platform defaults';
-    console.log(`[admin] reconcile resources for ${project.slug} by ${session.email}: `
-      + `quota ${result.quota}, limits ${result.limits}; ${applied}`
-      + (details.length ? `; storage: ${details.join('; ')}` : ''));
+    await recordResourceAudit(session.email, project.slug, {
+      action: 'save-overrides', before, overrides: stored ?? {},
+      ...(pvcSize ? { pvcSize } : {}),
+    });
+    const summary = stored
+      ? Object.entries(stored).map(([k, v]) => `${k}=${v}`).join(', ')
+      : 'platform defaults';
+    console.log(`[admin] resources for ${project.slug} saved by ${session.email}: ${summary}`
+      + (pvcSize ? `; pvcSize=${pvcSize}` : '')
+      + (result ? `; quota ${result.quota}, limits ${result.limits}` : '; NOT applied (k8s disabled)'));
 
-    res.send(renderAdminProjectResources(
-      resourceGroups(form),
-      {
-        ok: true, slug: project.slug,
-        message: `Applied ${applied} — ResourceQuota ${result.quota}, LimitRange ${result.limits}.`,
-        details, helpLink,
-      },
-      session.email, csrf, project.slug,
+    // Re-read so the page reflects the just-persisted overrides + stamps.
+    const fresh = (await getProjectBySlug(project.slug)) ?? project;
+    const message = result === null
+      ? 'Overrides saved, but Kubernetes integration is disabled on this deployment — the live quota was not touched.'
+      : `Saved and applied ${stored ? `overrides (${summary})` : 'the platform defaults'} — ResourceQuota ${result.quota}, LimitRange ${result.limits}.`;
+    res.status(result === null ? 503 : 200).send(renderAdminProjectResourceDetail(
+      await buildProjectResourceView(fresh),
+      { ok: result !== null, message, details, helpLink },
+      session.email, csrf,
     ));
   } catch (err: any) {
-    console.error('Reconcile project resources error:', err?.message);
-    fail(project.slug, 'Failed to apply — see portal logs.', 500);
+    if (err instanceof TenantDefaultsError) {
+      await fail(err.message).catch(() =>
+        res.status(500).send(renderError('Error', 'Failed to render project resources.')));
+      return;
+    }
+    console.error('Save project resources error:', err?.message);
+    await fail('Failed to apply — see portal logs.', 500).catch(() =>
+      res.status(500).send(renderError('Error', 'Failed to apply — see portal logs.')));
+  }
+});
+
+// Clear a project's overrides and reconcile it back to the platform defaults —
+// the sanctioned way DOWN from a bump.
+router.post('/resources/:slug/clear', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const csrf = csrfHiddenField(req, res);
+  const project = await getProjectBySlug(req.params.slug).catch(() => null);
+  if (!project) {
+    res.status(404).send(renderError('Not Found', 'No project with that slug.'));
+    return;
+  }
+
+  try {
+    const before = project.resource_overrides ?? null;
+    await setProjectResourceOverrides(project.id, null, session.email);
+    const result = await reconcileTenantResources(project.slug, {});
+    await recordResourceAudit(session.email, project.slug, { action: 'clear-overrides', before });
+    console.log(`[admin] resources for ${project.slug} cleared by ${session.email}`
+      + (result ? `; quota ${result.quota}, limits ${result.limits}` : '; NOT applied (k8s disabled)'));
+
+    const fresh = (await getProjectBySlug(project.slug)) ?? project;
+    const message = result === null
+      ? 'Overrides cleared, but Kubernetes integration is disabled on this deployment — the live quota was not touched.'
+      : `Overrides cleared — reconciled to the platform defaults (ResourceQuota ${result.quota}, LimitRange ${result.limits}). A quota below current usage only blocks NEW pods; nothing is evicted.`;
+    res.status(result === null ? 503 : 200).send(renderAdminProjectResourceDetail(
+      await buildProjectResourceView(fresh),
+      { ok: result !== null, message },
+      session.email, csrf,
+    ));
+  } catch (err: any) {
+    console.error('Clear project resources error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to clear overrides — see portal logs.'));
   }
 });
 

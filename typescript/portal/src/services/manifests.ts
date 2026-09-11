@@ -15,9 +15,9 @@ import { getFile, upsertRepoFile } from './gitea';
 import type { Capabilities } from './templates';
 import {
   CV_REGISTRY, PORTAL_PUBLIC_URL, PORTAL_INTERNAL_URL, PROJECTS_DOMAIN,
-  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
-  TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST, isQuantity,
+  isQuantity,
 } from './platform-config';
+import { tenantDefaults } from './tenant-defaults';
 
 const REGISTRY = CV_REGISTRY;
 // Placeholder tag before the first Build runs; the pin endpoint rewrites it.
@@ -38,9 +38,10 @@ interface ManifestOpts {
 }
 
 // cpu/memory defaults stamped into a newly added container both come from the
-// chart via platform-config now, and match the LimitRange's default/defaultRequest
-// so a fresh container agrees with what the platform would inject anyway. An
-// owner's hand-tuned values are preserved across regeneration regardless.
+// platform defaults (chart-seeded, admin-editable — services/tenant-defaults.ts),
+// and match the LimitRange's default/defaultRequest so a fresh container agrees
+// with what the platform would inject anyway. An owner's hand-tuned values are
+// preserved across regeneration regardless.
 
 // A container's resource quantities carried forward from an existing manifest.
 // Every field is either undefined (use the default) or a string already
@@ -182,11 +183,11 @@ function containerBlock(opts: {
     ...envLines,
     `          resources:`,
     `            requests:`,
-    `              cpu: ${opts.resources?.reqCpu ?? TENANT_DEFAULT_CPU_REQUEST}`,
-    `              memory: ${opts.resources?.reqMem ?? TENANT_DEFAULT_MEMORY_REQUEST}`,
+    `              cpu: ${opts.resources?.reqCpu ?? tenantDefaults().cpuDefaultRequest}`,
+    `              memory: ${opts.resources?.reqMem ?? tenantDefaults().defaultRequest}`,
     `            limits:`,
-    `              cpu: ${opts.resources?.limCpu ?? TENANT_DEFAULT_CPU}`,
-    `              memory: ${opts.resources?.limMem ?? TENANT_DEFAULT_MEMORY}`,
+    `              cpu: ${opts.resources?.limCpu ?? tenantDefaults().cpuDefault}`,
+    `              memory: ${opts.resources?.limMem ?? tenantDefaults().default}`,
     `          securityContext:`,
     `            allowPrivilegeEscalation: false`,
     `            readOnlyRootFilesystem: true`,

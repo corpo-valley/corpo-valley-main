@@ -24,7 +24,8 @@ import {
 } from './gitea';
 import { buildSealedSecretYaml } from './seal';
 import { k8sDeleteNamespaced, k8sEnabled } from './k8s';
-import { POSTGRES_STORAGE_CLASS, TENANT_DEFAULT_STORAGE, POSTGRES_IMAGE } from './platform-config';
+import { POSTGRES_STORAGE_CLASS, POSTGRES_IMAGE } from './platform-config';
+import { tenantDefaults } from './tenant-defaults';
 
 // Workflow file path inside a project repo. Used both by the postgres
 // flow (no direct touch) and by the pin-token backfill which refreshes
@@ -159,7 +160,7 @@ spec:
         accessModes: ["ReadWriteOnce"]
 ${POSTGRES_STORAGE_CLASS !== undefined ? `        storageClassName: ${POSTGRES_STORAGE_CLASS}\n` : ''}        resources:
           requests:
-            storage: ${TENANT_DEFAULT_STORAGE}
+            storage: ${tenantDefaults().defaultStorage}
 `;
 }
 
