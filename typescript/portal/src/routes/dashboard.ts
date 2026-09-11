@@ -50,7 +50,7 @@ import {
   setBranchProtection,
   listRepoFiles, upsertRepoFile, deleteRepoFile,
   mintUserCliToken, setActionsSecret,
-  getRepoUpdatedAtMap,
+  getRepoLastCommitMap,
 } from '../services/gitea';
 import { createArgoApplication, k8sEnabled, namespaceExists } from '../services/k8s';
 import { purgeProjectResources } from '../services/project-purge';
@@ -252,7 +252,7 @@ router.get('/achievements/u/:username', profileLimiter, requireSession, async (r
 // last-updated, sortable by creation date (default, newest first), creator, or
 // last updated. Visible to any logged-in user. Three batch lookups total,
 // independent of project count: the shared-projects query, one Kratos identity
-// page (owner → email), and one Gitea repos/search (gitea_repo → updated_at).
+// page (owner → email), and one last-commit lookup (gitea_repo → commit date).
 // Both enrichment lookups are best-effort — a failure degrades a column rather
 // than the whole page.
 router.get('/community', requireSession, async (req: Request, res: Response) => {
@@ -271,7 +271,8 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
     const projects = await listProjectsWithEveryoneSiteGrant();
     const [identities, repoUpdated] = await Promise.all([
       listAllHumanIdentities().catch(() => []),
-      getRepoUpdatedAtMap().catch(() => new Map<string, string>()),
+      getRepoLastCommitMap(projects.map((p) => p.gitea_repo).filter(Boolean) as string[])
+        .catch(() => new Map<string, string>()),
     ]);
     const emailById = new Map<string, string>();
     const usernameById = new Map<string, string>();
@@ -290,8 +291,9 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
         .map((k) => ({ key: k, name: BADGE_META[k].name, emoji: BADGE_META[k].emoji }));
 
     // Enrich each project. "Last active" is the most recent of the last build
-    // shipped (reliable, from our ledger) and the Gitea repo updated_at (flaky);
-    // fall back to created_at so the column is never blank.
+    // shipped (reliable, from our ledger) and the repo's latest default-branch
+    // commit (repo `updated_at` was a trap — admin sweeps bump every repo at
+    // once); fall back to created_at so the column is never blank.
     const enriched = projects.map((p) => {
       const m = metricsById.get(p.id) ?? emptyMetrics();
       const repoIso = (p.gitea_repo && repoUpdated.get(p.gitea_repo)) || null;
