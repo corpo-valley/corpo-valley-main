@@ -7,10 +7,15 @@
 // provisions the repo, database, manifests, and ArgoCD Application.
 //
 // Every step is best-effort and logged: a downstream hiccup (Gitea/k8s) must
-// not roll back the project row, which is the source of truth a reconciler can
-// retry from later.
+// not roll back the project row. But "best-effort" is not "pretend it worked":
+// the ArgoCD Application is only created — and the project only marked `ready`
+// — when the namespace was sealed AND the repo was generated AND its k8s/
+// manifests were rendered. Anything less flips the project to `failed`.
+// NOTE: there is NO background reconciler today — a `failed` project stays
+// failed until it's deleted and recreated (the row is kept so a future
+// reconciler could retry from it).
 
-import type { Project } from './projects';
+import type { Project, ProjectStatus } from './projects';
 import {
   claimOrGetPostgresPassword, decodePostgresPassword,
   claimOrGetGarageCredentials, decodeGarageCredentials,
@@ -41,9 +46,19 @@ export interface ProvisionContext {
 
 export interface ProvisionResult {
   namespaceSealed: boolean;
+  // The project repo was generated from the template (and recorded on the row).
+  repoGenerated: boolean;
+  // composeProjectManifests rewrote k8s/{deployment,service,ingress}.yaml for
+  // the chosen capabilities. Without this the repo still holds the template's
+  // un-rendered {{SLUG}} reference copies — not deployable.
+  manifestsRendered: boolean;
   postgresEnabled: boolean;
   storageEnabled: boolean;
   argoRegistered: boolean;
+  // The lifecycle status this run wrote to the project row: 'ready' only on
+  // the full happy path, 'failed' otherwise. Callers (dashboard initializing
+  // screen, MCP create_project) surface it to the user.
+  status: ProjectStatus;
 }
 
 export async function provisionProject(
@@ -53,7 +68,11 @@ export async function provisionProject(
 ): Promise<ProvisionResult> {
   const tag = ctx.logTag || 'provision';
   const slug = project.slug;
-  const result: ProvisionResult = { namespaceSealed: false, postgresEnabled: false, storageEnabled: false, argoRegistered: false };
+  const result: ProvisionResult = {
+    namespaceSealed: false, repoGenerated: false, manifestsRendered: false,
+    postgresEnabled: false, storageEnabled: false, argoRegistered: false,
+    status: 'failed',
+  };
 
   // 1. Seal the namespace FIRST — PSA labels + default-deny egress + quota +
   //    limits — so the box is locked before any tenant workload can land.
@@ -80,6 +99,7 @@ export async function provisionProject(
         templateOwner: TEMPLATE_GITEA_OWNER, templateRepo: TEMPLATE_GITEA_REPO,
       });
       await setGiteaRepo(project.id, fullName);
+      result.repoGenerated = true;
 
       // Converge collaborators (default-`write` fan-out for `internal`
       // projects; explicit grants don't exist yet at create time).
@@ -116,8 +136,10 @@ export async function provisionProject(
         }
       }
 
-      try { await composeProjectManifests({ owner: ownerUsername, repo: slug, slug, caps }); }
-      catch (e: any) { console.error(`[${tag}] manifest generation failed for ${slug}:`, e?.message); }
+      try {
+        await composeProjectManifests({ owner: ownerUsername, repo: slug, slug, caps });
+        result.manifestsRendered = true;
+      } catch (e: any) { console.error(`[${tag}] manifest generation failed for ${slug}:`, e?.message); }
 
       try { await setBranchProtection({ owner: ownerUsername, repo: slug }); }
       catch (e: any) { console.error(`[${tag}] branch protection failed for ${slug}:`, e?.message); }
@@ -141,16 +163,31 @@ export async function provisionProject(
   }
 
   // 3. Register the ArgoCD Application so the projects ArgoCD deploys the repo
-  //    into the (now sealed) namespace. FAIL CLOSED: never deploy tenant code
-  //    into an unsealed namespace. If the seal failed, skip registration — the
-  //    project row remains and a retry/reconcile can complete it later.
-  if (!result.namespaceSealed) {
-    console.error(`[${tag}] skipping ArgoCD registration for ${slug}: namespace not sealed`);
-    // Fail closed AND surface it: the project never reached a deployable state,
-    // so mark it `failed` rather than leaving it stuck `provisioning` (which
-    // would poll the initializing screen forever). Best-effort/logged.
+  //    into the (now sealed) namespace. FAIL CLOSED on two conditions:
+  //    - never deploy tenant code into an unsealed namespace;
+  //    - never point ArgoCD at a repo that wasn't generated, or whose k8s/
+  //      manifests weren't rendered (the repo would be missing, or still carry
+  //      the template's un-rendered {{SLUG}} reference copies).
+  //    Either way the project never reached a deployable state: mark it
+  //    `failed` and surface that, rather than leaving it stuck `provisioning`
+  //    (which would poll the initializing screen forever) or lying with
+  //    `ready`. There is NO reconciler that retries a failed project today —
+  //    the row is kept so one could be built later.
+  const markFailed = async () => {
+    result.status = 'failed';
     try { await setProjectStatus(project.id, 'failed'); }
     catch (e: any) { console.error(`[${tag}] could not mark ${slug} failed:`, e?.message); }
+  };
+  // Repo/manifest success is only required where Gitea provisioning was
+  // actually attempted (Gitea wired up + an owner username to create under);
+  // a dev deployment without Gitea behaves as before.
+  const giteaAttempted = giteaEnabled() && !!ctx.ownerUsername;
+  if (!result.namespaceSealed || (giteaAttempted && (!result.repoGenerated || !result.manifestsRendered))) {
+    const why = !result.namespaceSealed ? 'namespace not sealed'
+      : !result.repoGenerated ? 'repo generation failed'
+      : 'manifest rendering failed';
+    console.error(`[${tag}] skipping ArgoCD registration for ${slug}: ${why} — marking project failed`);
+    await markFailed();
     return result;
   }
   if (k8sEnabled() && ctx.ownerUsername) {
@@ -165,7 +202,11 @@ export async function provisionProject(
       });
       result.argoRegistered = true;
     } catch (e: any) {
-      console.error(`[${tag}] argo register failed for ${slug}:`, e?.message);
+      console.error(`[${tag}] argo register failed for ${slug} — marking project failed:`, e?.message);
+      // Without the Application nothing will ever deploy this repo; that's not
+      // `ready` either.
+      await markFailed();
+      return result;
     }
   }
 
@@ -173,6 +214,7 @@ export async function provisionProject(
   // `ready` so the portal's initializing screen redirects to the detail page
   // and the MCP path (which awaits this) returns a ready project. Best-effort
   // and logged — a DB hiccup here shouldn't change provisionProject's contract.
+  result.status = 'ready';
   try { await setProjectStatus(project.id, 'ready'); }
   catch (e: any) { console.error(`[${tag}] could not mark ${slug} ready:`, e?.message); }
 

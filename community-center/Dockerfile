@@ -7,6 +7,7 @@
 #
 # Two-stage: install production deps in a builder, copy the slim node_modules
 # into the runtime image so the npm cache never ships.
+{{CV_COOLDEPS_DOCKER_ENV}}
 FROM node:20-alpine AS deps
 WORKDIR /app
 # .npmrc is copied with the manifests so `npm install` honors the platform's

@@ -469,19 +469,23 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
     }
     // Unified provisioning (shared with the MCP create_project tool): seals the
     // namespace baseline first, then provisions repo/postgres/manifests/argocd.
-    // Best-effort — never fail creation on a downstream error; the project row
-    // is the source of truth and a reconciler can retry from it.
+    // Never fails creation on a downstream error — the project row survives —
+    // but provisionProject itself flips the status: `ready` only on the full
+    // happy path, `failed` when the project never reached a deployable state
+    // (there is no reconciler; a failed project is surfaced as such).
     //
     // Provisioning takes ~a minute, so we DON'T await it here — we redirect
     // immediately to the project page, which renders the "initializing" screen
-    // while status is `provisioning`. provisionProject flips status to `ready`
-    // at the end of its happy path; the catch below covers a rare hard throw.
+    // while status is `provisioning`. The catch below covers a rare hard throw.
     // The post-provision repo-access converge for internal projects moves into
-    // the `.then` so it still runs once the repo actually exists.
+    // the `.then` so it runs once the repo actually exists (and is skipped when
+    // provisioning failed — there may be no repo to converge).
     provisionProject(project, caps, {
       ownerUsername: session.preferredUsername, email: session.email, logTag: 'dashboard',
     })
-      .then(() => { if (visible === 'internal') return syncRepoAccess(project); })
+      .then((prov) => {
+        if (visible === 'internal' && prov.status === 'ready') return syncRepoAccess(project);
+      })
       .catch((e: any) => {
         console.error(`[dashboard] provisioning failed for ${project.slug}:`, e?.message);
         setProjectStatus(project.id, 'failed').catch(() => {});

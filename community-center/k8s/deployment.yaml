@@ -4,6 +4,12 @@
 # hand-edit the container list; toggle capabilities in the portal (or via the
 # `set_capabilities` MCP tool) and the platform rewrites this file.
 #
+# This reference copy shows ALL capabilities enabled. In a generated file the
+# DATABASE_URL / S3_* entries appear only when their capability is on (so the
+# referenced `postgres` / `garage` Secret always exists) — but when a
+# capability IS on, its creds are projected into EVERY container, not just
+# the one that serves it.
+#
 # The image tag is immutable: every push to `main` runs the Build workflow,
 # which timestamps a new tag (YYYYMMDDHHMMSS), pushes one image to the
 # in-cluster registry, and asks the portal to pin every container below to
@@ -42,6 +48,52 @@ spec:
           env:
             - name: PORT
               value: "8080"
+            # Per-user isolation by default. The portal sets this to "true"
+            # when the project's "data is shared across users" box is ticked.
+            - name: CV_SHARED
+              value: "false"
+            # Cross-capability credentials: EVERY container in the pod gets
+            # the creds of every enabled stateful capability, not just the one
+            # it serves — same image, one pod, one author — so e.g. the
+            # storage server can record a download in the database. Only
+            # DATABASE_URL is projected from the `postgres` Secret (keeps
+            # POSTGRES_PASSWORD out of each process's environ and crash
+            # dumps), and the six S3_* keys from the `garage` Secret.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: DATABASE_URL
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ENDPOINT
+            - name: S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_REGION
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_BUCKET
+            - name: S3_FORCE_PATH_STYLE
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_FORCE_PATH_STYLE
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ACCESS_KEY_ID
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_SECRET_ACCESS_KEY
           resources:
             requests:
               cpu: 25m
@@ -78,19 +130,46 @@ spec:
             - name: http-api
               containerPort: 3000
           env:
+            # Same cross-capability env as static-site (see comments there).
             - name: PORT
               value: "3000"
-            # Per-user isolation by default. The portal sets this to "true"
-            # when the project's "data is shared across users" box is ticked.
             - name: CV_SHARED
               value: "false"
-            # Only DATABASE_URL is projected — keeps POSTGRES_PASSWORD out of
-            # every child process's environ and crash dumps.
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: postgres
                   key: DATABASE_URL
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ENDPOINT
+            - name: S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_REGION
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_BUCKET
+            - name: S3_FORCE_PATH_STYLE
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_FORCE_PATH_STYLE
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ACCESS_KEY_ID
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_SECRET_ACCESS_KEY
           resources:
             requests:
               cpu: 25m
@@ -127,12 +206,16 @@ spec:
             - name: http-files
               containerPort: 7000
           env:
+            # Same cross-capability env as static-site (see comments there).
             - name: PORT
               value: "7000"
             - name: CV_SHARED
               value: "false"
-            # The platform projects the S3 connection + credentials from the
-            # per-project `garage` Secret (created when storage is enabled).
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: DATABASE_URL
             - name: S3_ENDPOINT
               valueFrom:
                 secretKeyRef:
@@ -199,10 +282,46 @@ spec:
             - name: http-mcp
               containerPort: 9000
           env:
+            # Same cross-capability env as static-site (see comments there).
             - name: PORT
               value: "9000"
             - name: CV_SHARED
               value: "false"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: DATABASE_URL
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ENDPOINT
+            - name: S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_REGION
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_BUCKET
+            - name: S3_FORCE_PATH_STYLE
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_FORCE_PATH_STYLE
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_ACCESS_KEY_ID
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: garage
+                  key: S3_SECRET_ACCESS_KEY
           resources:
             requests:
               cpu: 25m

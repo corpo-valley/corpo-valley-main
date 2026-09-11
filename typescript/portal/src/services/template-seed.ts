@@ -3,8 +3,11 @@
 //
 // Lifecycle model: the baseline in code is the FACTORY DEFAULT. The portal
 // pushes it to Gitea exactly once — on startup, only when the Gitea repo is
-// missing or empty. From then on Gitea is the source of truth: platform
-// admins edit the template there, and every new project generates from
+// missing, empty, or lacks the SEED_SENTINEL marking a completed seed. A repo
+// with files but no sentinel (interrupted seed, or seeded before the sentinel
+// existed) is ADOPTED: only missing baseline files are written, existing
+// content is never touched. Once seeded, Gitea is the source of truth:
+// platform admins edit the template there, and every new project generates from
 // whatever it currently holds. The baseline is pushed again only on an
 // explicit reset (POST /admin/template/reset), which makes the Gitea repo
 // match the baseline exactly — including deleting files admins added.
@@ -50,12 +53,31 @@ const COOLDEPS_AGENTS_NOTE = COOLDEPS_ENABLED
     + `This platform proxies npm/PyPI/Go installs through **cooldeps**, which blocks\n`
     + `brand-new (within a cooldown window), badly-licensed, or known-vulnerable\n`
     + `releases. The build pipeline and this repo's \`.npmrc\` are already wired to it,\n`
-    + `so a normal push-and-build flow needs no extra setup.\n\n`
+    + `so a normal push-and-build flow needs no extra setup. If you add a Python or\n`
+    + `Go build stage to the Dockerfile, uncomment the cooldeps ENV lines there so\n`
+    + `those installs go through the same gate.\n\n`
     + `If a dependency is rejected, that's policy — **don't** work around it by removing\n`
     + `\`.npmrc\` or switching registries. A brand-new package usually just needs to age\n`
     + `out of the cooldown; otherwise ask an admin to add an override on the portal's\n`
     + `cooldeps page. MCP-connected agents: call \`how_corpo_valley_works\` topic\n`
     + `\`cooldeps\` for details.\n`
+  : '';
+
+// Commented ENV lines for the template Dockerfile. npm is covered by the
+// rendered .npmrc, but a user who adds a Python or Go build stage needs the
+// pip/uv/Go knobs too (CI runners inherit them from the platform; in-image
+// installs only see what the repo ships). Rendered as comments because the
+// stock template has no Python/Go stage — and ENV doesn't cross FROM
+// boundaries anyway — so the wiring is one uncomment away in whatever stage
+// needs it. Same GOPROXY form as the platform docs (mcp-docs.ts).
+const COOLDEPS_DOCKER_ENV = COOLDEPS_ENABLED
+  ? `\n# Managed by Corpo Valley: cooldeps gates pip and Go installs too, not just\n`
+    + `# npm. If you add a Python or Go build stage, copy these ENV lines\n`
+    + `# (uncommented) into that stage — ENV doesn't cross FROM boundaries — so\n`
+    + `# its installs go through the same gate as npm's .npmrc:\n`
+    + `#   ENV PIP_INDEX_URL=${COOLDEPS_INTERNAL_URL}/pypi/simple\n`
+    + `#   ENV UV_INDEX_URL=${COOLDEPS_INTERNAL_URL}/pypi/simple\n`
+    + `#   ENV GOPROXY=${COOLDEPS_INTERNAL_URL}/go,direct\n`
   : '';
 
 // Locate the baseline tree. In the container it's /app/community-center
@@ -73,6 +95,8 @@ function findBaselineDir(): string | null {
   return null;
 }
 
+// CANONICAL placeholder list. scripts/sync-community-center-template.sh
+// renders the same set for the manual escape hatch — keep them in lockstep.
 const RENDER_VARS: Record<string, string> = {
   '{{CV_REGISTRY}}': CV_REGISTRY,
   '{{CV_PORTAL_PIN_URL}}': `${PORTAL_INTERNAL_URL}/internal/projects`,
@@ -80,10 +104,11 @@ const RENDER_VARS: Record<string, string> = {
   '{{CV_PORTAL_LOGIN_URL}}': `${PORTAL_PUBLIC_URL}/login`,
   '{{CV_KRATOS_PUBLIC_URL}}': KRATOS_CLUSTER_URL,
   '{{CV_PROJECTS_DOMAIN}}': PROJECTS_DOMAIN,
-  // Empty string when cooldeps is off, so the .npmrc / AGENTS.md placeholders
-  // disappear cleanly on deployments that don't run the gate.
+  // Empty string when cooldeps is off, so the .npmrc / AGENTS.md / Dockerfile
+  // placeholders disappear cleanly on deployments that don't run the gate.
   '{{CV_COOLDEPS_NPMRC}}': COOLDEPS_NPMRC,
   '{{CV_COOLDEPS_NOTE}}': COOLDEPS_AGENTS_NOTE,
+  '{{CV_COOLDEPS_DOCKER_ENV}}': COOLDEPS_DOCKER_ENV,
 };
 
 export function renderTemplateFile(content: string): string {
@@ -133,6 +158,15 @@ function gitBlobSha(content: string): string {
     .digest('hex');
 }
 
+// Sentinel written as the LAST file of every seed/reset. Its presence is what
+// marks the Gitea repo as fully seeded (and therefore admin-owned): the seed
+// pushes one Contents-API commit per file, so an interrupted first seed leaves
+// a partial tree — without the sentinel that partial tree would be mistaken
+// for admin content and skipped forever. Not part of the baseline tree on
+// disk; Gitea's generate-from-template copies it into project repos, which is
+// harmless (nothing reads it there — manifests.ts only touches k8s/).
+export const SEED_SENTINEL = '.cv-template-seeded';
+
 export interface SeedResult {
   action: 'seeded' | 'reset' | 'skipped' | 'disabled';
   reason?: string;
@@ -166,11 +200,25 @@ export async function seedCommunityCenterTemplate(
   }
 
   const existing = await getTreeFiles({ owner, repo: repoName });
-  // auto_init's README.md is sync residue, not admin content — a repo holding
-  // only that still counts as empty for the seed-if-absent check.
-  const hasAdminContent = existing.some((e) => e.path !== 'README.md');
-  if (!created && hasAdminContent && !opts.force) {
-    return { action: 'skipped', reason: 'template repo already has content (admin-owned)' };
+  // Seeded = the sentinel exists. It's written LAST, so its presence implies
+  // every baseline file landed; only then is the repo admin-owned. Files
+  // WITHOUT the sentinel are the leftovers of an interrupted seed (the
+  // Contents-API pushes one commit per file) — resume/overwrite them rather
+  // than treating them as admin content. auto_init's README.md is sync
+  // residue either way.
+  const seeded = existing.some((e) => e.path === SEED_SENTINEL);
+  if (!created && seeded && !opts.force) {
+    return { action: 'skipped', reason: 'template repo already seeded (admin-owned)' };
+  }
+  // Files but no sentinel: either an interrupted seed, or a repo seeded before
+  // the sentinel existed (every pre-upgrade deployment). We can't tell which,
+  // and the latter may hold admin edits — so ADOPT rather than reset: write
+  // only missing baseline files, never overwrite or delete what's there, then
+  // mark it seeded. A force reset keeps full overwrite+sweep semantics.
+  const adopt = !created && !seeded && !opts.force
+    && existing.some((e) => e.path !== 'README.md');
+  if (adopt) {
+    console.warn(`[template-seed] ${owner}/${repoName} has files but no ${SEED_SENTINEL} — adopting: writing missing baseline files only, existing content untouched`);
   }
 
   // The generate endpoint refuses non-template sources; make sure the flag is
@@ -187,6 +235,7 @@ export async function seedCommunityCenterTemplate(
   for (const [relPath, content] of baseline) {
     const prevSha = existingByPath.get(relPath);
     if (prevSha && prevSha === gitBlobSha(content)) continue;
+    if (adopt && prevSha) continue; // adopting — never clobber existing content
     await upsertRepoFile({
       owner, repo: repoName, path: relPath, content,
       sha: prevSha,
@@ -195,13 +244,33 @@ export async function seedCommunityCenterTemplate(
     written++;
   }
   for (const e of existing) {
+    if (adopt) break; // adopting — extra files are (potential) admin content
     if (baseline.has(e.path)) continue;
+    // Never sweep the sentinel — it's platform metadata, not baseline content,
+    // and it's (re)written below as the seed's final commit.
+    if (e.path === SEED_SENTINEL) continue;
     await deleteRepoFile({
       owner, repo: repoName, path: e.path, sha: e.sha,
       message: `platform: ${opts.force ? 'reset' : 'seed'} — remove ${e.path} (not in baseline)`,
     });
     deleted++;
   }
+
+  // Write the sentinel LAST — only a seed that pushed every file above gets to
+  // mark the repo as seeded, which is what makes an interrupted run resumable.
+  // Content is informational; presence is what the skip check reads.
+  await upsertRepoFile({
+    owner, repo: repoName, path: SEED_SENTINEL,
+    content:
+      `Written by the Corpo Valley portal as the FINAL step of a template ${opts.force ? 'reset' : 'seed'}.\n`
+      + `Its presence marks the seed complete (repo is admin-owned). If deleted, the\n`
+      + `next portal startup re-adds any missing baseline files (existing files are\n`
+      + `left alone) and rewrites this marker.\n`
+      + `completed_at: ${new Date().toISOString()}\n`,
+    sha: existingByPath.get(SEED_SENTINEL),
+    message: `platform: mark template ${opts.force ? 'reset' : 'seed'} complete`,
+  });
+  written++;
 
   return { action: opts.force && !created ? 'reset' : 'seeded', written, deleted };
 }

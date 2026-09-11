@@ -48,8 +48,11 @@ projects calling your Services directly). That edge overwrite — not anything i
 your container — is what makes a forged identity impossible.
 
 - Resolve the caller with `resolveUser(req)` from `lib/identity.js` — it returns
-  `{ id, email, perm }` or `null`. The `database`, `storage`, and `mcp` modules
-  already do this.
+  `{ id, email, perm }` or `null`. The `database` and `storage` modules already
+  do this. The `mcp` module does NOT use the helper: it sits behind the MCP
+  gateway (not the project Ingress), which OAuth-authenticates the caller and
+  forwards `X-User-Id` / `X-User-Email` / `X-CV-Perm` — see how
+  `mcp/server.js` reads those headers directly.
 - **Gate every mutating route with `requirePerm('write')`** (also from
   `lib/identity.js`): it 401s unauthenticated callers, 403s anyone below the
   class, and sets `req.userId` / `req.userEmail` / `req.userPerm`. GETs are

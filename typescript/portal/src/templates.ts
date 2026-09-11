@@ -1254,7 +1254,7 @@ export function renderProjectInitializing(
     body += `
       <div class="app-card init-card">
         <h2>🌱 ${escapeHtml(project.name)}</h2>
-        <div class="message error" style="text-align:left;">Provisioning hit a snag — the platform will keep retrying in the background.</div>
+        <div class="message error" style="text-align:left;">Provisioning failed — this project never reached a deployable state. Delete it and create it again, or contact a platform admin.</div>
         <div class="init-actions">
           <a href="/" class="btn btn-secondary">← Back to projects</a>
         </div>

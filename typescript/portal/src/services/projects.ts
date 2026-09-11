@@ -63,11 +63,14 @@ export function isGrantLevel(value: string): value is GrantLevel {
 }
 
 // Lifecycle of a project's external resources. New projects start
-// `provisioning` and flip to `ready` the moment provisionProject finishes its
-// happy path (shared by both the portal fire-and-forget path and the awaited
-// MCP path). `failed` is set only when provisioning throws hard out of the
-// portal's fire-and-forget call. Existing rows pre-date the column and default
-// to `ready` (they are already provisioned).
+// `provisioning` and flip to `ready` only when provisionProject finishes its
+// full happy path (shared by both the portal fire-and-forget path and the
+// awaited MCP path). `failed` is set by provisionProject itself when the
+// project never reached a deployable state (namespace seal, repo generation,
+// manifest rendering, or ArgoCD registration failed), and by the portal's
+// fire-and-forget catch on a hard throw. There is no reconciler: a failed
+// project stays failed until deleted/recreated. Existing rows pre-date the
+// column and default to `ready` (they are already provisioned).
 export type ProjectStatus = 'provisioning' | 'ready' | 'failed';
 
 export interface Project {
@@ -457,8 +460,8 @@ export async function createProject(input: {
 }
 
 // Update a project's provisioning lifecycle status. Best-effort UPDATE called
-// from provisionProject (→ 'ready') and the portal's fire-and-forget catch
-// (→ 'failed').
+// from provisionProject (→ 'ready' or 'failed') and the portal's
+// fire-and-forget catch (→ 'failed').
 export async function setProjectStatus(id: string, status: ProjectStatus): Promise<void> {
   await pool.query('UPDATE projects SET status = $2 WHERE id = $1', [id, status]);
 }

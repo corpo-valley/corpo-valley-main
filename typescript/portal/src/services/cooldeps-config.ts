@@ -53,7 +53,15 @@ export const DEFAULT_COOLDEPS_CONFIG: CooldepsConfig = {
     releaseAge: { minDays: 14, warnOnly: false, blockOnUnknown: false },
     cve: { maxSeverity: 'HIGH', warnOnly: false },
     license: {
-      allow: ['MIT', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC'],
+      // The permissive core set, plus licenses the PLATFORM ITSELF depends on
+      // under ENFORCING policy — without these, every first project image
+      // build and/or the required scan checks fail out of the box:
+      //   0BSD        — tslib, shipped by the template's own lockfile
+      //   MPL-2.0     — certifi, pulled in by `pip install semgrep` (scan.yaml)
+      //   LGPL-2.1    — semgrep itself (scan.yaml's required *semgrep* check)
+      //   BlueOak-1.0.0 — common in modern npm deps (permissive, OSI-adjacent)
+      allow: ['MIT', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC',
+        '0BSD', 'MPL-2.0', 'LGPL-2.1', 'BlueOak-1.0.0'],
       block: ['GPL-3.0', 'AGPL-3.0'],
       warnOnUnknown: true,
     },
