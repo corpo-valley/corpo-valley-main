@@ -180,8 +180,8 @@ router.get('/', requireSession, async (req: Request, res: Response) => {
 });
 
 // GET /achievements — the signed-in resident's own badge board. Awards any
-// newly-crossed thresholds, then renders the full catalog (earned + locked with
-// progress). GET-only: no CSRF prefix, no verified-email gate to view.
+// newly-crossed thresholds, then renders ONLY earned badges (unearned ones are
+// a surprise). GET-only: no CSRF prefix, no verified-email gate to view.
 router.get('/achievements', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
