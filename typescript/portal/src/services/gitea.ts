@@ -93,25 +93,49 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
-// One-shot inventory of every repo the platform admin token can see — all of
-// them, public AND private (verified against live Gitea: repos/search with the
-// cvportal admin token returns private repos too). Keyed by full_name
-// (`owner/repo`) → ISO `updated_at`. Powers the Community Feed's "last updated"
-// sort with a single call instead of one-per-project. Paginates because Gitea
-// caps a page at 50; stops when a page comes back short.
-export async function getRepoUpdatedAtMap(): Promise<Map<string, string>> {
+// Repo `updated_at` turned out to be useless for "last active": Gitea bumps it
+// on ANY repo-table write, and platform-wide admin sweeps (branch-protection
+// reconcile, secret writes, portal-restart backfills) touch every repo at once,
+// so the whole Community Feed showed one identical timestamp. The last commit
+// on the default branch is what "last active" actually means, so fetch that
+// instead — one cheap commits?limit=1 call per repo, bounded concurrency, and
+// a short cache so a busy feed doesn't hammer Gitea.
+const LAST_COMMIT_TTL_MS = 5 * 60 * 1000;
+const lastCommitCache = new Map<string, { iso: string | null; at: number }>();
+
+async function fetchLastCommitIso(fullName: string): Promise<string | null> {
+  try {
+    const body = await call<Array<{ commit?: { committer?: { date?: string }; author?: { date?: string } } }>>(
+      `/repos/${fullName}/commits?limit=1&stat=false&verification=false&files=false`
+    );
+    const c = body?.[0]?.commit;
+    return c?.committer?.date || c?.author?.date || null;
+  } catch {
+    return null; // empty repo (409) or transient error — degrade to fallback
+  }
+}
+
+// Map of `owner/repo` → ISO timestamp of the latest default-branch commit.
+// Best-effort: repos that fail (or have no commits) are simply absent, and the
+// caller falls back to other signals. Results are cached for 5 minutes.
+export async function getRepoLastCommitMap(fullNames: string[]): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   if (!giteaEnabled()) return map;
-  const limit = 50;
-  for (let page = 1; ; page++) {
-    const body = await call<{ data?: Array<{ full_name?: string; updated_at?: string }> }>(
-      `/repos/search?limit=${limit}&page=${page}`
-    );
-    const repos = body.data ?? [];
-    for (const r of repos) {
-      if (r.full_name && r.updated_at) map.set(r.full_name, r.updated_at);
-    }
-    if (repos.length < limit) break;
+  const now = Date.now();
+  const wanted = [...new Set(fullNames)];
+  const misses = wanted.filter((n) => {
+    const hit = lastCommitCache.get(n);
+    return !hit || now - hit.at > LAST_COMMIT_TTL_MS;
+  });
+  const CONCURRENCY = 5;
+  for (let i = 0; i < misses.length; i += CONCURRENCY) {
+    const batch = misses.slice(i, i + CONCURRENCY);
+    const isos = await Promise.all(batch.map((n) => fetchLastCommitIso(n)));
+    batch.forEach((n, j) => lastCommitCache.set(n, { iso: isos[j], at: now }));
+  }
+  for (const n of wanted) {
+    const iso = lastCommitCache.get(n)?.iso;
+    if (iso) map.set(n, iso);
   }
   return map;
 }
