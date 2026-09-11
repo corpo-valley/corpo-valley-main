@@ -6,6 +6,7 @@
 // carried over from the reference portal.
 
 import { cspNonce } from './lib/csp-nonce';
+import type { Badge, ProjectMetrics } from './services/achievements';
 import {
   GITEA_PUBLIC_URL, PROJECTS_DOMAIN, BASE_DOMAIN,
   PORTAL_PUBLIC_URL, MCP_ENDPOINT_URL, OAUTH_PUBLIC_URL,
@@ -212,6 +213,33 @@ const CSS = `
   .badge-ADMIN { background: #7f3d1d; color: #f3a5a5; }
   .badge-USER { background: #4d6624; color: #c3e0a0; }
   .badge-access { background: #4a3c2c; color: #c4b698; }
+  .badge-achievement { background: #4a3c2c; color: #e8b94a; text-transform: none; letter-spacing: 0; }
+
+  /* Achievements board */
+  .achv-cat { font-size: 1rem; color: #e8b94a; margin: 1.6rem 0 0.2rem; border-bottom: 1px solid #4a3c2c; padding-bottom: 0.3rem; }
+  .achv-cat-count { color: #9c8a70; font-weight: 500; font-size: 0.85rem; }
+  .achv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1rem; margin-top: 1rem; }
+  .achv-card { border: 1px solid #5a4a36; border-radius: 8px; padding: 1rem; background: #322619; position: relative; }
+  .achv-card.earned { border-color: #e8b94a; background: #3a2f1c; }
+  .achv-card.locked { opacity: 0.72; }
+  .achv-emoji { font-size: 1.9rem; line-height: 1; filter: grayscale(1); }
+  .achv-card.earned .achv-emoji { filter: none; }
+  .achv-name { font-weight: 700; color: #f3ead9; margin: 0.4rem 0 0.15rem; }
+  .achv-rule { font-size: 0.82rem; color: #c4b698; margin: 0; }
+  .achv-meta { margin-top: 0.6rem; font-size: 0.75rem; color: #9c8a70; }
+  .achv-check { position: absolute; top: 0.75rem; right: 0.9rem; color: #84a25a; font-weight: 700; }
+  .achv-bar { height: 6px; border-radius: 9999px; background: #2b2118; margin-top: 0.55rem; overflow: hidden; }
+  .achv-bar > span { display: block; height: 100%; background: #84a25a; }
+  .chip-row { display: inline-flex; gap: 0.3rem; flex-wrap: wrap; vertical-align: middle; }
+
+  /* Project engagement metrics strip */
+  .metric-strip { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin: 0.5rem 0 0.2rem; font-size: 0.85rem; color: #c4b698; }
+  .metric b { color: #f3ead9; font-weight: 700; }
+  .metric-hot { color: #e8b94a; }
+
+  /* Badge-earned toast banner */
+  .toast-badges { border: 1px solid #e8b94a; background: #3a2f1c; color: #f3ead9; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.75rem; }
+  .toast-badges .toast-close { margin-left: auto; background: none; border: none; color: #c4b698; font-size: 1.1rem; cursor: pointer; line-height: 1; }
 
   /* Tables */
   .table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
@@ -657,6 +685,79 @@ export function roleBadge(isAdmin: boolean): string {
     : '<span class="badge badge-USER">User</span>';
 }
 
+export interface BadgeChip { key: string; name: string; emoji: string; }
+
+// A small pill used to surface an earned badge on other surfaces (project cards,
+// Community Feed). Pass already-shaped, trusted metadata (name/emoji from the
+// catalog) — never user input.
+export function badgeChip(c: BadgeChip): string {
+  return `<span class="badge badge-achievement" title="${escapeHtml(c.name)}">${c.emoji} ${escapeHtml(c.name)}</span>`;
+}
+
+function achievementCard(b: Badge): string {
+  const pct = Math.max(0, Math.min(100, Math.round((b.have / b.need) * 100)));
+  const progress = b.earned
+    ? (b.since ? `Earned ${escapeHtml(b.since.slice(0, 10))}` : 'Earned')
+    : `${b.have} / ${b.need}`;
+  const bar = b.earned ? '' : `<div class="achv-bar"><span style="width:${pct}%"></span></div>`;
+  return `
+    <div class="achv-card ${b.earned ? 'earned' : 'locked'}">
+      ${b.earned ? '<span class="achv-check">✓</span>' : ''}
+      <div class="achv-emoji">${b.emoji}</div>
+      <p class="achv-name">${escapeHtml(b.name)}</p>
+      <p class="achv-rule">${escapeHtml(b.rule)}</p>
+      <div class="achv-meta">${progress}</div>
+      ${bar}
+    </div>`;
+}
+
+function achievementsBoard(badges: Badge[]): string {
+  const earned = badges.filter((b) => b.earned).length;
+  // badges arrive in catalog order (already grouped by category); emit a
+  // section heading whenever the category changes.
+  const sections: string[] = [];
+  let current = '';
+  let open = false;
+  for (const b of badges) {
+    if (b.category !== current) {
+      if (open) sections.push('</div>');
+      const done = badges.filter((x) => x.category === b.category && x.earned).length;
+      const total = badges.filter((x) => x.category === b.category).length;
+      sections.push(`<h2 class="achv-cat">${escapeHtml(b.category)} <span class="achv-cat-count">${done}/${total}</span></h2>`);
+      sections.push('<div class="achv-grid">');
+      current = b.category;
+      open = true;
+    }
+    sections.push(achievementCard(b));
+  }
+  if (open) sections.push('</div>');
+  return `
+    <p class="tagline">${earned} of ${badges.length} badges earned — keep planting and being a good neighbor.</p>
+    ${sections.join('\n')}`;
+}
+
+export function renderAchievements(
+  email: string,
+  badges: Badge[],
+  isAdmin: boolean,
+  newBadges: BadgeChip[] = [],
+): string {
+  return dashboardLayout('Achievements', achievementsBoard(badges), email, isAdmin, 'achievements', { newBadges });
+}
+
+export function renderPublicProfile(
+  email: string,
+  isAdmin: boolean,
+  displayName: string,
+  badges: Badge[],
+): string {
+  const body = `
+    <p class="tagline">${escapeHtml(displayName)}'s badges in the valley.</p>
+    ${achievementsBoard(badges)}
+    <div style="margin-top:1.5rem;"><a href="/community">← Back to Community</a></div>`;
+  return dashboardLayout(`${displayName}'s Achievements`, body, email, isAdmin, 'community');
+}
+
 interface NavItem { label: string; href: string; key: string; }
 
 function dashboardLayout(
@@ -667,15 +768,24 @@ function dashboardLayout(
   activeNav: string,
   // Optional extra markup injected into <head> (e.g. a no-JS meta refresh on
   // the initializing screen). Trusted, static, caller-supplied markup only —
-  // never interpolate user input here.
-  opts: { headExtra?: string } = {}
+  // never interpolate user input here. `newBadges` renders a one-time
+  // badge-earned toast (metadata is from the trusted catalog).
+  opts: { headExtra?: string; newBadges?: BadgeChip[] } = {}
 ): string {
   const navItems: NavItem[] = [
     { label: 'Projects', href: '/', key: 'projects' },
     { label: 'Community', href: '/community', key: 'community' },
+    { label: 'Achievements', href: '/achievements', key: 'achievements' },
     { label: 'Groups', href: '/groups', key: 'groups' },
     { label: 'Connect Claude Code', href: '/connect', key: 'connect' },
   ];
+  const toast = opts.newBadges && opts.newBadges.length
+    ? `<div class="toast-badges" data-toast>
+        <span style="font-size:1.4rem;">🏆</span>
+        <span>You earned <strong>${opts.newBadges.map((b) => `${b.emoji} ${escapeHtml(b.name)}`).join(', ')}</strong>! <a href="/achievements">View your board →</a></span>
+        <button class="toast-close" data-dismiss-toast aria-label="Dismiss">&times;</button>
+      </div>`
+    : '';
   let adminNav = '';
   if (isAdmin) {
     adminNav = `
@@ -712,6 +822,7 @@ function dashboardLayout(
     </nav>
     <main class="main">
       <h1>${escapeHtml(title)}</h1>
+      ${toast}
       ${bodyHtml}
 ${SITE_FOOTER}
     </main>
@@ -737,6 +848,13 @@ ${SITE_FOOTER}
         if (form && form.getAttribute && form.hasAttribute('data-confirm')) {
           if (!window.confirm(form.getAttribute('data-confirm'))) e.preventDefault();
         }
+      });
+      // Dismiss the badge-earned toast.
+      document.addEventListener('click', function(e){
+        var x = e.target && e.target.closest ? e.target.closest('[data-dismiss-toast]') : null;
+        if (!x) return;
+        var t = x.closest('[data-toast]');
+        if (t && t.parentNode) t.parentNode.removeChild(t);
       });
       // Copy-to-clipboard for buttons carrying data-copy-target="<elementId>".
       document.addEventListener('click', function(e){
@@ -808,7 +926,7 @@ function accessBadge(value: string): string {
 // The sort axes the feed offers. `created`/`updated` render newest-first;
 // `creator` is alphabetical by email. Shared with routes/dashboard.ts so the
 // route and template agree on the valid set.
-export const COMMUNITY_SORTS = ['created', 'creator', 'updated'] as const;
+export const COMMUNITY_SORTS = ['created', 'creator', 'updated', 'popular', 'trending'] as const;
 export type CommunitySort = (typeof COMMUNITY_SORTS)[number];
 
 // Sort direction. Validated by the route the same way `sort` is.
@@ -822,6 +940,8 @@ export const COMMUNITY_DEFAULT_DIR: Record<CommunitySort, CommunityDir> = {
   created: 'desc',
   updated: 'desc',
   creator: 'asc',
+  popular: 'desc',
+  trending: 'desc',
 };
 
 export interface CommunityRow {
@@ -833,6 +953,12 @@ export interface CommunityRow {
   updatedAt: string; // pre-formatted absolute date (tooltip)
   createdRel: string; // relative "2d ago" label
   updatedRel: string; // relative "3w ago" label
+  creatorUsername?: string; // owner's preferred_username, for the profile link
+  creatorBadges: BadgeChip[]; // owner's earned badges (from the grant cache)
+  visitors: number;   // distinct site visitors (popularity)
+  builds: number;     // deploys shipped
+  contributors: number; // distinct PR authors/mergers
+  trending: boolean;  // had views in the last 7 days
 }
 
 export function renderCommunityFeed(
@@ -862,8 +988,11 @@ export function renderCommunityFeed(
     };
   };
 
+  const quickSort = (key: CommunitySort, label: string) =>
+    `<a class="cf-quick${sort === key ? ' is-active' : ''}" href="/community?sort=${key}&dir=${COMMUNITY_DEFAULT_DIR[key]}">${label}</a>`;
   let body = `
     <p class="tagline">Internal projects shared across the valley. Open one to see what folks are building.</p>
+    <div class="cf-quicksort">Sort: ${quickSort('trending', '🔥 Trending')} ${quickSort('popular', '👀 Popular')} ${quickSort('updated', '🕒 Recently active')} ${quickSort('created', '🆕 Newest')}</div>
   `;
 
   if (rows.length === 0) {
@@ -878,8 +1007,9 @@ export function renderCommunityFeed(
   }
 
   const creatorH = sortHeader('creator', 'Creator');
+  const popularH = sortHeader('popular', 'Popularity');
   const createdH = sortHeader('created', 'Created');
-  const updatedH = sortHeader('updated', 'Last updated');
+  const updatedH = sortHeader('updated', 'Last active');
 
   body += `
     <style>
@@ -903,6 +1033,13 @@ export function renderCommunityFeed(
       .table tr.cf-row:hover td { background: #3a2e22; }
       .cf-nomatch { display: none; }
       .cf-nomatch td { color: #a89878; text-align: center; padding: 1.5rem 0.75rem; font-style: italic; }
+      .cf-metrics { white-space: nowrap; color: #c4b698; font-size: 0.85rem; }
+      .cf-metrics span { margin-right: 0.35rem; }
+      .cf-trending { color: #e8b94a; }
+      .cf-quicksort { margin: 0.25rem 0 0.5rem; font-size: 0.85rem; color: #a89878; }
+      .cf-quick { display: inline-block; margin: 0 0.15rem; padding: 0.2rem 0.55rem; border-radius: 9999px; border: 1px solid #5a4a36; color: #c4b698; text-decoration: none; }
+      .cf-quick:hover { border-color: #e8b94a; color: #e8b94a; }
+      .cf-quick.is-active { background: #4a3c2c; color: #e8b94a; border-color: #e8b94a; }
     </style>
     <div class="cf-filter-wrap">
       <input type="text" id="cf-filter" class="cf-filter" placeholder="Filter by project or creator…"
@@ -913,6 +1050,7 @@ export function renderCommunityFeed(
         <th class="col-static">Project</th>
         <th class="col-static">Access</th>
         <th aria-sort="${creatorH.ariaSort}">${creatorH.html}</th>
+        <th aria-sort="${popularH.ariaSort}">${popularH.html}</th>
         <th aria-sort="${createdH.ariaSort}">${createdH.html}</th>
         <th aria-sort="${updatedH.ariaSort}">${updatedH.html}</th>
       </tr></thead>
@@ -927,7 +1065,18 @@ export function renderCommunityFeed(
             <div class="help" style="margin:0;">${host}</div>
           </td>
           <td>${accessBadge(r.sitePerm)}</td>
-          <td>${escapeHtml(r.creator)}</td>
+          <td>
+            ${r.creatorUsername
+              ? `<a href="/achievements/u/${encodeURIComponent(r.creatorUsername)}">${escapeHtml(r.creator)}</a>`
+              : escapeHtml(r.creator)}
+            ${r.creatorBadges.length ? `<div class="chip-row" style="margin-top:0.3rem;">${r.creatorBadges.map(badgeChip).join('')}</div>` : ''}
+          </td>
+          <td class="cf-metrics">
+            <span title="distinct visitors">👀 ${r.visitors}</span>
+            ${r.builds ? ` <span title="deploys shipped">🚀 ${r.builds}</span>` : ''}
+            ${r.contributors ? ` <span title="contributors">🤝 ${r.contributors}</span>` : ''}
+            ${r.trending ? ' <span class="cf-trending" title="active in the last 7 days">🔥</span>' : ''}
+          </td>
           <td><span title="${escapeHtml(r.createdAt)}">${escapeHtml(r.createdRel)}</span></td>
           <td><span title="${escapeHtml(r.updatedAt)}">${escapeHtml(r.updatedRel)}</span></td>
         </tr>`;
@@ -980,7 +1129,8 @@ export function renderProjects(
   email: string,
   projects: ProjectRow[],
   isAdmin: boolean,
-  shared: SharedProjectRow[] = []
+  shared: SharedProjectRow[] = [],
+  newBadges: BadgeChip[] = []
 ): string {
   let body = `
     <p class="tagline">Your patch of the valley — every app starts as a project.${isAdmin ? ` ${roleBadge(true)}` : ''}</p>
@@ -1050,7 +1200,7 @@ export function renderProjects(
     body += '</div>';
   }
 
-  return dashboardLayout('Projects', body, email, isAdmin, 'projects');
+  return dashboardLayout('Projects', body, email, isAdmin, 'projects', { newBadges });
 }
 
 // The "project initializing" screen shown right after async creation (POST
@@ -1334,7 +1484,8 @@ export function renderProjectDetail(
   secrets: ProjectSecretRow[] = [],
   secretMessage: { type: 'error' | 'success'; text: string } | null = null,
   grants: ProjectGrantRow[] = [],
-  groups: GroupOptionRow[] = []
+  groups: GroupOptionRow[] = [],
+  metrics: ProjectMetrics | null = null
 ): string {
   const secretsList = secrets.length === 0
     ? '<div class="message info">No secrets yet.</div>'
@@ -1367,6 +1518,18 @@ cd ${escapeHtml(project.slug)}
 claude`
     : '';
 
+  // Engagement metrics strip (popularity/activity from the town's ledger).
+  const m = metrics;
+  const metricsStrip = m
+    ? `<div class="metric-strip">
+        <span class="metric" title="distinct site visitors"><b>👀 ${m.visitors}</b> visitors</span>
+        <span class="metric" title="total site views"><b>${m.views}</b> views</span>
+        <span class="metric" title="deploys shipped"><b>🚀 ${m.builds}</b> builds</span>
+        <span class="metric" title="contributors (PR authors)"><b>🤝 ${m.contributors}</b> contributors</span>
+        ${m.views7d ? `<span class="metric metric-hot" title="views in the last 7 days">🔥 ${m.views7d} this week</span>` : ''}
+      </div>`
+    : '';
+
   // ── Overview card: name + live URL as the focal point; repo + created
   // are secondary metadata below.
   const overviewCard = `
@@ -1377,6 +1540,7 @@ claude`
           ${escapeHtml(project.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗
         </a>
       </div>
+      ${metricsStrip}
       <div style="font-size:0.8rem;color:#a89878;">
         ${project.giteaRepo
           ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `
