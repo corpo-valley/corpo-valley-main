@@ -800,7 +800,7 @@ function dashboardLayout(
       <a href="/admin/users"${activeNav === 'users' ? ' class="active"' : ''}>Users</a>
       <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>SSO Apps</a>
       <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
-      <a href="/admin/projects/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Project Resources</a>
+      <a href="/admin/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Resources</a>
       ${COOLDEPS_ENABLED ? `<a href="/admin/cooldeps"${activeNav === 'cooldeps' ? ' class="active"' : ''}>cooldeps</a>` : ''}
     `;
   }
@@ -2817,71 +2817,102 @@ function renderCommunityCenterAccessPanel(
   return html;
 }
 
-// ── Project Resources (per-project memory budget) ──────────
+// ── Resource management (platform defaults + per-project overrides) ────────
 
-export interface ResourceFieldView {
-  key: string;
-  label: string;
-  placeholder: string;  // the current platform default
-  help: string;
-  value: string;        // the admin's raw input, re-rendered on validation error
-}
-
-export interface ResourceGroupView {
-  title: string;
-  fields: ResourceFieldView[];
-}
-
-export interface ProjectResourcesResultView {
+export interface ResourcesResultView {
   ok: boolean;
-  slug: string;
   message: string;
-  // Per-volume storage outcomes (grown / unsupported / skipped), if a PVC grow
-  // was requested.
+  // Per-item outcomes: storage grows on the detail page, per-project results
+  // for the apply-all sweep on the index.
   details?: string[];
   // Set when a volume could not be expanded online — link the storage help page.
   helpLink?: boolean;
 }
 
-export function renderAdminProjectResources(
-  groups: ResourceGroupView[],
-  result: ProjectResourcesResultView | null,
+// One platform-default field on the index page's defaults card.
+export interface DefaultsFieldView {
+  key: string;
+  label: string;
+  help: string;
+  value: string;      // the current effective default (or the admin's raw input on error)
+  chartSeed: string;  // the chart-injected seed, shown muted for reference
+}
+
+export interface DefaultsGroupView {
+  title: string;
+  fields: DefaultsFieldView[];
+}
+
+export interface TenantDefaultsMetaView {
+  persisted: boolean;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+// One row of the index page's projects table.
+export interface ResourceProjectRow {
+  slug: string;
+  name: string;
+  owner: string;
+  customised: boolean;
+  overriddenKeys: string[];
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+// Shared success/error banner for the resources pages (same styling as the
+// cooldeps page's result banner).
+function resourceResultBanner(result: ResourcesResultView | null): string {
+  if (!result) return '';
+  const color = result.ok ? '#84a25a' : '#d9734a';
+  const bg = result.ok ? 'rgba(132,162,90,0.12)' : 'rgba(217,115,74,0.12)';
+  let banner = `${result.ok ? '✓' : '✗'} ${escapeHtml(result.message)}`;
+  if (result.details && result.details.length) {
+    banner += `<ul style="margin:0.5rem 0 0 1rem; padding:0;">`
+      + result.details.map((d) => `<li>${escapeHtml(d)}</li>`).join('') + `</ul>`;
+  }
+  if (result.helpLink) {
+    banner += `<div style="margin-top:0.5rem;">A volume's StorageClass can't be expanded online — `
+      + `see <a href="/admin/help/storage">how to take advantage of the new size</a>.</div>`;
+  }
+  return `<div style="margin-bottom:1rem; padding:0.75rem 1rem; border:1px solid ${color}; border-radius:4px; background:${bg};">${banner}</div>`;
+}
+
+// "2026-09-11T12:34:56.000Z" → "2026-09-11 12:34 UTC" for the meta lines.
+function whenLabel(iso: string | null): string {
+  if (!iso) return '';
+  return `${iso.slice(0, 16).replace('T', ' ')} UTC`;
+}
+
+// /admin/resources — the resource-management index: the platform-defaults card
+// (chart-seeded, DB-backed once saved) and the per-project overrides table.
+export function renderAdminResourcesIndex(
+  groups: DefaultsGroupView[],
+  meta: TenantDefaultsMetaView,
+  projects: ResourceProjectRow[],
+  result: ResourcesResultView | null,
   email: string,
   csrf: string = '',
-  slugValue: string = '',
 ): string {
-  let body = '';
+  let body = resourceResultBanner(result);
 
-  if (result) {
-    const color = result.ok ? '#84a25a' : '#d9734a';
-    const bg = result.ok ? 'rgba(132,162,90,0.12)' : 'rgba(217,115,74,0.12)';
-    let banner = `${result.ok ? '✓' : '✗'} <strong>${escapeHtml(result.slug)}</strong> — ${escapeHtml(result.message)}`;
-    if (result.details && result.details.length) {
-      banner += `<ul style="margin:0.5rem 0 0 1rem; padding:0;">`
-        + result.details.map((d) => `<li>${escapeHtml(d)}</li>`).join('') + `</ul>`;
-    }
-    if (result.helpLink) {
-      banner += `<div style="margin-top:0.5rem;">A volume's StorageClass can't be expanded online — `
-        + `see <a href="/admin/help/storage">how to take advantage of the new size</a>.</div>`;
-    }
-    body += `<div style="margin-bottom:1rem; padding:0.75rem 1rem; border:1px solid ${color}; border-radius:4px; background:${bg};">${banner}</div>`;
-  }
+  body += `<p>Platform-wide resource defaults for every project namespace
+    (<code>ResourceQuota</code> + <code>LimitRange</code>), and per-project
+    overrides on top. Saving defaults here does <strong>not</strong> touch
+    existing projects — use <em>Apply defaults to all existing projects</em>
+    below, or a project's own page, to push them out.</p>`;
 
-  body += `<p>Raise one project's resource budget — its <code>ResourceQuota</code>
-    + <code>LimitRange</code>, and (for storage) the size of its data volumes.
-    The platform applies these once at project creation, so a changed platform
-    default — or a per-project bump — only reaches an existing project through
-    here. Leave a field blank to <strong>keep that field's current value
-    unchanged</strong> (the placeholder shows the platform default for
-    reference). Overrides are <strong>up-only</strong>: you can grant more than
-    the default, not less.</p>`;
+  const metaLine = meta.persisted && meta.updatedAt
+    ? `Last saved ${escapeHtml(whenLabel(meta.updatedAt))}${meta.updatedBy ? ` by ${escapeHtml(meta.updatedBy)}` : ''}.`
+    : 'Showing chart defaults — never customised.';
 
-  const field = (f: ResourceFieldView) => `
+  const field = (f: DefaultsFieldView) => `
       <div class="field">
         <label>${escapeHtml(f.label)}</label>
         <input type="text" name="${escapeHtml(f.key)}" value="${escapeHtml(f.value)}"
-               placeholder="${escapeHtml(f.placeholder)}" autocomplete="off" spellcheck="false">
-        <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">${escapeHtml(f.help)}</div>
+               autocomplete="off" spellcheck="false">
+        <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">${escapeHtml(f.help)}
+          <span style="color:#6b5a42;">Chart default: ${escapeHtml(f.chartSeed)}.</span></div>
       </div>`;
 
   const sections = groups.map((g) => `
@@ -2891,18 +2922,171 @@ export function renderAdminProjectResources(
       </fieldset>`).join('');
 
   body += `
-    <form method="POST" action="/admin/projects/resources" style="max-width:34rem;">
+    <h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:1.5rem;">Platform defaults</h2>
+    <p style="color:#8a7a5a; font-size:0.85rem; margin:0.25rem 0 0.75rem;">${metaLine}</p>
+    <form method="POST" action="/admin/resources/defaults" style="max-width:34rem;">
       ${csrf}
-      <div class="field">
-        <label>Project slug</label>
-        <input type="text" name="slug" value="${escapeHtml(slugValue)}" required
-               placeholder="my-project" autocomplete="off" spellcheck="false">
-      </div>
       ${sections}
-      <button type="submit" class="btn">Apply to project</button>
+      <button type="submit" class="btn btn-primary">Save defaults</button>
+    </form>
+    <form method="POST" action="/admin/resources/apply-all" style="margin-top:0.75rem;"
+          data-confirm="Reconcile EVERY existing project's ResourceQuota/LimitRange to the platform defaults (plus each project's stored overrides)? Values below a project's current usage only block NEW pods.">
+      ${csrf}
+      <button type="submit" class="btn btn-secondary">Apply defaults to all existing projects</button>
     </form>`;
 
-  return dashboardLayout('Project Resources', body, email, true, 'resources');
+  const rows = projects.map((p) => {
+    const badge = p.customised
+      ? `<span class="badge badge-access">customised</span>
+         <span style="color:#8a7a5a; font-size:0.8rem;">${escapeHtml(p.overriddenKeys.join(', '))}</span>`
+      : '<span style="color:#8a7a5a;">defaults</span>';
+    const changed = p.updatedAt
+      ? `${escapeHtml(whenLabel(p.updatedAt))}${p.updatedBy ? `<br><span style="color:#8a7a5a;">${escapeHtml(p.updatedBy)}</span>` : ''}`
+      : '—';
+    return `
+        <tr>
+          <td><a href="/admin/resources/${escapeHtml(p.slug)}">${escapeHtml(p.name)}</a><br>
+              <code style="font-size:0.75rem;">${escapeHtml(p.slug)}</code></td>
+          <td>${escapeHtml(p.owner)}</td>
+          <td>${badge}</td>
+          <td>${changed}</td>
+        </tr>`;
+  }).join('');
+
+  body += `
+    <h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">Projects</h2>
+    ${projects.length === 0 ? '<p class="help">No projects yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Project</th><th>Owner</th><th>Budget</th><th>Last changed</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`}`;
+
+  return dashboardLayout('Resources', body, email, true, 'resources');
+}
+
+// One knob row on the per-project detail page.
+export interface ProjectResourceFieldRow {
+  key: string;
+  label: string;
+  help: string;
+  platformDefault: string;
+  overrideValue: string;        // '' = inherit the platform default
+  prefilledFromLive: boolean;   // live drifted above default with no stored override
+  live: string | null;          // enforced live value (quota spec.hard / LimitRange max)
+  used: string | null;          // quota status.used (quota-backed fields only)
+  drift: boolean;               // live differs from expected (default ⊕ override)
+}
+
+export interface ProjectResourceAuditRow {
+  createdAt: string;
+  actor: string;
+  summary: string;
+}
+
+export interface ProjectResourceDetailView {
+  slug: string;
+  name: string;
+  customised: boolean;
+  updatedAt: string | null;
+  updatedBy: string | null;
+  fields: ProjectResourceFieldRow[];
+  // The grow-volumes control: current floor (grow-only) and the chart's
+  // per-volume admission cap.
+  pvcSizeFloor: string;
+  pvcSizeMax: string;
+  // false when k8s is disabled or the quota objects don't exist yet.
+  liveAvailable: boolean;
+  audit: ProjectResourceAuditRow[];
+}
+
+// /admin/resources/:slug — one project's overrides: platform default | override
+// input | live state, plus the grow-volumes control and the audit trail.
+export function renderAdminProjectResourceDetail(
+  view: ProjectResourceDetailView,
+  result: ResourcesResultView | null,
+  email: string,
+  csrf: string = '',
+): string {
+  let body = `<p style="margin-bottom:1rem;"><a href="/admin/resources" class="btn btn-secondary btn-sm">Back to Resources</a></p>`;
+  body += resourceResultBanner(result);
+
+  const metaLine = view.customised
+    ? `Overrides last changed ${escapeHtml(whenLabel(view.updatedAt))}${view.updatedBy ? ` by ${escapeHtml(view.updatedBy)}` : ''}.`
+    : 'Running on the platform defaults — no overrides stored.';
+
+  body += `<p><strong>${escapeHtml(view.name)}</strong> (<code>${escapeHtml(view.slug)}</code>) —
+    leave a field blank to <strong>inherit the platform default</strong>; overrides are
+    <strong>up-only</strong> relative to the current defaults (use <em>Clear overrides</em>
+    to come back down). Setting a value below the project's current usage never evicts
+    running pods — it only blocks <em>new</em> ones until usage drops.
+    <span style="color:#8a7a5a;">${metaLine}</span></p>`;
+
+  if (!view.liveAvailable) {
+    body += `<p class="help">Live cluster state is unavailable (Kubernetes integration
+      disabled, or the project's quota objects don't exist yet) — the "Live now" column
+      is empty.</p>`;
+  }
+
+  const rows = view.fields.map((f) => {
+    const liveCell = f.live === null
+      ? '<span style="color:#8a7a5a;">—</span>'
+      : `<code>${escapeHtml(f.live)}</code>`
+        + (f.used !== null ? `<br><span style="color:#8a7a5a; font-size:0.75rem;">used ${escapeHtml(f.used)}</span>` : '')
+        + (f.drift ? '<br><span style="color:#e8b94a; font-size:0.75rem;">⚠ differs from expected</span>' : '');
+    const note = f.prefilledFromLive
+      ? '<div style="color:#e8b94a; font-size:0.72rem; margin-top:0.2rem;">pre-filled from live (no stored override) — save to capture it</div>'
+      : '';
+    return `
+        <tr>
+          <td><label style="margin:0;">${escapeHtml(f.label)}</label>
+              <div style="color:#8a7a5a; font-size:0.75rem;">${escapeHtml(f.help)}</div></td>
+          <td style="color:#8a7a5a;"><code>${escapeHtml(f.platformDefault)}</code></td>
+          <td><input type="text" name="${escapeHtml(f.key)}" value="${escapeHtml(f.overrideValue)}"
+                     placeholder="inherit" autocomplete="off" spellcheck="false"
+                     style="min-width:6.5rem;">${note}</td>
+          <td>${liveCell}</td>
+        </tr>`;
+  }).join('');
+
+  body += `
+    <form method="POST" action="/admin/resources/${escapeHtml(view.slug)}">
+      ${csrf}
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Setting</th><th>Platform default</th><th>Override</th><th>Live now</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <div class="field" style="max-width:34rem; margin-top:1.25rem;">
+        <label>Grow data volumes to</label>
+        <input type="text" name="pvcSize" value="" placeholder="e.g. ${escapeHtml(view.pvcSizeFloor)}"
+               autocomplete="off" spellcheck="false">
+        <div style="font-size:0.8rem; color:#8a7a5a; margin-top:0.25rem;">Resize the Postgres/Garage
+          PVCs (grow-only, between ${escapeHtml(view.pvcSizeFloor)} and the ${escapeHtml(view.pvcSizeMax)}
+          per-volume cap; needs an expandable StorageClass — otherwise see the
+          <a href="/admin/help/storage">storage help page</a>). Blank = leave volumes alone.</div>
+      </div>
+      <button type="submit" class="btn btn-primary">Save &amp; apply</button>
+    </form>
+    <form method="POST" action="/admin/resources/${escapeHtml(view.slug)}/clear" style="margin-top:0.75rem;"
+          data-confirm="Clear all stored overrides for ${escapeHtml(view.slug)} and reconcile it back to the platform defaults?">
+      ${csrf}
+      <button type="submit" class="btn btn-danger"${view.customised ? '' : ' disabled'}>Clear overrides</button>
+    </form>`;
+
+  if (view.audit.length) {
+    body += `
+    <h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">Recent changes</h2>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>When</th><th>Who</th><th>Change</th></tr></thead>
+      <tbody>${view.audit.map((a) => `
+        <tr>
+          <td>${escapeHtml(whenLabel(a.createdAt))}</td>
+          <td>${escapeHtml(a.actor)}</td>
+          <td style="font-size:0.8rem;">${escapeHtml(a.summary)}</td>
+        </tr>`).join('')}</tbody>
+    </table></div>`;
+  }
+
+  return dashboardLayout(`Resources — ${view.slug}`, body, email, true, 'resources');
 }
 
 export interface CooldepsResultView { ok: boolean; message: string; }
@@ -3015,7 +3199,7 @@ export function renderAdminCooldeps(
 // a grow attempt comes back `unsupported`.
 export function renderStorageHelp(email: string): string {
   const body = `
-    <p style="margin-bottom:1rem;"><a href="/admin/projects/resources" class="btn btn-secondary btn-sm">Back to Project Resources</a></p>
+    <p style="margin-bottom:1rem;"><a href="/admin/resources" class="btn btn-secondary btn-sm">Back to Resources</a></p>
     <h2>Increasing a project's storage</h2>
     <p>Raising <strong>Max total storage</strong> lifts the namespace
       <code>ResourceQuota</code> ceiling, and raising <strong>Grow data volumes
@@ -3047,8 +3231,9 @@ export function renderStorageHelp(email: string): string {
         the backup into the new volume.</li>
     </ol>
     <p style="color:#8a7a5a; font-size:0.85rem;">A changed platform default only
-      reaches existing projects through the Project Resources form — it is not
-      swept across every namespace.</p>`;
+      reaches existing projects through a project's Resources page or the
+      "Apply defaults to all existing projects" sweep — never automatically on
+      save.</p>`;
   return dashboardLayout('Storage Help', body, email, true, 'resources');
 }
 

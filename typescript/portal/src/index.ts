@@ -14,6 +14,7 @@ import { validateCsrf } from './middleware/csrf';
 import { authLimiter, dcrLimiter, wellKnownLimiter } from './middleware/rateLimit';
 import { pruneActivity } from './services/achievements';
 import { migrate } from './services/projects';
+import { loadTenantDefaults } from './services/tenant-defaults';
 import { reconcileAllProjects } from './services/repo-access';
 import { backfillPinTokens } from './services/pin-token-backfill';
 import { seedCommunityCenterTemplate } from './services/template-seed';
@@ -180,6 +181,18 @@ async function start() {
     console.error('Portal DB migration failed:', err.message);
     // Fail fast — projects routes can't work without the table.
     process.exit(1);
+  }
+
+  // Warm the tenant-defaults cache from the DB row (if an admin has ever saved
+  // one) so quota builders and YAML generators read the persisted values, not
+  // the chart seed. Best-effort: without a row — or on a transient read error —
+  // the module-load env seed stays in place, which is exactly the pre-DB
+  // behaviour.
+  try {
+    const rec = await loadTenantDefaults();
+    console.log(`Tenant resource defaults: ${rec.persisted ? `persisted (saved ${rec.updatedAt} by ${rec.updatedBy})` : 'chart seed'}`);
+  } catch (err: any) {
+    console.error('Tenant defaults load failed (using chart seed):', err?.message);
   }
 
   // One-shot security backfill: mint CV_PIN_TOKEN for any pre-existing

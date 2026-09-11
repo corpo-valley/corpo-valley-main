@@ -12,13 +12,10 @@ import * as https from 'https';
 import * as fs from 'fs';
 import {
   KRATOS_NAMESPACE, PROJECTS_DOMAIN,
-  TENANT_MAX_MEMORY, TENANT_MAX_MEMORY_REQUESTS, TENANT_MAX_MEMORY_PER_CONTAINER,
-  TENANT_DEFAULT_MEMORY, TENANT_DEFAULT_MEMORY_REQUEST,
-  TENANT_MAX_CPU, TENANT_MAX_CPU_REQUESTS, TENANT_MAX_CPU_PER_CONTAINER,
-  TENANT_DEFAULT_CPU, TENANT_DEFAULT_CPU_REQUEST,
-  TENANT_MAX_STORAGE, TENANT_MAX_PODS, TENANT_MAX_PVCS,
   quantityToNumber, isQuantity,
 } from './platform-config';
+import { effectiveForProject, TenantDefaults } from './tenant-defaults';
+import { getResourceOverridesBySlug } from './projects';
 
 const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
 const TOKEN_FILE = `${SA_DIR}/token`;
@@ -624,14 +621,14 @@ function warnClusterNetpolConfigOnce(): void {
   }
 }
 
-// Per-project resource overrides an admin may pass to reconcileTenantResources
-// to raise ONE project above the chart defaults (overrides are up-only; the
-// route enforces that). Every field is optional; an omitted field falls back to
-// the chart-configured value. Callers MUST have validated each supplied value
-// (isQuantity / isCount, platform-config) first — these flow into a k8s API
-// object, so a bad value would be rejected by the apiserver. The memory field
-// names are kept short (`max`, `default`, …) for back-compat; cpu/storage/count
-// fields are prefixed.
+// A project's per-project resource overrides — the FULL stored override set
+// for that project (routes/admin.ts persists it on projects.resource_overrides
+// and passes it here). Every field is optional; an omitted field resolves to
+// the current platform default (services/tenant-defaults.ts). Overrides are
+// up-only relative to the current defaults; effectiveForProject enforces that
+// and re-validates every value, so nothing unvalidated reaches a k8s API
+// object. The memory field names are kept short (`max`, `default`, …) for
+// back-compat; cpu/storage/count fields are prefixed.
 export interface TenantResourceOverrides {
   // memory (ResourceQuota + LimitRange)
   max?: string;
@@ -651,63 +648,46 @@ export interface TenantResourceOverrides {
   maxPvcs?: string;
 }
 
-// Resolve the desired value of a field: an admin override wins; otherwise keep
-// the project's CURRENT live value; otherwise the chart default. So a field the
-// admin left blank stays UNCHANGED rather than being reset to the chart default
-// (which would clobber an earlier per-project bump). `cur` is the live object's
-// value, read by reconcileTenantResources; empty on the write-once create path.
-function tenantResourceQuotaObject(
-  slug: string, o: TenantResourceOverrides = {}, curHard: Record<string, string> = {},
-) {
-  const pick = (ov: string | undefined, key: string, def: string) => ov ?? curHard[key] ?? def;
+// Build the FULL desired ResourceQuota from an already-resolved values object
+// (defaults ⊕ overrides via effectiveForProject). Deterministic: the same
+// resolved values always produce the same object — live state never feeds back
+// in, so drift (however it happened) is corrected on every reconcile rather
+// than preserved.
+function tenantResourceQuotaObject(slug: string, v: TenantDefaults) {
   return {
     apiVersion: 'v1', kind: 'ResourceQuota',
     metadata: { name: 'cv-tenant-quota', namespace: slug,
       labels: { 'corpo-valley.com/managed': 'baseline' } },
-    // Each field: operator-tunable via the chart (tenant.* → CV_*), per-project
-    // raisable by an admin, and preserved-as-is when neither is supplied.
+    // Each field: operator-tunable via the chart seed / admin defaults page,
+    // per-project raisable via the stored overrides.
     spec: { hard: {
-      'requests.cpu': pick(o.cpuMaxRequests, 'requests.cpu', TENANT_MAX_CPU_REQUESTS),
-      'limits.cpu': pick(o.cpuMax, 'limits.cpu', TENANT_MAX_CPU),
-      'requests.memory': pick(o.maxRequests, 'requests.memory', TENANT_MAX_MEMORY_REQUESTS),
-      'limits.memory': pick(o.max, 'limits.memory', TENANT_MAX_MEMORY),
-      'requests.storage': pick(o.maxStorage, 'requests.storage', TENANT_MAX_STORAGE),
-      'pods': pick(o.maxPods, 'pods', TENANT_MAX_PODS),
-      'persistentvolumeclaims': pick(o.maxPvcs, 'persistentvolumeclaims', TENANT_MAX_PVCS),
-      // Deliberate hardening — always RE-ASSERTED (never preserved from live, so
-      // a tampered quota can't keep a nonzero LB/NodePort allowance).
+      'requests.cpu': v.cpuMaxRequests,
+      'limits.cpu': v.cpuMax,
+      'requests.memory': v.maxRequests,
+      'limits.memory': v.max,
+      'requests.storage': v.maxStorage,
+      'pods': v.maxPods,
+      'persistentvolumeclaims': v.maxPvcs,
+      // Deliberate hardening — always RE-ASSERTED (never taken from any input,
+      // so a tampered quota can't keep a nonzero LB/NodePort allowance).
       'services.loadbalancers': '0', 'services.nodeports': '0',
     } },
   };
 }
 
-function tenantLimitRangeObject(
-  slug: string, o: TenantResourceOverrides = {}, curLimit: any = undefined,
-) {
-  // Same precedence as the quota: override → current live value → chart default.
-  // The LimitRange `limits` is an array (JSON merge-patch replaces it wholesale),
-  // so we must emit the COMPLETE entry — hence reading each current sub-field.
-  const curReq = curLimit?.defaultRequest || {};
-  const curDef = curLimit?.default || {};
-  const curMax = curLimit?.max || {};
+// LimitRange twin of the quota builder above — same resolved-values contract.
+// The `limits` field is an array (JSON merge-patch replaces it wholesale), so
+// the complete Container entry is always emitted.
+function tenantLimitRangeObject(slug: string, v: TenantDefaults) {
   return {
     apiVersion: 'v1', kind: 'LimitRange',
     metadata: { name: 'cv-tenant-limits', namespace: slug,
       labels: { 'corpo-valley.com/managed': 'baseline' } },
     spec: { limits: [{
       type: 'Container',
-      defaultRequest: {
-        cpu: o.cpuDefaultRequest ?? curReq.cpu ?? TENANT_DEFAULT_CPU_REQUEST,
-        memory: o.defaultRequest ?? curReq.memory ?? TENANT_DEFAULT_MEMORY_REQUEST,
-      },
-      default: {
-        cpu: o.cpuDefault ?? curDef.cpu ?? TENANT_DEFAULT_CPU,
-        memory: o.default ?? curDef.memory ?? TENANT_DEFAULT_MEMORY,
-      },
-      max: {
-        cpu: o.cpuMaxPerContainer ?? curMax.cpu ?? TENANT_MAX_CPU_PER_CONTAINER,
-        memory: o.maxPerContainer ?? curMax.memory ?? TENANT_MAX_MEMORY_PER_CONTAINER,
-      },
+      defaultRequest: { cpu: v.cpuDefaultRequest, memory: v.defaultRequest },
+      default: { cpu: v.cpuDefault, memory: v.default },
+      max: { cpu: v.cpuMaxPerContainer, memory: v.maxPerContainer },
     }] },
   };
 }
@@ -757,34 +737,54 @@ async function getNamespacedOrNull(path: string): Promise<any | null> {
   }
 }
 
-// Reconcile ONE project's ResourceQuota + LimitRange. We GET the live objects
-// FIRST and resolve each field as override → current live value → chart default,
-// so an admin's partial edit changes ONLY the fields they supplied and leaves
-// the rest untouched (a blank form field = unchanged). Because
-// applyNamespaceBaseline creates these write-once, an admin's per-project bump
-// only reaches an existing namespace through this call. Admin-triggered; see
-// routes/admin.ts. Returns null when the k8s client is disabled (local dev).
-// Throws (404) if the namespace doesn't exist — the caller validates first.
+// Reconcile ONE project's ResourceQuota + LimitRange to the full desired state:
+// the current platform defaults overlaid with the project's stored overrides
+// (pass the FULL override set — an omitted field means "platform default", not
+// "keep whatever is live"). Deterministic by design; drift is corrected, never
+// preserved. Admin-triggered (per-project save/clear and the apply-all sweep);
+// see routes/admin.ts. Returns null when the k8s client is disabled (local
+// dev). Throws (404) if the namespace doesn't exist — the caller validates
+// first.
 export async function reconcileTenantResources(
   slug: string,
   o: TenantResourceOverrides = {},
 ): Promise<{ quota: 'patched' | 'created'; limits: 'patched' | 'created' } | null> {
   if (!k8sEnabled()) return null;
   const ns = encodeURIComponent(slug);
-  const quotaColl = `/api/v1/namespaces/${ns}/resourcequotas`;
-  const limitsColl = `/api/v1/namespaces/${ns}/limitranges`;
-  // Read current state first so unspecified fields are preserved, not reset.
-  const curQuota = await getNamespacedOrNull(`${quotaColl}/cv-tenant-quota`);
-  const curLimits = await getNamespacedOrNull(`${limitsColl}/cv-tenant-limits`);
+  const v = effectiveForProject(o);
   const quota = await patchOrCreate(
-    quotaColl, 'cv-tenant-quota',
-    tenantResourceQuotaObject(slug, o, curQuota?.spec?.hard),
+    `/api/v1/namespaces/${ns}/resourcequotas`, 'cv-tenant-quota',
+    tenantResourceQuotaObject(slug, v),
   );
   const limits = await patchOrCreate(
-    limitsColl, 'cv-tenant-limits',
-    tenantLimitRangeObject(slug, o, curLimits?.spec?.limits?.[0]),
+    `/api/v1/namespaces/${ns}/limitranges`, 'cv-tenant-limits',
+    tenantLimitRangeObject(slug, v),
   );
   return { quota, limits };
+}
+
+// Live state of a project's quota (+ the LimitRange per-container ceilings),
+// for the admin detail page's "live now" column and its drift markers:
+// `hard` is the enforced ResourceQuota spec, `used` is what the namespace is
+// consuming right now, `limitMax` is LimitRange spec.limits[0].max. Returns
+// null when k8s is disabled or neither object exists yet.
+export interface TenantQuotaState {
+  hard: Record<string, string>;
+  used: Record<string, string>;
+  limitMax: Record<string, string>;
+}
+
+export async function readTenantQuota(slug: string): Promise<TenantQuotaState | null> {
+  if (!k8sEnabled()) return null;
+  const ns = encodeURIComponent(slug);
+  const quota = await getNamespacedOrNull(`/api/v1/namespaces/${ns}/resourcequotas/cv-tenant-quota`);
+  const limits = await getNamespacedOrNull(`/api/v1/namespaces/${ns}/limitranges/cv-tenant-limits`);
+  if (!quota && !limits) return null;
+  return {
+    hard: quota?.spec?.hard ?? {},
+    used: quota?.status?.used ?? {},
+    limitMax: limits?.spec?.limits?.[0]?.max ?? {},
+  };
 }
 
 // The project data volumes the platform manages, and the StatefulSet that owns
@@ -1034,6 +1034,13 @@ export async function namespaceExists(slug: string): Promise<boolean> {
 export async function applyNamespaceBaseline(slug: string): Promise<void> {
   if (!k8sEnabled()) return;
   warnClusterNetpolConfigOnce();
+  // Resolve the slug's effective quota/limit values (platform defaults ⊕ any
+  // stored per-project overrides). A brand-new project has no overrides, so
+  // this is normally just the defaults; the lookup matters when a namespace is
+  // re-baselined for a project that had already been bumped. Best-effort: a DB
+  // hiccup must not block sealing the namespace, so fall back to defaults.
+  const overrides = await getResourceOverridesBySlug(slug).catch(() => null);
+  const effective = effectiveForProject(overrides);
   await createOrIgnore('/api/v1/namespaces', tenantNamespaceObject(slug));
   // Always (re)assert the labels via PATCH — covers the case where the
   // namespace already existed (e.g. a recreate, or ArgoCD got there first) and
@@ -1047,8 +1054,8 @@ export async function applyNamespaceBaseline(slug: string): Promise<void> {
   });
   await createOrIgnore(`/apis/networking.k8s.io/v1/namespaces/${encodeURIComponent(slug)}/networkpolicies`, tenantEgressPolicyObject(slug));
   await createOrIgnore(`/apis/networking.k8s.io/v1/namespaces/${encodeURIComponent(slug)}/networkpolicies`, tenantIngressPolicyObject(slug));
-  await createOrIgnore(`/api/v1/namespaces/${encodeURIComponent(slug)}/resourcequotas`, tenantResourceQuotaObject(slug));
-  await createOrIgnore(`/api/v1/namespaces/${encodeURIComponent(slug)}/limitranges`, tenantLimitRangeObject(slug));
+  await createOrIgnore(`/api/v1/namespaces/${encodeURIComponent(slug)}/resourcequotas`, tenantResourceQuotaObject(slug, effective));
+  await createOrIgnore(`/api/v1/namespaces/${encodeURIComponent(slug)}/limitranges`, tenantLimitRangeObject(slug, effective));
 }
 
 export interface ArgoApplicationSpec {

@@ -97,6 +97,13 @@ export interface Project {
   // project-create time and never stored server-side — we only keep the
   // hash so we can verify the workflow's Bearer header.
   pin_token_hash: string | null;
+  // Admin-set per-project resource overrides (a partial TenantResourceOverrides
+  // record as jsonb: field → quantity/count string). NULL = the project runs on
+  // the platform defaults. Written only from /admin/resources/:slug; the
+  // reconcile path re-validates every value before it reaches a k8s object.
+  resource_overrides: Record<string, string> | null;
+  resource_overrides_updated_at: string | null;
+  resource_overrides_updated_by: string | null;
 }
 
 // Slugs become `{slug}.projects.corpo-valley.com`, a Gitea repo name, and a
@@ -121,6 +128,9 @@ const RESERVED_SLUGS = new Set([
   'kube-system', 'mcp', 'metrics', 'oauth', 'oidc', 'ory', 'portal',
   'projects', 'public', 'registry', 'root', 'static', 'sys', 'system',
   'www',
+  // Literal path segments under /admin/resources/:slug — a project with one
+  // of these slugs would be shadowed by (or shadow) the admin routes.
+  'defaults', 'apply-all', 'resources',
 ]);
 
 export function isValidSlug(slug: string): boolean {
@@ -221,6 +231,38 @@ export async function migrate(): Promise<void> {
       constraint platform_cooldeps_config_singleton check (id = 1)
     );
   `);
+
+  // Single-row store for the platform-wide tenant resource defaults an admin
+  // edits on /admin/resources. The chart env (tenant.* → CV_*) seeds the
+  // in-memory cache; once an admin saves, this row is the source of truth.
+  // Absent row → chart defaults. See services/tenant-defaults.ts.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS platform_tenant_defaults (
+      id integer primary key default 1,
+      config jsonb not null,
+      updated_at timestamptz not null default now(),
+      updated_by text,
+      constraint platform_tenant_defaults_singleton check (id = 1)
+    );
+  `);
+  // Per-project resource overrides (see the Project interface above) + who set
+  // them last and when, for the admin resources pages.
+  await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS resource_overrides jsonb;');
+  await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS resource_overrides_updated_at timestamptz;');
+  await pool.query('ALTER TABLE projects ADD COLUMN IF NOT EXISTS resource_overrides_updated_by text;');
+  // Append-only audit trail for resource changes: scope is 'defaults' (the
+  // platform-wide card, including apply-all sweeps) or a project slug. Written
+  // best-effort by services/tenant-defaults.ts recordResourceAudit().
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cv_resource_audit (
+      id uuid primary key default gen_random_uuid(),
+      actor_email text not null,
+      scope text not null,
+      change jsonb not null,
+      created_at timestamptz not null default now()
+    );
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS cv_resource_audit_scope_idx ON cv_resource_audit (scope, created_at DESC);');
 
   // Achievements: the ONLY facts not already derivable from the tables above —
   // pull requests to repos you don't own, and meaningful cross-project
@@ -511,6 +553,32 @@ export async function claimOrGetGarageCredentials(
 
 export async function clearGarageCredentials(id: string): Promise<void> {
   await pool.query('UPDATE projects SET garage_creds = NULL WHERE id = $1', [id]);
+}
+
+// Persist (or clear, with null) a project's per-project resource overrides,
+// stamping who changed them and when. The caller has already validated every
+// value (routes/admin.ts) and reconciles the live quota separately.
+export async function setProjectResourceOverrides(
+  id: string, overrides: Record<string, string> | null, updatedBy: string,
+): Promise<void> {
+  await pool.query(
+    `UPDATE projects
+     SET resource_overrides = $2,
+         resource_overrides_updated_at = now(),
+         resource_overrides_updated_by = $3
+     WHERE id = $1`,
+    [id, overrides ? JSON.stringify(overrides) : null, updatedBy]
+  );
+}
+
+// A project's stored overrides by slug (null when none / unknown slug). Used
+// by applyNamespaceBaseline so a re-baselined namespace keeps its bump.
+export async function getResourceOverridesBySlug(slug: string): Promise<Record<string, string> | null> {
+  const { rows } = await pool.query<{ resource_overrides: Record<string, string> | null }>(
+    'SELECT resource_overrides FROM projects WHERE slug = $1',
+    [slug]
+  );
+  return rows[0]?.resource_overrides ?? null;
 }
 
 export async function setPinTokenHash(id: string, hash: string): Promise<void> {
