@@ -128,6 +128,9 @@ const RESERVED_SLUGS = new Set([
   'kube-system', 'mcp', 'metrics', 'oauth', 'oidc', 'ory', 'portal',
   'projects', 'public', 'registry', 'root', 'static', 'sys', 'system',
   'www',
+  // Literal path segments under /admin/resources/:slug — a project with one
+  // of these slugs would be shadowed by (or shadow) the admin routes.
+  'defaults', 'apply-all', 'resources',
 ]);
 
 export function isValidSlug(slug: string): boolean {
