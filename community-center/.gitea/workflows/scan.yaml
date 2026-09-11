@@ -31,8 +31,14 @@ jobs:
         # --user lands the entry point in ~/.local/bin; we put that on PATH
         # for the next step because semgrep's `osemgrep` shells out to a
         # sibling `pysemgrep` binary that has to be PATH-resolvable.
+        #
+        # Pinned: the runner installs through the cooldeps gating proxy, whose
+        # release-age policy blocks brand-new releases — an unpinned install
+        # resolves to semgrep's latest and fails whenever upstream shipped
+        # within the cooldown window. The pin is a stable release comfortably
+        # older than the cooldown; bump it deliberately, not implicitly.
         run: |
-          pip install --quiet --user semgrep
+          pip install --quiet --user semgrep==1.173.0
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Static analysis

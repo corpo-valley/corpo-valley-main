@@ -983,18 +983,17 @@ export async function setBranchProtection(opts: {
   const contexts = opts.statusCheckGlobs || ['*semgrep*', '*osv-scanner*'];
   const enableStatusCheck = opts.enableStatusCheck ?? true;
   // Default whitelist preserves the existing project-repo behavior: the repo
-  // owner (whose CV_PUSH_TOKEN PAT the Build workflow pushes with) plus the
-  // platform admin. Callers may override it wholesale.
+  // owner (humans push their own code straight to main) plus the platform
+  // admin. Callers may override it wholesale.
   const pushWhitelist = (opts.pushWhitelistUsernames ?? [opts.owner, giteaAdminUser])
     .filter((u, i, a) => u && a.indexOf(u) === i);
-  // Status-check enforcement is back ON. The Build workflow auto-bump
-  // would normally be rejected because Gitea 1.22's auto-provisioned
-  // Actions token is an internal pseudo-user (UID 0) that can't be
-  // whitelisted — so the bump now pushes using a PAT minted on the
-  // project owner's account (stored as the CV_PUSH_TOKEN repo Actions
-  // secret). That makes the bot's effective user = the owner, who IS
-  // in `push_whitelist_usernames` and therefore bypasses status checks
-  // on direct push.
+  // Status-check enforcement is ON. The shipped Build workflow holds NO git
+  // credentials at all — after pushing the image it calls the portal's
+  // /internal/projects/:slug/pin endpoint (authenticated by the per-project
+  // CV_PIN_TOKEN Actions secret), and the PORTAL writes the image-pin bump
+  // via the Contents API as `cvportal`. That's why `cvportal` must be on the
+  // whitelist: the pin commit lands as a direct push to main that bypasses
+  // the status checks.
   //
   // Outside contributors aren't on the whitelist; they're forced to PR,
   // and the PR's merge is gated by the status_check_contexts below.
@@ -1003,10 +1002,11 @@ export async function setBranchProtection(opts: {
     branch_name: branch,
     enable_push: true,
     enable_push_whitelist: true,
-    // Whitelist defaults to the project owner (the Build workflow's
-    // CV_PUSH_TOKEN PAT is minted on their account) and `cvportal` (the
-    // platform admin that drives manifest generation, sealed-secret writes,
-    // and any future portal-side Contents API edits). Overridable per call.
+    // Whitelist defaults to the project owner (direct human pushes) and
+    // `cvportal` (the platform admin that drives manifest generation,
+    // sealed-secret writes, and the Build workflow's image-pin bump — the
+    // portal commits that via the Contents API; the workflow itself holds no
+    // git credentials). Overridable per call.
     push_whitelist_usernames: pushWhitelist,
     push_whitelist_deploy_keys: false,
     enable_status_check: enableStatusCheck,

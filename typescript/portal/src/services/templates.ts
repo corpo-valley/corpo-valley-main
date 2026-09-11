@@ -9,8 +9,12 @@
 //     are auto-enabled.
 //
 // All projects generate from the single Gitea template repo
-// `corpo-valley/community-center`, which carries all the modules. Pushing
-// changes to that Gitea repo is done via scripts/sync-community-center-template.sh.
+// `corpo-valley/community-center`, which carries all the modules. The portal
+// seeds that repo from the baked-in baseline once on startup (template-seed.ts);
+// after that it's admin-owned in Gitea, and the baseline is only re-pushed on
+// an explicit admin reset (POST /admin/template/reset).
+// scripts/sync-community-center-template.sh is a manual kubectl escape hatch
+// for the same reset, not the normal update path.
 
 export const TEMPLATE_GITEA_OWNER = process.env.GITEA_TEMPLATE_OWNER || 'corpo-valley';
 export const TEMPLATE_GITEA_REPO = process.env.GITEA_TEMPLATE_REPO || 'community-center';

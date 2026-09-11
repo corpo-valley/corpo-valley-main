@@ -17,7 +17,12 @@
 # script renders them with the same defaults; override via env for a
 # non-default deployment:
 #   CV_NAMESPACE_PREFIX, CV_REGISTRY, CV_PORTAL_PIN_URL,
-#   CV_PORTAL_LOGIN_URL, CV_KRATOS_PUBLIC_URL, CV_PROJECTS_DOMAIN
+#   CV_PORTAL_INTERNAL_URL, CV_PORTAL_LOGIN_URL, CV_KRATOS_PUBLIC_URL,
+#   CV_PROJECTS_DOMAIN
+# The cooldeps fragments (CV_COOLDEPS_NPMRC, CV_COOLDEPS_NOTE,
+# CV_COOLDEPS_DOCKER_ENV) render EMPTY unless set in the env — matching a
+# portal deployment with cooldeps disabled. On a cooldeps-enabled deployment,
+# export them with the fragments template-seed.ts would render.
 #
 # Usage:
 #   scripts/sync-community-center-template.sh
@@ -38,10 +43,17 @@ NSP="${CV_NAMESPACE_PREFIX:-cv-}"
 # reproduce the original corpo-valley.com deployment — keep these in sync with
 # typescript/portal/src/services/platform-config.ts.
 CV_REGISTRY="${CV_REGISTRY:-registry.${NSP}registry.svc.cluster.local:5000}"
-CV_PORTAL_PIN_URL="${CV_PORTAL_PIN_URL:-http://portal.${NSP}portal.svc.cluster.local/internal/projects}"
+CV_PORTAL_INTERNAL_URL="${CV_PORTAL_INTERNAL_URL:-http://portal.${NSP}portal.svc.cluster.local}"
+CV_PORTAL_PIN_URL="${CV_PORTAL_PIN_URL:-${CV_PORTAL_INTERNAL_URL}/internal/projects}"
 CV_PORTAL_LOGIN_URL="${CV_PORTAL_LOGIN_URL:-https://portal.corpo-valley.com/login}"
 CV_KRATOS_PUBLIC_URL="${CV_KRATOS_PUBLIC_URL:-http://ory-kratos-public.${NSP}ory.svc.cluster.local:4433}"
 CV_PROJECTS_DOMAIN="${CV_PROJECTS_DOMAIN:-projects.corpo-valley.com}"
+# cooldeps fragments: empty (= cooldeps disabled) unless the caller exports
+# them. These are multi-line file fragments, not URLs — see template-seed.ts
+# for what a cooldeps-enabled portal renders here.
+CV_COOLDEPS_NPMRC="${CV_COOLDEPS_NPMRC:-}"
+CV_COOLDEPS_NOTE="${CV_COOLDEPS_NOTE:-}"
+CV_COOLDEPS_DOCKER_ENV="${CV_COOLDEPS_DOCKER_ENV:-}"
 
 if [ ! -d "$SRC_DIR" ]; then
   echo "ERROR: $SRC_DIR not found" >&2
@@ -80,13 +92,24 @@ find . -mindepth 1 -path ./.git -prune -o -exec rm -rf {} + 2>/dev/null || true
 cp -a "$SRC_DIR/." .
 rm -rf .git/index.lock 2>/dev/null || true
 
-# Render the {{CV_*}} placeholders (same substitutions as template-seed.ts).
-find . -path ./.git -prune -o -type f -print0 | xargs -0 sed -i \
-  -e "s|{{CV_REGISTRY}}|${CV_REGISTRY}|g" \
-  -e "s|{{CV_PORTAL_PIN_URL}}|${CV_PORTAL_PIN_URL}|g" \
-  -e "s|{{CV_PORTAL_LOGIN_URL}}|${CV_PORTAL_LOGIN_URL}|g" \
-  -e "s|{{CV_KRATOS_PUBLIC_URL}}|${CV_KRATOS_PUBLIC_URL}|g" \
-  -e "s|{{CV_PROJECTS_DOMAIN}}|${CV_PROJECTS_DOMAIN}|g"
+# Render the {{CV_*}} placeholders. CANONICAL RENDERER: template-seed.ts's
+# RENDER_VARS is what the portal renders in the normal path — this list must
+# mirror it exactly (all nine placeholders). perl rather than sed because the
+# cooldeps fragments are multi-line; values are passed via the environment so
+# no quoting/escaping of their content is needed.
+export CV_REGISTRY CV_PORTAL_PIN_URL CV_PORTAL_INTERNAL_URL CV_PORTAL_LOGIN_URL \
+  CV_KRATOS_PUBLIC_URL CV_PROJECTS_DOMAIN \
+  CV_COOLDEPS_NPMRC CV_COOLDEPS_NOTE CV_COOLDEPS_DOCKER_ENV
+find . -path ./.git -prune -o -type f -print0 | xargs -0 perl -pi -e '
+  BEGIN {
+    %v = map { $_ => $ENV{$_} // "" } qw(
+      CV_REGISTRY CV_PORTAL_PIN_URL CV_PORTAL_INTERNAL_URL CV_PORTAL_LOGIN_URL
+      CV_KRATOS_PUBLIC_URL CV_PROJECTS_DOMAIN
+      CV_COOLDEPS_NPMRC CV_COOLDEPS_NOTE CV_COOLDEPS_DOCKER_ENV
+    );
+  }
+  for my $k (keys %v) { s/\Q{{$k}}\E/$v{$k}/g; }
+'
 
 git -c user.email="cvportal@corpo-valley.com" -c user.name="cvportal" add -A
 if git diff --cached --quiet; then

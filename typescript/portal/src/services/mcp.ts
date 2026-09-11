@@ -310,6 +310,10 @@ const tools: Record<string, ToolDef> = {
       const base = toToolProject(project, everyone);
       return {
         ...base,
+        // provisionProject's verdict: 'ready' on the full happy path, 'failed'
+        // when the project never reached a deployable state (no reconciler
+        // retries a failed project — delete and recreate it).
+        status: prov.status,
         application_registered: prov.argoRegistered,
         capabilities: capabilityList(caps),
         postgres: { enabled: prov.postgresEnabled },
