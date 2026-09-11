@@ -695,35 +695,39 @@ export function badgeChip(c: BadgeChip): string {
 }
 
 function achievementCard(b: Badge): string {
-  const pct = Math.max(0, Math.min(100, Math.round((b.have / b.need) * 100)));
-  const progress = b.earned
-    ? (b.since ? `Earned ${escapeHtml(b.since.slice(0, 10))}` : 'Earned')
-    : `${b.have} / ${b.need}`;
-  const bar = b.earned ? '' : `<div class="achv-bar"><span style="width:${pct}%"></span></div>`;
+  const progress = b.since ? `Earned ${escapeHtml(b.since.slice(0, 10))}` : 'Earned';
   return `
-    <div class="achv-card ${b.earned ? 'earned' : 'locked'}">
-      ${b.earned ? '<span class="achv-check">✓</span>' : ''}
+    <div class="achv-card earned">
+      <span class="achv-check">✓</span>
       <div class="achv-emoji">${b.emoji}</div>
       <p class="achv-name">${escapeHtml(b.name)}</p>
       <p class="achv-rule">${escapeHtml(b.rule)}</p>
       <div class="achv-meta">${progress}</div>
-      ${bar}
     </div>`;
 }
 
-function achievementsBoard(badges: Badge[]): string {
-  const earned = badges.filter((b) => b.earned).length;
-  // badges arrive in catalog order (already grouped by category); emit a
+// Unearned badges are a SURPRISE: the board never lists the locked catalog,
+// per-category totals, or the overall count — only what's been earned, plus a
+// teaser that more exist. (This also keeps public profiles from leaking the
+// full catalog.)
+function achievementsBoard(badges: Badge[], own: boolean): string {
+  const earned = badges.filter((b) => b.earned);
+  if (earned.length === 0) {
+    return `
+    <p class="tagline">No badges yet.</p>
+    <p style="color:#c4b698;">${own
+      ? 'Badges in the valley are earned by doing, not by reading a checklist — plant a project, ship a build, visit a neighbor. Your first one may be closer than you think.'
+      : 'This resident hasn’t earned any badges yet.'}</p>`;
+  }
+  // earned badges arrive in catalog order (already grouped by category); emit a
   // section heading whenever the category changes.
   const sections: string[] = [];
   let current = '';
   let open = false;
-  for (const b of badges) {
+  for (const b of earned) {
     if (b.category !== current) {
       if (open) sections.push('</div>');
-      const done = badges.filter((x) => x.category === b.category && x.earned).length;
-      const total = badges.filter((x) => x.category === b.category).length;
-      sections.push(`<h2 class="achv-cat">${escapeHtml(b.category)} <span class="achv-cat-count">${done}/${total}</span></h2>`);
+      sections.push(`<h2 class="achv-cat">${escapeHtml(b.category)}</h2>`);
       sections.push('<div class="achv-grid">');
       current = b.category;
       open = true;
@@ -731,8 +735,11 @@ function achievementsBoard(badges: Badge[]): string {
     sections.push(achievementCard(b));
   }
   if (open) sections.push('</div>');
+  const teaser = own
+    ? ' More are hidden around the valley — keep planting and being a good neighbor to discover them.'
+    : '';
   return `
-    <p class="tagline">${earned} of ${badges.length} badges earned — keep planting and being a good neighbor.</p>
+    <p class="tagline">${earned.length} badge${earned.length === 1 ? '' : 's'} earned.${teaser}</p>
     ${sections.join('\n')}`;
 }
 
@@ -742,7 +749,7 @@ export function renderAchievements(
   isAdmin: boolean,
   newBadges: BadgeChip[] = [],
 ): string {
-  return dashboardLayout('Achievements', achievementsBoard(badges), email, isAdmin, 'achievements', { newBadges });
+  return dashboardLayout('Achievements', achievementsBoard(badges, true), email, isAdmin, 'achievements', { newBadges });
 }
 
 export function renderPublicProfile(
@@ -753,7 +760,7 @@ export function renderPublicProfile(
 ): string {
   const body = `
     <p class="tagline">${escapeHtml(displayName)}'s badges in the valley.</p>
-    ${achievementsBoard(badges)}
+    ${achievementsBoard(badges, false)}
     <div style="margin-top:1.5rem;"><a href="/community">← Back to Community</a></div>`;
   return dashboardLayout(`${displayName}'s Achievements`, body, email, isAdmin, 'community');
 }
