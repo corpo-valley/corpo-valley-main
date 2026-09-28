@@ -1,12 +1,13 @@
 {
   "name": "portal",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Corpo Valley self-service portal: Ory auth UI, Hydra consent, API keys, and project registration",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "test": "tsc -p tsconfig.test.json && node --test $(find dist-test -name '*.test.js')"
   },
   "dependencies": {
     "@ory/client": "^1.15.0",

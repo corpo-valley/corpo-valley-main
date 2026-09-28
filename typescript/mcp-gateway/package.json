@@ -1,12 +1,13 @@
 {
   "name": "mcp-gateway",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Corpo Valley MCP gateway: OAuth-authenticating reverse proxy in front of per-project MCP endpoints",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "test": "tsc -p tsconfig.test.json && node --test $(find dist-test -name '*.test.js')"
   },
   "dependencies": {
     "express": "^4.21.2"

@@ -131,6 +131,10 @@ app.use(cookieParser());
 // auth subrequest path — throttling those would let an attacker starve
 // legitimate infra/API traffic instead of protecting it.
 app.use('/oauth2/register', dcrLimiter);
+// The MCP authorization facade is unauthenticated and calls the Hydra ADMIN
+// API (client lookup + allowlist patch) on every request; client ids are not
+// secret (they appear in every authorize URL). Same strict budget as DCR.
+app.use('/oauth2/mcp-authorize', dcrLimiter);
 app.use(['/.well-known', '/mcp/.well-known'], wellKnownLimiter);
 app.use(
   ['/login', '/consent', '/registration', '/recovery', '/verification', '/settings', '/error'],

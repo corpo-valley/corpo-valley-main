@@ -1,0 +1,98 @@
+// Keeps a Hydra OAuth2 client's `audience` allowlist in sync with the
+// audiences the MCP authorization facade requests on its behalf.
+//
+// Hydra rejects an `audience` request value that isn't in the client's
+// registered allowlist. New MCP clients get the PLATFORM audience at
+// registration (the DCR proxy injects it), but per-PROJECT audiences are only
+// known at authorize time — so this patch is load-bearing for every project
+// authorization, not merely a migration path for pre-facade clients.
+
+export interface HydraClientAdmin {
+  getOAuth2Client(req: { id: string }): Promise<{ data: { audience?: string[] | null } }>;
+  patchOAuth2Client(req: { id: string; jsonPatch: Array<{ op: string; path: string; value?: unknown }> }): Promise<unknown>;
+}
+
+export interface EnsureClientAudienceOptions {
+  /** Hard cap on allowlist size per client. */
+  maxAudiences?: number;
+  /**
+   * At capacity, audiences for which this returns true are pruned (e.g. a
+   * project that no longer exists) to make room. Without it, capacity is a
+   * hard error.
+   */
+  isStale?: (audience: string) => Promise<boolean>;
+  /** How long a (client, audience) memo entry is trusted before re-checking Hydra. */
+  memoTtlMs?: number;
+  now?: () => number;
+}
+
+export const DEFAULT_MAX_CLIENT_AUDIENCES = 256;
+export const DEFAULT_MEMO_TTL_MS = 15 * 60 * 1000;
+const MAX_MEMO_ENTRIES = 10_000;
+
+export function createEnsureClientAudience(admin: HydraClientAdmin, options: EnsureClientAudienceOptions = {}) {
+  const max = options.maxAudiences ?? DEFAULT_MAX_CLIENT_AUDIENCES;
+  const ttl = options.memoTtlMs ?? DEFAULT_MEMO_TTL_MS;
+  const now = options.now ?? Date.now;
+
+  // Memo key MUST include the audience. Keyed on clientId alone, a client
+  // patched for its first audience short-circuits and never gets subsequent
+  // ones allowlisted; Hydra then rejects the authorize request, producing an
+  // intermittent failure indistinguishable from the bug this module fixes.
+  //
+  // Entries expire (TTL) because the allowlist can change behind our back: an
+  // RFC 7592 PUT replaces the whole Hydra client, and two first-time
+  // authorizations for a fresh client can race on the seed patch. A stale
+  // "already patched" entry would otherwise persist until restart. The DCR
+  // proxy also calls invalidate() on PUT/DELETE for the common case.
+  // `|` is safe as a separator: client ids are [A-Za-z0-9._~-] and audiences
+  // are canonical https URLs.
+  const memo = new Map<string, number>(); // key → expiresAt
+  const keyOf = (clientId: string, audience: string) => `${clientId}|${audience}`;
+
+  async function ensureClientAudience(clientId: string, audience: string): Promise<void> {
+    const key = keyOf(clientId, audience);
+    const exp = memo.get(key);
+    if (exp !== undefined && exp > now()) return;
+    memo.delete(key);
+
+    const { data } = await admin.getOAuth2Client({ id: clientId });
+    const current = Array.isArray(data.audience) ? data.audience : [];
+
+    if (!current.includes(audience)) {
+      if (current.length >= max) {
+        // Callers validate that a project audience names a REAL project before
+        // reaching here, so growth is bounded by the project table — but
+        // deleted projects leave entries behind. Prune those at capacity.
+        const kept: string[] = [];
+        for (const a of current) {
+          if (options.isStale && (await options.isStale(a))) continue;
+          kept.push(a);
+        }
+        if (kept.length >= max) {
+          throw new Error(`audience allowlist at capacity for client ${clientId}`);
+        }
+        await admin.patchOAuth2Client({ id: clientId, jsonPatch: [{ op: 'replace', path: '/audience', value: [...kept, audience] }] });
+      } else {
+        // Append server-side rather than replacing the whole array from a stale
+        // read: two concurrent authorizations for different audiences would
+        // otherwise lose one. `/audience/-` requires the member to exist, so
+        // seed it when the client has no audience array yet.
+        const jsonPatch = current.length
+          ? [{ op: 'add', path: '/audience/-', value: audience }]
+          : [{ op: 'add', path: '/audience', value: [audience] }];
+        await admin.patchOAuth2Client({ id: clientId, jsonPatch });
+      }
+    }
+
+    if (memo.size < MAX_MEMO_ENTRIES) memo.set(key, now() + ttl);
+  }
+
+  /** Forget everything memoised for a client (its allowlist was replaced or it was deleted). */
+  function invalidate(clientId: string): void {
+    const prefix = `${clientId}|`;
+    for (const k of memo.keys()) if (k.startsWith(prefix)) memo.delete(k);
+  }
+
+  return Object.assign(ensureClientAudience, { invalidate });
+}

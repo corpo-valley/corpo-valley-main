@@ -23,6 +23,7 @@
 import express from 'express';
 import * as crypto from 'crypto';
 import * as http from 'http';
+import { DNS_LABEL, resourceForSlug as canonicalResourceForSlug } from './shared/mcp-resources';
 
 const PORT = Number(process.env.PORT || 3000);
 // Public OAuth issuer the clients drive (browser-facing).
@@ -93,8 +94,9 @@ function slugFromHost(host: string | undefined): string | null {
   const suffix = '.' + PROJECTS_DOMAIN;
   if (!h.endsWith(suffix)) return null;
   const slug = h.slice(0, -suffix.length);
-  // DNS-label; never let a crafted Host escape the `<slug>-mcp.<slug>.svc` target.
-  if (!/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(slug)) return null;
+  // DNS-label (shared grammar); never let a crafted Host escape the
+  // `<slug>-mcp.<slug>.svc` target.
+  if (!DNS_LABEL.test(slug)) return null;
   return slug;
 }
 
@@ -135,8 +137,11 @@ const ENFORCE_AUDIENCE = process.env.MCP_ENFORCE_AUDIENCE !== 'false';
 const PLATFORM_MCP_AUDIENCE = (process.env.PUBLIC_MCP_URL || '').replace(/\/+$/, '');
 const ACCEPT_PLATFORM_AUDIENCE = process.env.MCP_ACCEPT_PLATFORM_AUDIENCE !== 'false';
 
+// Canonical form shared (as a mirrored file) with the portal's facade and
+// consent filter, so the exact-string comparison below can never disagree
+// with what the token issuer minted.
 function resourceForSlug(slug: string): string {
-  return `https://${slug}.${PROJECTS_DOMAIN}/mcp`;
+  return canonicalResourceForSlug(slug, PROJECTS_DOMAIN);
 }
 
 // Portal internal endpoint used to verify project ownership per request. This is
@@ -262,7 +267,15 @@ async function authServerMetadata(_req: express.Request, res: express.Response) 
       const r = await fetch(`${HYDRA_PUBLIC_INTERNAL}/.well-known/openid-configuration`);
       if (!r.ok) throw new Error(`hydra discovery ${r.status}`);
       const oidc = await r.json() as Record<string, unknown>;
-      metaCache = { at: Date.now(), body: { ...oidc, registration_endpoint: `${HYDRA_PUBLIC_URL}/oauth2/register` } };
+      metaCache = { at: Date.now(), body: {
+        ...oidc,
+        // MUST match portal/src/routes/mcp.ts: a client that discovers AS
+        // metadata from THIS (resource) host instead of the authorization_servers
+        // entry would otherwise reach raw Hydra, skip the facade, and receive an
+        // unbound (aud=[]) token — invisible until enforcement is switched on.
+        authorization_endpoint: `${HYDRA_PUBLIC_URL}/oauth2/mcp-authorize`,
+        registration_endpoint: `${HYDRA_PUBLIC_URL}/oauth2/register`,
+      } };
     }
     res.set('Cache-Control', 'public, max-age=300').set('Access-Control-Allow-Origin', '*').json(metaCache.body);
   } catch (e) {
@@ -338,15 +351,16 @@ async function handleMcp(req: express.Request, res: express.Response) {
       res.status(403).json({ error: 'invalid_audience', resource_metadata: resourceMetadataUrl(host) });
       return;
     }
-    // Shadow observability: with enforcement off there was no signal about
-    // binding coverage (the gateway only logged on reject). Mirror the portal's
-    // `[mcp] audience-shadow` line so operators can verify clients are bound
-    // BEFORE flipping MCP_ENFORCE_AUDIENCE=true.
-    if (!ENFORCE_AUDIENCE) {
-      console.info('[gateway] audience-shadow', {
-        slug, client_id: intro.client_id, bound: boundToThis, platform: acceptsPlatform,
-      });
-    }
+    // Binding observability, logged on every ACCEPTED request regardless of
+    // enforcement: `bound` says whether the client is on a per-project audience
+    // (watch for all-true before flipping MCP_ENFORCE_AUDIENCE=true), and
+    // `platform` says it is still riding the transitional platform-audience
+    // allowance (watch for all-false before setting
+    // MCP_ACCEPT_PLATFORM_AUDIENCE=false). Once enforcement is on, only
+    // `platform` can still be true.
+    console.info('[gateway] audience-shadow', {
+      slug, client_id: intro.client_id, bound: boundToThis, platform: acceptsPlatform, enforce: ENFORCE_AUDIENCE,
+    });
   }
 
   // Site-access check — the authoritative per-request authorization. Unlike the
