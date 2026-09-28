@@ -336,18 +336,18 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   // flow auto-trusts — those are exactly the confused-deputy risk (their tokens
   // carry the user's sub and skip consent).
   //
-  // The deny set is the UNION of MCP_DENY_CLIENT_IDS (the chart wires it from
-  // `mcp.denyClientIds` to this portal AND the mcp-gateway) and
-  // TRUSTED_CLIENT_IDS — NOT a fallback chain. Trusted clients auto-consent
-  // (they skip the MCP consent screen), so their tokens were never explicitly
-  // authorized for MCP: every trusted client must be denied here, and taking
-  // the union keeps that self-maintaining as new trusted clients are added.
-  // DCR clients aren't trusted-for-consent, so they pass.
+  // The deny set is MCP_DENY_CLIENT_IDS (the chart wires it from
+  // `mcp.denyClientIds` to this portal AND the mcp-gateway, so the two enforce
+  // identically), falling back to TRUSTED_CLIENT_IDS, then the built-in
+  // default — the SAME fallback chain as the gateway (mcp-gateway/src/index.ts).
+  // It is deliberately NOT the union of the two: TRUSTED_CLIENT_IDS may include
+  // an MCP-driver client (claude-code-mcp is trusted for consent AND is the
+  // client MCP tooling uses), and unioning denied it here with
+  // `unauthorized_client` while the gateway let it through. DCR clients are
+  // never trusted-for-consent, so they pass.
   const DENY_CLIENT_IDS = new Set(
-    [
-      process.env.MCP_DENY_CLIENT_IDS || 'argocd,gitea',
-      process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea',
-    ].flatMap((v) => v.split(',')).map((s) => s.trim()).filter(Boolean),
+    (process.env.MCP_DENY_CLIENT_IDS || process.env.TRUSTED_CLIENT_IDS || 'argocd,gitea')
+      .split(',').map((s) => s.trim()).filter(Boolean),
   );
   if (introspection.client_id && DENY_CLIENT_IDS.has(introspection.client_id)) {
     console.warn('[mcp] rejected token from non-MCP client', { client_id: introspection.client_id });
