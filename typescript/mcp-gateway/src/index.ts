@@ -121,6 +121,19 @@ interface Introspection { active: boolean; sub?: string; client_id?: string; aud
 // Set MCP_ENFORCE_AUDIENCE=false only as a transitional escape hatch while
 // clients are migrated to send resource indicators.
 const ENFORCE_AUDIENCE = process.env.MCP_ENFORCE_AUDIENCE !== 'false';
+// Transitional: the portal's authorization facade (/oauth2/mcp-authorize, see
+// portal/src/routes/mcp.ts) stamps EVERY MCP token with the PLATFORM MCP
+// resource (PUBLIC_MCP_URL) — it cannot yet mint per-project audiences. Such a
+// token names a foreign resource from this gateway's point of view and would
+// trip the non-bypassable backstop below, making every project MCP endpoint
+// unreachable for any client that follows RFC 9728/8414 discovery. Accept the
+// platform audience as equivalent to this project's until the facade is
+// resource-aware. This grants nothing new: those tokens are already accepted
+// at the platform MCP, and sitePermission() below remains the authoritative
+// per-request gate. Set MCP_ACCEPT_PLATFORM_AUDIENCE=false once per-project
+// audiences are minted correctly.
+const PLATFORM_MCP_AUDIENCE = (process.env.PUBLIC_MCP_URL || '').replace(/\/+$/, '');
+const ACCEPT_PLATFORM_AUDIENCE = process.env.MCP_ACCEPT_PLATFORM_AUDIENCE !== 'false';
 
 function resourceForSlug(slug: string): string {
   return `https://${slug}.${PROJECTS_DOMAIN}/mcp`;
@@ -310,12 +323,29 @@ async function handleMcp(req: express.Request, res: express.Response) {
   // can never promote a foreign-resource token to this project's gateway.
   {
     const aud = Array.isArray(intro.aud) ? intro.aud : [];
-    const audMissingThis = !aud.includes(resourceForSlug(slug));
+    const boundToThis = aud.includes(resourceForSlug(slug));
+    const acceptsPlatform =
+      ACCEPT_PLATFORM_AUDIENCE &&
+      PLATFORM_MCP_AUDIENCE !== '' &&
+      aud.includes(PLATFORM_MCP_AUDIENCE);
+    const audMissingThis = !boundToThis && !acceptsPlatform;
     const audNamesOtherResource = aud.length > 0 && audMissingThis;
     if ((ENFORCE_AUDIENCE && audMissingThis) || audNamesOtherResource) {
-      console.warn('[gateway] audience mismatch', { slug, aud, client_id: intro.client_id, enforce: ENFORCE_AUDIENCE });
+      console.warn('[gateway] audience mismatch', {
+        slug, aud, client_id: intro.client_id,
+        enforce: ENFORCE_AUDIENCE, acceptPlatform: ACCEPT_PLATFORM_AUDIENCE,
+      });
       res.status(403).json({ error: 'invalid_audience', resource_metadata: resourceMetadataUrl(host) });
       return;
+    }
+    // Shadow observability: with enforcement off there was no signal about
+    // binding coverage (the gateway only logged on reject). Mirror the portal's
+    // `[mcp] audience-shadow` line so operators can verify clients are bound
+    // BEFORE flipping MCP_ENFORCE_AUDIENCE=true.
+    if (!ENFORCE_AUDIENCE) {
+      console.info('[gateway] audience-shadow', {
+        slug, client_id: intro.client_id, bound: boundToThis, platform: acceptsPlatform,
+      });
     }
   }
 
