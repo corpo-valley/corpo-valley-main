@@ -23,6 +23,7 @@
 import express from 'express';
 import * as crypto from 'crypto';
 import * as http from 'http';
+import { resourceForSlug as canonicalResourceForSlug } from './shared/mcp-resources';
 
 const PORT = Number(process.env.PORT || 3000);
 // Public OAuth issuer the clients drive (browser-facing).
@@ -135,8 +136,11 @@ const ENFORCE_AUDIENCE = process.env.MCP_ENFORCE_AUDIENCE !== 'false';
 const PLATFORM_MCP_AUDIENCE = (process.env.PUBLIC_MCP_URL || '').replace(/\/+$/, '');
 const ACCEPT_PLATFORM_AUDIENCE = process.env.MCP_ACCEPT_PLATFORM_AUDIENCE !== 'false';
 
+// Canonical form shared (as a mirrored file) with the portal's facade and
+// consent filter, so the exact-string comparison below can never disagree
+// with what the token issuer minted.
 function resourceForSlug(slug: string): string {
-  return `https://${slug}.${PROJECTS_DOMAIN}/mcp`;
+  return canonicalResourceForSlug(slug, PROJECTS_DOMAIN);
 }
 
 // Portal internal endpoint used to verify project ownership per request. This is
@@ -262,7 +266,15 @@ async function authServerMetadata(_req: express.Request, res: express.Response) 
       const r = await fetch(`${HYDRA_PUBLIC_INTERNAL}/.well-known/openid-configuration`);
       if (!r.ok) throw new Error(`hydra discovery ${r.status}`);
       const oidc = await r.json() as Record<string, unknown>;
-      metaCache = { at: Date.now(), body: { ...oidc, registration_endpoint: `${HYDRA_PUBLIC_URL}/oauth2/register` } };
+      metaCache = { at: Date.now(), body: {
+        ...oidc,
+        // MUST match portal/src/routes/mcp.ts: a client that discovers AS
+        // metadata from THIS (resource) host instead of the authorization_servers
+        // entry would otherwise reach raw Hydra, skip the facade, and receive an
+        // unbound (aud=[]) token — invisible until enforcement is switched on.
+        authorization_endpoint: `${HYDRA_PUBLIC_URL}/oauth2/mcp-authorize`,
+        registration_endpoint: `${HYDRA_PUBLIC_URL}/oauth2/register`,
+      } };
     }
     res.set('Cache-Control', 'public, max-age=300').set('Access-Control-Allow-Origin', '*').json(metaCache.body);
   } catch (e) {

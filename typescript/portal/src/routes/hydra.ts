@@ -8,62 +8,20 @@ import { userCanAccessService } from '../services/keto';
 import { requireSession } from '../middleware/session';
 import { validateCsrf, csrfHiddenField } from '../middleware/csrf';
 import { PROJECTS_DOMAIN } from '../services/platform-config';
+import { createAudienceFilter, hasProjectAudience } from '../services/audience-filter';
 
 const router = Router();
 
 const hydraAdminUrl = process.env.HYDRA_ADMIN_URL || 'http://localhost:4445';
 
-// Parse the project slug out of a per-project MCP resource indicator
-// (`https://<slug>.<PROJECTS_DOMAIN>/mcp`). Returns null for any audience that
-// isn't a project-MCP resource — those pass through access filtering.
-function projectSlugFromResource(resource: string): string | null {
-  try {
-    const u = new URL(resource);
-    const suffix = '.' + PROJECTS_DOMAIN;
-    if (!u.hostname.endsWith(suffix)) return null;
-    const slug = u.hostname.slice(0, -suffix.length);
-    if (!/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(slug)) return null;
-    return slug;
-  } catch {
-    return null;
-  }
-}
-
-// Root-cause defense for the MCP confused-deputy: a client can request ANY
-// resource indicator, so before Hydra stamps a per-project MCP resource into a
-// token's `aud`, drop any such audience the consenting subject has no effective
-// SITE access to. The keep/drop decision mirrors the per-project MCP gateway's
-// authorization model exactly (mcp-gateway sitePermission() with
-// MIN_SITE_PERM='read', backed by GET /internal/projects/:slug/access/:sub →
-// effectiveSitePerm): owner, direct user grants, group grants, and the
-// org-wide `everyone` grant (internal projects) all count — not just
-// ownership. Non-project audiences (the platform MCP, OIDC clients) pass
-// through untouched. Fails CLOSED: an unknown project or a failed lookup drops
-// the audience. The gateway re-checks access per request; this stops the token
-// issuing at all.
-async function filterAccessibleAudiences(requested: string[], subject: string): Promise<string[]> {
-  const out: string[] = [];
-  for (const aud of requested) {
-    const slug = projectSlugFromResource(aud);
-    if (!slug) { out.push(aud); continue; }
-    let allowed = false;
-    try {
-      const project = await getProjectBySlug(slug);
-      // Effective site permission >= read (i.e. anything above 'none') is the
-      // same floor the gateway enforces (MIN_SITE_PERM = 'read').
-      allowed = !!project && (await effectiveSitePerm(project, subject)) !== 'none';
-    } catch (err: any) {
-      console.warn('[consent] audience access lookup failed — dropping audience (fail closed)', { aud, subject, error: err?.message });
-      continue;
-    }
-    if (allowed) {
-      out.push(aud);
-    } else {
-      console.warn('[consent] dropping audience for project the subject has no site access to', { aud, subject });
-    }
-  }
-  return out;
-}
+// Consent-time audience gate: drops per-project MCP audiences the subject has
+// no site access to (fails closed). Logic + tests live in
+// services/audience-filter.ts; the resource grammar in shared/mcp-resources.ts.
+const filterAccessibleAudiences = createAudienceFilter({
+  projectsDomain: PROJECTS_DOMAIN,
+  getProjectBySlug,
+  effectiveSitePerm,
+});
 
 const hydra = new OAuth2Api(
   new Configuration({ basePath: hydraAdminUrl })
@@ -244,13 +202,25 @@ router.post('/consent/accept', requireSession, validateCsrf, async (req: Request
     if (!(await ensureServiceAccess(res, consentRequest.client?.client_id, consentRequest.subject || ''))) return;
 
     const idTokenClaims = await buildIdTokenClaims(consentRequest.subject || '');
+    const grantedAudience = await filterAccessibleAudiences(
+      consentRequest.requested_access_token_audience || [],
+      consentRequest.subject || '',
+    );
+    // Hydra's remembered consent does not discriminate on audience, so a
+    // remembered grant carrying a project audience could be replayed (consent
+    // skipped) for a DIFFERENT project's authorization and hand out a token
+    // bound to the wrong resource. Never remember a grant that names a project.
+    // (The facade also sends prompt=consent for project audiences; this is the
+    // server-side half.) This is the only accept site: trusted clients reach it
+    // via the auto-submitting form on GET /consent.
+    const rememberable = !hasProjectAudience(grantedAudience, PROJECTS_DOMAIN);
     const { data: completedRequest } = await hydra.acceptOAuth2ConsentRequest({
       consentChallenge,
       acceptOAuth2ConsentRequest: {
         grant_scope: consentRequest.requested_scope || [],
-        grant_access_token_audience: await filterAccessibleAudiences(consentRequest.requested_access_token_audience || [], consentRequest.subject || ''),
-        remember: true,
-        remember_for: 3600,
+        grant_access_token_audience: grantedAudience,
+        remember: rememberable,
+        remember_for: rememberable ? 3600 : 0,
         session: { id_token: idTokenClaims },
       },
     });

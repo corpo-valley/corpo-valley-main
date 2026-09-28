@@ -1,0 +1,40 @@
+name: Test
+
+# Unit tests + typecheck for the TypeScript services, and the mirrored-file
+# drift check. The image builds only run `tsc`; this is the gate that catches
+# logic regressions in the MCP auth path.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shared-sync:
+    name: Mirrored files in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - run: sh scripts/check-shared-sync.sh
+
+  unit:
+    name: ${{ matrix.app }} tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [portal, mcp-gateway]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # ubuntu-latest ships Node 20 (the same major as the image builders);
+      # no setup-node so this stays within the actions the repo already uses
+      # (the repo requires SHA-pinned actions).
+      - name: Install, typecheck, test
+        working-directory: typescript/${{ matrix.app }}
+        run: |
+          node --version && npm --version
+          npm ci --ignore-scripts
+          npx tsc --noEmit -p .
+          npm test
