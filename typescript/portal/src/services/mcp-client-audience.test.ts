@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createEnsureClientAudience, MAX_CLIENT_AUDIENCES, type HydraClientAdmin } from './mcp-client-audience';
+import { createEnsureClientAudience, type HydraClientAdmin } from './mcp-client-audience';
 
 function fakeAdmin(initial: Record<string, string[] | undefined>) {
   const clients = new Map(Object.entries(initial));
@@ -21,6 +21,7 @@ function fakeAdmin(initial: Record<string, string[] | undefined>) {
 
 const PLATFORM = 'https://mcp.example.com';
 const PROJ = 'https://proj.projects.example.com/mcp';
+const PROJ2 = 'https://proj2.projects.example.com/mcp';
 
 test('patches once PER (client, audience) pair, not per client', async () => {
   const { admin, patches } = fakeAdmin({ c1: [] });
@@ -51,14 +52,31 @@ test('does not patch (but memoises) when the audience is already allowlisted', a
   assert.equal(patches.length, 0);
 });
 
-test('refuses to grow an allowlist past the cap', async () => {
-  const full = Array.from({ length: MAX_CLIENT_AUDIENCES }, (_, i) => `https://p${i}.projects.example.com/mcp`);
-  const { admin, patches } = fakeAdmin({ c1: full });
-  const ensure = createEnsureClientAudience(admin);
-  await assert.rejects(() => ensure('c1', PROJ), /at capacity/);
-  assert.equal(patches.length, 0);
-  // An already-present audience is still fine at capacity.
-  await ensure('c1', full[0]);
+test('at capacity: prunes stale audiences with a replace patch, else hard error', async () => {
+  const full = Array.from({ length: 4 }, (_, i) => `https://p${i}.projects.example.com/mcp`);
+  // No isStale → hard error, nothing patched.
+  {
+    const { admin, patches } = fakeAdmin({ c1: full });
+    const ensure = createEnsureClientAudience(admin, { maxAudiences: 4 });
+    await assert.rejects(() => ensure('c1', PROJ), /at capacity/);
+    assert.equal(patches.length, 0);
+    await ensure('c1', full[0]); // already present is still fine at capacity
+  }
+  // isStale prunes p1 and p3 → replace with kept + new.
+  {
+    const { admin, patches, clients } = fakeAdmin({ c1: full });
+    const ensure = createEnsureClientAudience(admin, { maxAudiences: 4, isStale: async (a) => a.includes('p1') || a.includes('p3') });
+    await ensure('c1', PROJ);
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].jsonPatch[0].op, 'replace');
+    assert.deepEqual(clients.get('c1'), [full[0], full[2], PROJ]);
+  }
+  // Nothing stale → still a hard error.
+  {
+    const { admin } = fakeAdmin({ c1: full });
+    const ensure = createEnsureClientAudience(admin, { maxAudiences: 4, isStale: async () => false });
+    await assert.rejects(() => ensure('c1', PROJ), /at capacity/);
+  }
 });
 
 test('a failed patch is not memoised, so the next call retries', async () => {
@@ -72,4 +90,33 @@ test('a failed patch is not memoised, so the next call retries', async () => {
   await assert.rejects(() => ensure('c1', PROJ), /hydra down/);
   await ensure('c1', PROJ);
   assert.equal(patches.length, 1);
+});
+
+test('memo expires after the TTL and re-checks Hydra (self-heals a replaced allowlist)', async () => {
+  let t = 1_000_000;
+  const { admin, patches, clients } = fakeAdmin({ c1: [] });
+  const ensure = createEnsureClientAudience(admin, { memoTtlMs: 1000, now: () => t });
+  await ensure('c1', PROJ);
+  assert.equal(patches.length, 1);
+  clients.set('c1', [PLATFORM]); // an RFC 7592 PUT wiped the project audience behind our back
+  await ensure('c1', PROJ);
+  assert.equal(patches.length, 1, 'still memoised inside the TTL');
+  t += 1001;
+  await ensure('c1', PROJ);
+  assert.equal(patches.length, 2, 're-patched after expiry');
+  assert.deepEqual(clients.get('c1'), [PLATFORM, PROJ]);
+});
+
+test('invalidate(clientId) forgets only that client', async () => {
+  const { admin, patches, clients } = fakeAdmin({ c1: [], c2: [] });
+  const ensure = createEnsureClientAudience(admin);
+  await ensure('c1', PROJ);
+  await ensure('c1', PROJ2);
+  await ensure('c2', PROJ);
+  assert.equal(patches.length, 3);
+  clients.set('c1', []);
+  ensure.invalidate('c1');
+  await ensure('c1', PROJ);
+  await ensure('c2', PROJ);
+  assert.equal(patches.length, 4, 'c1 re-patched, c2 still memoised');
 });

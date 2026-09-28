@@ -18,8 +18,10 @@ import {
   OAUTH_PUBLIC_URL as HYDRA_PUBLIC_URL,
   PORTAL_PUBLIC_URL as PORTAL_BASE_URL,
 } from '../services/platform-config';
-import { selectMcpAudience, InvalidTargetError } from '../shared/mcp-resources';
+import { projectSlugFromResource } from '../shared/mcp-resources';
 import { createEnsureClientAudience } from '../services/mcp-client-audience';
+import { planMcpAuthorize } from '../services/mcp-facade';
+import { getProjectBySlug } from '../services/projects';
 
 const router = Router();
 
@@ -140,69 +142,36 @@ const hydraAdmin = new OAuth2Api(new Configuration({ basePath: HYDRA_ADMIN_URL }
 
 // Hydra rejects an `audience` request value that isn't in the client's
 // registered `audience` allowlist. The platform audience is injected at DCR
-// (below); per-project audiences are only known here, at authorize time, so
-// this patch is load-bearing for every project authorization. Memoised per
-// (client, audience) — see services/mcp-client-audience.ts for why.
-const ensureClientAudience = createEnsureClientAudience(hydraAdmin);
-
-const CLIENT_ID_RE = /^[A-Za-z0-9._~-]{1,128}$/;
+// (below); per-project audiences are only known at authorize time, so the
+// facade patches them in — load-bearing for every project authorization.
+// Memoised per (client, audience) with a TTL; see services/mcp-client-audience.ts.
+const projectExists = async (slug: string): Promise<boolean> => !!(await getProjectBySlug(slug));
+const ensureClientAudience = createEnsureClientAudience(hydraAdmin, {
+  // At capacity, drop audiences whose project no longer exists.
+  isStale: async (aud) => {
+    const slug = projectSlugFromResource(aud, PROJECTS_DOMAIN);
+    return slug !== null && !(await projectExists(slug));
+  },
+});
 
 // GET /oauth2/mcp-authorize — the facade authorization endpoint advertised in AS
 // metadata (by the portal for the platform MCP and by every project gateway).
-// Selects the audience from the client's `resource`, allowlists it on the
-// client, and forwards to Hydra's real /oauth2/auth. Served on the oauth host
-// via the DCR shim ingress (same origin as the issuer). Rate-limited in
-// index.ts (it is unauthenticated and calls the Hydra ADMIN API).
+// Selects the audience from the client's `resource`, requires the project to
+// exist, allowlists the audience on the client, and forwards to Hydra's real
+// /oauth2/auth. Served on the oauth host via the DCR shim ingress (same origin
+// as the issuer). Rate-limited in index.ts (unauthenticated; calls the Hydra
+// ADMIN API). Decision logic + tests: services/mcp-facade.ts.
 router.get('/oauth2/mcp-authorize', async (req: Request, res: Response) => {
   const qs = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?') + 1) : '';
-  const params = new URLSearchParams(qs);
-
-  const clientId = params.get('client_id');
-  if (!clientId || !CLIENT_ID_RE.test(clientId)) {
-    res.status(400).json({ error: 'invalid_request', error_description: 'client_id is required' });
-    return;
-  }
-
-  // RFC 8707 `resource` selects the audience: absent → platform, exactly one
-  // → its canonical form, several → hard error (exactly one audience per
-  // token, never a merge). Pure logic + tests in shared/mcp-resources.ts.
-  let audience: string;
-  try {
-    audience = selectMcpAudience(params.getAll('resource'), { projectsDomain: PROJECTS_DOMAIN, platformAudience: MCP_AUDIENCE });
-  } catch (err) {
-    // Deliberately NO fallback to MCP_AUDIENCE here: a typo'd project resource
-    // must not yield a token carrying platform-wide authority (RFC 8707 §2.2).
-    if (!(err instanceof InvalidTargetError)) throw err;
-    console.warn('[mcp] facade: rejected resource indicator', { clientId, reason: err.reason, resource: err.resource });
-    res.status(400).json({
-      error: 'invalid_target',
-      error_description: err.reason === 'multiple' ? 'exactly one resource may be requested' : 'unrecognized MCP resource',
-    });
-    return;
-  }
-
-  // Server-controlled: never honour a client-supplied `audience`.
-  params.delete('audience');
-  params.set('audience', audience);
-
-  // Hydra's remembered consent keys on client + subject + scope and IGNORES
-  // audience, so within remember_for a second authorization can skip consent
-  // and inherit the previous grant's audience — issuing a token for the WRONG
-  // resource with no error anywhere. Force the consent screen whenever this is
-  // not the default platform audience (consent also declines to remember such
-  // grants, routes/hydra.ts).
-  if (audience !== MCP_AUDIENCE) params.set('prompt', 'consent');
-
-  try {
-    await ensureClientAudience(clientId, audience);
-  } catch (err) {
-    // Fail closed: without the allowlist entry Hydra would reject the audience
-    // request anyway. Surface a retryable error rather than dropping the binding.
-    console.error('[mcp] facade: ensureClientAudience failed', { clientId, audience, msg: (err as Error)?.message });
-    res.status(502).json({ error: 'temporarily_unavailable', error_description: 'could not prepare client for MCP authorization' });
-    return;
-  }
-  res.redirect(302, `${HYDRA_PUBLIC_URL}/oauth2/auth?${params.toString()}`);
+  const plan = await planMcpAuthorize(qs, {
+    projectsDomain: PROJECTS_DOMAIN,
+    platformAudience: MCP_AUDIENCE,
+    hydraPublicUrl: HYDRA_PUBLIC_URL,
+    projectExists,
+    ensureClientAudience,
+  });
+  if (plan.kind === 'error') { res.status(plan.status).json(plan.body); return; }
+  res.redirect(302, plan.location);
 });
 
 // ── Dynamic Client Registration proxy (RFC 7591/7592) ─────────────────────────
@@ -274,9 +243,27 @@ async function proxyRegister(req: Request, res: Response): Promise<void> {
   let outBody: unknown = req.body ?? {};
   if (hasBody && outBody && typeof outBody === 'object' && !Array.isArray(outBody)) {
     const b = outBody as Record<string, unknown>;
-    const aud = Array.isArray(b.audience) ? (b.audience as unknown[]) : [];
-    if (!aud.includes(MCP_AUDIENCE)) outBody = { ...b, audience: [...aud, MCP_AUDIENCE] };
+    const aud = new Set<unknown>(Array.isArray(b.audience) ? (b.audience as unknown[]) : []);
+    aud.add(MCP_AUDIENCE);
+    // RFC 7592 PUT is a WHOLE-CLIENT replacement in Hydra: without this merge
+    // an update from the client would wipe every per-project audience the
+    // facade has allowlisted since registration, and the facade's memo would
+    // still believe they were present.
+    if (req.method === 'PUT' && id) {
+      try {
+        const { data } = await hydraAdmin.getOAuth2Client({ id });
+        for (const a of Array.isArray(data.audience) ? data.audience : []) aud.add(a);
+      } catch (err) {
+        // Unknown client / admin API hiccup: Hydra will reject the PUT itself
+        // if the client is unknown; otherwise proceed with what we have.
+        console.warn('[mcp] DCR proxy: could not read current audience for merge', { id, msg: (err as Error)?.message });
+      }
+    }
+    outBody = { ...b, audience: [...aud] };
   }
+  // Whatever the outcome, the client's allowlist may be about to change:
+  // forget the facade's memo for it so the next authorize re-checks Hydra.
+  if ((req.method === 'PUT' || req.method === 'DELETE') && id) ensureClientAudience.invalidate(id);
   try {
     const upstream = await fetch(url, {
       method: req.method,
@@ -360,12 +347,12 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   // a first-party OIDC client (e.g. `gitea`), which carries the user's Kratos
   // `sub`, could be replayed here to gain full project-management authority.
   //
-  // We can't bind on audience: real MCP-client tokens arrive with empty `aud`
-  // (the clients don't send RFC 8707 resource indicators). And we can't
-  // allow-list client_ids, because legitimate MCP clients register dynamically
-  // (DCR) with random ids. So we DENY the first-party clients that the consent
-  // flow auto-trusts — those are exactly the confused-deputy risk (their tokens
-  // carry the user's sub and skip consent).
+  // Audience binding (below) is the primary control, but tokens minted before
+  // the facade — or through raw Hydra — carry an empty `aud`, and we can't
+  // allow-list client_ids because legitimate MCP clients register dynamically
+  // (DCR) with random ids. So we ALSO deny the first-party clients that the
+  // consent flow auto-trusts — those are exactly the confused-deputy risk
+  // (their tokens carry the user's sub and skip the consent question).
   //
   // The deny set is MCP_DENY_CLIENT_IDS (the chart wires it from
   // `mcp.denyClientIds` to this portal AND the mcp-gateway, so the two enforce
@@ -391,18 +378,19 @@ async function authenticate(req: Request, res: Response): Promise<McpContext | n
   // (token_endpoint_auth_method=none) client. Legitimate MCP clients register
   // via DCR and MANY are confidential — e.g. claude.ai's connector, which Hydra
   // assigns a client_secret unless `none` is explicitly requested. The
-  // confused-deputy defence is the union deny-list above (every consent-skipping
-  // trusted client is denied); a public-only requirement would reject real MCP
-  // clients. RFC 8707 audience binding would be the stronger control, but Hydra
-  // v2.3.0 ignores the `resource` indicator, so MCP tokens have empty `aud` and
-  // enforcing it (MCP_ENFORCE_AUDIENCE) would reject all MCP clients.
+  // confused-deputy defence is the deny-list above plus the audience binding
+  // below; a public-only requirement would reject real MCP clients.
   //
-  // Audience binding (RFC 8707). Per the MCP authorization spec, clients send a
-  // `resource` indicator so Hydra stamps the resource into `aud`; we require it
-  // here so a token minted for another resource (or with no audience) can't be
-  // replayed against this broad platform MCP surface. Enforced by default — set
-  // MCP_ENFORCE_AUDIENCE=false only as a transitional escape hatch.
-  const requiredAud = process.env.MCP_RESOURCE_AUDIENCE || PUBLIC_MCP_URL;
+  // Audience binding (RFC 8707). Hydra v2.3.0 ignores the `resource` indicator
+  // itself, so the facade (/oauth2/mcp-authorize, above) translates it into
+  // Hydra's `audience` and consent grants it; the token then carries exactly
+  // one MCP resource. We require the PLATFORM one here so a token minted for a
+  // project (or with no audience) can't be replayed against this broad
+  // surface. The required value is the same constant the facade mints —
+  // there is deliberately no separate knob, which could only ever disagree.
+  // Enforced by default — set MCP_ENFORCE_AUDIENCE=false only as a
+  // transitional escape hatch while clients re-authorize through the facade.
+  const requiredAud = MCP_AUDIENCE;
   const enforceAud = process.env.MCP_ENFORCE_AUDIENCE !== 'false';
   const aud = Array.isArray(introspection.aud) ? introspection.aud : [];
   // Non-bypassable backstop: a token that NAMES some other resource (e.g. a

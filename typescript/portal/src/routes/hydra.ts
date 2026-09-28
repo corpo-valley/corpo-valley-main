@@ -9,6 +9,8 @@ import { requireSession } from '../middleware/session';
 import { validateCsrf, csrfHiddenField } from '../middleware/csrf';
 import { PROJECTS_DOMAIN } from '../services/platform-config';
 import { createAudienceFilter, hasProjectAudience } from '../services/audience-filter';
+import { canonicalMcpAudience, isMcpAudience, projectSlugFromResource } from '../shared/mcp-resources';
+import { PUBLIC_MCP_URL } from '../services/platform-config';
 
 const router = Router();
 
@@ -201,18 +203,58 @@ router.post('/consent/accept', requireSession, validateCsrf, async (req: Request
     // against a direct POST that skips the GET render).
     if (!(await ensureServiceAccess(res, consentRequest.client?.client_id, consentRequest.subject || ''))) return;
 
+    const requestedAudience = consentRequest.requested_access_token_audience || [];
+
+    // Consent is the one server-controlled chokepoint EVERY authorization
+    // crosses — including raw Hydra /oauth2/auth, which the ingress still
+    // routes and where a client can request any allowlisted audience. So the
+    // facade's invariants are re-checked here for MCP audiences:
+    //   • exactly ONE (both enforcement sites use aud.includes, so a token
+    //     naming platform AND a project would satisfy both at once);
+    //   • canonical spelling (enforcement compares exact strings).
+    // Non-MCP audiences (OIDC service clients) are untouched.
+    const mcpOpts = { projectsDomain: PROJECTS_DOMAIN, platformAudience: PUBLIC_MCP_URL };
+    const mcpRequested = requestedAudience.filter((a) => isMcpAudience(a, mcpOpts));
+    if (mcpRequested.length > 0) {
+      const nonCanonical = mcpRequested.find((a) => { try { return canonicalMcpAudience(a, mcpOpts) !== a; } catch { return true; } });
+      if (mcpRequested.length > 1 || nonCanonical !== undefined) {
+        console.warn('[consent] rejecting: MCP audience request violates one-canonical-audience rule', { client_id: consentRequest.client?.client_id, requested: requestedAudience });
+        const { data: rejected } = await hydra.rejectOAuth2ConsentRequest({
+          consentChallenge,
+          rejectOAuth2Request: { error: 'invalid_target', error_description: 'exactly one canonical MCP resource may be requested' },
+        });
+        return sendFormRedirect(res, rejected.redirect_to);
+      }
+    }
+
+    const grantedAudience = await filterAccessibleAudiences(requestedAudience, consentRequest.subject || '');
+
+    // A project audience the subject cannot access is DROPPED by the filter.
+    // Never turn that into a grant: the client asked for one project and would
+    // otherwise receive an unbound (aud=[]) token — which the platform MCP
+    // accepts while enforcement is off, i.e. a request for one project would
+    // silently escalate into platform-wide authority; with enforcement on it
+    // becomes an opaque post-login 403. Reject explicitly and tell the client.
+    const droppedProject = requestedAudience.find((a) => projectSlugFromResource(a, PROJECTS_DOMAIN) !== null && !grantedAudience.includes(a));
+    if (droppedProject !== undefined) {
+      const slug = projectSlugFromResource(droppedProject, PROJECTS_DOMAIN);
+      console.warn('[consent] rejecting: subject has no access to the requested project', { client_id: consentRequest.client?.client_id, subject: consentRequest.subject, slug });
+      const { data: rejected } = await hydra.rejectOAuth2ConsentRequest({
+        consentChallenge,
+        rejectOAuth2Request: { error: 'access_denied', error_description: `you do not have access to project ${slug}` },
+      });
+      return sendFormRedirect(res, rejected.redirect_to);
+    }
+
     const idTokenClaims = await buildIdTokenClaims(consentRequest.subject || '');
-    const grantedAudience = await filterAccessibleAudiences(
-      consentRequest.requested_access_token_audience || [],
-      consentRequest.subject || '',
-    );
-    // Hydra's remembered consent does not discriminate on audience, so a
-    // remembered grant carrying a project audience could be replayed (consent
-    // skipped) for a DIFFERENT project's authorization and hand out a token
-    // bound to the wrong resource. Never remember a grant that names a project.
-    // (The facade also sends prompt=consent for project audiences; this is the
-    // server-side half.) This is the only accept site: trusted clients reach it
-    // via the auto-submitting form on GET /consent.
+    // Defensive: never remember a grant that names a project. Hydra's
+    // remembered-consent match keys on client+subject+scope and ignores
+    // audience, so a consent provider that honours `skip` could reuse a grant
+    // made for a different resource. This portal renders consent every time
+    // today (GET /consent never reads `skip`), so this changes nothing yet —
+    // it is here so the invariant survives a future change. The facade sends
+    // prompt=consent for the same reason. This is the only accept site:
+    // trusted clients reach it via the auto-submitting form on GET /consent.
     const rememberable = !hasProjectAudience(grantedAudience, PROJECTS_DOMAIN);
     const { data: completedRequest } = await hydra.acceptOAuth2ConsentRequest({
       consentChallenge,

@@ -25,7 +25,8 @@ export class InvalidTargetError extends Error {
   }
 }
 
-const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+/** One DNS label: what a project slug must be. Shared so no caller re-types it. */
+export const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 
 /** The canonical per-project MCP resource for a slug. */
 export function resourceForSlug(slug: string, projectsDomain: string): string {
@@ -46,6 +47,11 @@ export function projectSlugFromResource(resource: string, projectsDomain: string
   return DNS_LABEL.test(slug) ? slug : null;
 }
 
+/** True if the audience is any MCP resource of this deployment (platform or project). */
+export function isMcpAudience(resource: string, opts: { projectsDomain: string; platformAudience: string }): boolean {
+  return resource === opts.platformAudience || projectSlugFromResource(resource, opts.projectsDomain) !== null;
+}
+
 /**
  * Strict VALIDATOR for a client-supplied resource indicator.
  *
@@ -56,6 +62,12 @@ export function projectSlugFromResource(resource: string, projectsDomain: string
  * then get a 403 from the gateway's exact-string comparison. The final guard is
  * simply `input === rebuilt`: a resource is canonical iff it round-trips.
  *
+ * One deliberate alias: the PLATFORM resource with a trailing slash. The MCP
+ * TypeScript SDK (Claude Code, Cursor, …) parses the advertised resource with
+ * `new URL()` and sends `.href`, and WHATWG serialises a bare origin as
+ * `https://mcp.example.com/`. The MCP spec says servers SHOULD accept both
+ * spellings; we accept it and still emit the canonical no-slash form.
+ *
  * Throws InvalidTargetError; callers MUST surface 400 invalid_target and must
  * NOT fall back to the platform audience (that would silently escalate a
  * malformed project resource into platform-wide authority).
@@ -64,7 +76,9 @@ export function canonicalMcpAudience(
   resource: string,
   opts: { projectsDomain: string; platformAudience: string },
 ): string {
-  if (resource === opts.platformAudience) return opts.platformAudience;
+  if (resource === opts.platformAudience || resource === opts.platformAudience + '/') {
+    return opts.platformAudience;
+  }
 
   let u: URL;
   try { u = new URL(resource); } catch { throw new InvalidTargetError(resource); }

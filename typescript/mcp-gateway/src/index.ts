@@ -23,7 +23,7 @@
 import express from 'express';
 import * as crypto from 'crypto';
 import * as http from 'http';
-import { resourceForSlug as canonicalResourceForSlug } from './shared/mcp-resources';
+import { DNS_LABEL, resourceForSlug as canonicalResourceForSlug } from './shared/mcp-resources';
 
 const PORT = Number(process.env.PORT || 3000);
 // Public OAuth issuer the clients drive (browser-facing).
@@ -94,8 +94,9 @@ function slugFromHost(host: string | undefined): string | null {
   const suffix = '.' + PROJECTS_DOMAIN;
   if (!h.endsWith(suffix)) return null;
   const slug = h.slice(0, -suffix.length);
-  // DNS-label; never let a crafted Host escape the `<slug>-mcp.<slug>.svc` target.
-  if (!/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(slug)) return null;
+  // DNS-label (shared grammar); never let a crafted Host escape the
+  // `<slug>-mcp.<slug>.svc` target.
+  if (!DNS_LABEL.test(slug)) return null;
   return slug;
 }
 
@@ -350,15 +351,16 @@ async function handleMcp(req: express.Request, res: express.Response) {
       res.status(403).json({ error: 'invalid_audience', resource_metadata: resourceMetadataUrl(host) });
       return;
     }
-    // Shadow observability: with enforcement off there was no signal about
-    // binding coverage (the gateway only logged on reject). Mirror the portal's
-    // `[mcp] audience-shadow` line so operators can verify clients are bound
-    // BEFORE flipping MCP_ENFORCE_AUDIENCE=true.
-    if (!ENFORCE_AUDIENCE) {
-      console.info('[gateway] audience-shadow', {
-        slug, client_id: intro.client_id, bound: boundToThis, platform: acceptsPlatform,
-      });
-    }
+    // Binding observability, logged on every ACCEPTED request regardless of
+    // enforcement: `bound` says whether the client is on a per-project audience
+    // (watch for all-true before flipping MCP_ENFORCE_AUDIENCE=true), and
+    // `platform` says it is still riding the transitional platform-audience
+    // allowance (watch for all-false before setting
+    // MCP_ACCEPT_PLATFORM_AUDIENCE=false). Once enforcement is on, only
+    // `platform` can still be true.
+    console.info('[gateway] audience-shadow', {
+      slug, client_id: intro.client_id, bound: boundToThis, platform: acceptsPlatform, enforce: ENFORCE_AUDIENCE,
+    });
   }
 
   // Site-access check — the authoritative per-request authorization. Unlike the
