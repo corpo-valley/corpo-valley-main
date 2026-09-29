@@ -158,15 +158,20 @@ function escapeRe(s: string): string {
 // deploy that renames the namespaces while this generator keeps emitting the
 // real value. Requiring the registry host verbatim also means the `:5000` in
 // the host can never be mistaken for the tag separator, and an off-registry
-// image (`postgres:16-alpine`) never matches. The tag class is Docker's tag
-// grammar: no whitespace, `:`, `#`, or newlines can pass, so a tag lifted from
-// a hand-edited file can't inject YAML structure when it's stamped back into a
-// generated file.
+// image (`postgres:16-alpine`) never matches. The path class excludes `@` so
+// a digest-form reference (`<registry>/o/r@sha256:<hex>`) is NOT an image line
+// to either caller: the pin endpoint must not rewrite it into `@sha256:<tag>`
+// (a corrupt reference) and the generator must not lift `<hex>` out as if it
+// were a tag (a nonexistent one). Digest form is hand-edit-only and treated
+// like an off-registry image — left alone by the pin, bootstrap fallback on
+// regeneration. The tag class is Docker's tag grammar: no whitespace, `:`,
+// `#`, or newlines can pass, so a tag lifted from a hand-edited file can't
+// inject YAML structure when it's stamped back into a generated file.
 //
 // Returns a fresh RegExp per call: it carries the `g` flag, and a shared /g
 // regex is stateful (lastIndex) across callers.
 export function projectImageLineRe(): RegExp {
-  return new RegExp(`^([ \\t]*image:[ \\t]+${escapeRe(REGISTRY)}/[^\\s:]+):([A-Za-z0-9_.-]{1,128})[ \\t]*$`, 'mg');
+  return new RegExp(`^([ \\t]*image:[ \\t]+${escapeRe(REGISTRY)}/[^\\s:@]+):([A-Za-z0-9_.-]{1,128})[ \\t]*$`, 'mg');
 }
 
 // The image tag an existing deployment.yaml is pinned to, or null when there
@@ -496,6 +501,14 @@ export async function composeProjectManifests(opts: ManifestOpts): Promise<void>
   // owner's resource tuning (Layer 2). Reused below as the deployment's
   // existing blob for the sha + idempotency compare, so this is one GET, not
   // two. A 404 (or any read error) → null → the chart defaults are used.
+  //
+  // NOTE on the .catch: a non-404 read failure (Gitea 5xx, network) nulls
+  // existingDeployment, so the regenerated file falls back to the bootstrap tag
+  // — but it ALSO drops the blob sha, so upsertRepoFile POSTs on a path that
+  // already exists and Gitea rejects it. The write fails loudly instead of
+  // silently un-pinning the live deployment. A future "retry without sha" or
+  // "fetch sha separately" change would reopen that un-pin bug; if one is ever
+  // needed, the read error must propagate (fail closed) rather than null out.
   const existingDeployment = await getFile({ owner: opts.owner, repo: opts.repo, path: 'k8s/deployment.yaml' }).catch(() => null);
   const files: Array<{ path: string; content: string; prefetched?: typeof existingDeployment }> = [
     {

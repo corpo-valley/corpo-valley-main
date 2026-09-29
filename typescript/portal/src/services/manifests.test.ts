@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { buildDeploymentYaml, extractPinnedTag, projectImageLineRe } from './manifests';
 import { CV_REGISTRY } from './platform-config';
 import type { Capabilities } from './templates';
@@ -130,4 +132,34 @@ test('extractPinnedTag never returns a tag that could inject YAML structure', ()
   // single-line tag itself is ever returned.
   assert.equal(extractPinnedTag(`          image: ${IMG}:v1\n  evil: true\n`), 'v1');
   assert.equal(extractPinnedTag(`          image: ${IMG}:v1.2.3_rc-4   \n`), 'v1.2.3_rc-4', 'trailing whitespace tolerated');
+});
+
+test('the seeded template (unrendered {{CV_REGISTRY}}/{{OWNER}}/{{REPO}}:bootstrap on all 4 lines) → null, bootstrap fallback', () => {
+  // The real reference copy the portal seeds into a new repo, read from disk so
+  // the fixture can't drift from what the template actually ships.
+  const template = readFileSync(resolve(__dirname, '../../../../community-center/k8s/deployment.yaml'), 'utf8');
+  assert.equal(imageLines(template).length, 4);
+  assert.ok(imageLines(template).every((l) => l === 'image: {{CV_REGISTRY}}/{{OWNER}}/{{REPO}}:bootstrap'), imageLines(template).join('\n'));
+  assert.equal(extractPinnedTag(template), null, 'unrendered placeholders are not platform-registry lines');
+  assert.ok(imageLines(buildDeploymentYaml({ ...BASE, caps: ALL, existingDeployment: template }))
+    .every((l) => l === `image: ${IMG}:bootstrap`));
+  // And the rendered form (what actually lands in the repo): placeholders
+  // substituted, still on the placeholder tag → same fallback.
+  const rendered = template.replace(/\{\{CV_REGISTRY\}\}/g, CV_REGISTRY).replace(/\{\{OWNER\}\}/g, 'alice').replace(/\{\{REPO\}\}/g, 'shop');
+  assert.ok(imageLines(rendered).every((l) => l === `image: ${IMG}:bootstrap`));
+  assert.equal(extractPinnedTag(rendered), null);
+  assert.ok(imageLines(buildDeploymentYaml({ ...BASE, caps: ALL, existingDeployment: rendered }))
+    .every((l) => l === `image: ${IMG}:bootstrap`));
+});
+
+test('digest-form image lines are ignored by both the generator and the pin rewrite', () => {
+  // Hand-edit-only shape. Never treat `@sha256` as a path and the hex as a tag.
+  const hex = 'a'.repeat(64);
+  const digestLine = `          image: ${IMG}@sha256:${hex}`;
+  assert.equal(extractPinnedTag(digestLine + '\n'), null);
+  assert.equal(pin(digestLine, TAG), digestLine, 'pin must not corrupt a digest reference');
+  const out = buildDeploymentYaml({ ...BASE, caps: WEB_ONLY, existingDeployment: digestLine + '\n' });
+  assert.deepEqual(imageLines(out), [`image: ${IMG}:bootstrap`]);
+  // A digest line alongside a normally pinned sibling: the sibling's tag wins.
+  assert.equal(extractPinnedTag(`${digestLine}\n          image: ${IMG}:${TAG}\n`), TAG);
 });
