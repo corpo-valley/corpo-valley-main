@@ -278,16 +278,11 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
       return;
     }
 
-    // Line-anchored rewrite of every `image: <CV_REGISTRY>/<owner>/<slug>:<tag>`
-    // line, using the SAME regex the manifest generator uses to read the
-    // pinned tag back out (services/manifests.ts projectImageLineRe) — so what
-    // this endpoint pins is exactly what a later capability toggle preserves.
-    // Group 1 is everything up to the tag separator (the registry host is
-    // matched verbatim, so its `:5000` can't be mistaken for that separator).
-    // The `g` flag pins ALL container image lines: a multi-capability project
-    // runs several containers from the same image, so they must all move to
-    // the new tag together. An off-registry image such as the postgres
-    // StatefulSet's `postgres:16-alpine` doesn't match, so it's left alone.
+    // Rewrite every project image line to the new tag, with the same regex the
+    // manifest generator reads the pinned tag back with (services/manifests.ts),
+    // so what this pins is exactly what a later capability toggle preserves. The
+    // `g` flag matters: a multi-capability project runs several containers from
+    // the same image. The postgres StatefulSet's `postgres:16-alpine` doesn't match.
     const updated = file.content.replace(projectImageLineRe(), `$1:${tag}`);
 
     if (updated === file.content) {

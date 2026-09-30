@@ -6,8 +6,6 @@
 // these three files whenever the capability set changes (project create, or the
 // set_capabilities tool) and commits them to the project repo; ArgoCD applies
 // them and the Build workflow's pin keeps every container's image tag current.
-// A regeneration carries the currently pinned tag forward (see extractPinnedTag)
-// so toggling a capability never rewinds a live project to the placeholder tag.
 //
 // Keep the emitted YAML in sync with the reference copies the template ships
 // in community-center/k8s/ — same containers, ports, probes, and security
@@ -33,10 +31,10 @@ interface ManifestOpts {
   slug: string;
   caps: Capabilities;
   // The project's current k8s/deployment.yaml, if it already exists. Used to
-  // preserve, across a regeneration, (a) each container's owner-tuned
-  // `resources:` (Layer 2) and (b) the image tag the Build workflow last
-  // pinned. composeProjectManifests supplies this; callers that build a
-  // brand-new project leave it unset (chart defaults + the bootstrap tag).
+  // preserve each container's owner-tuned `resources:` (Layer 2) and the image
+  // tag the Build workflow last pinned across a regeneration.
+  // composeProjectManifests supplies this; callers that build a brand-new
+  // project leave it unset (chart defaults + the bootstrap tag).
   existingDeployment?: string | null;
 }
 
@@ -144,52 +142,25 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// THE definition of "a container `image:` line that points at the platform
-// registry". Shared by this generator (to carry the pinned tag forward) and by
-// the Build workflow's pin endpoint (routes/internal.ts, which rewrites the
-// tag), so the two code paths can never disagree about which lines are project
-// images. Line-anchored (use with a multi-line string). Group 1 is everything
-// up to the tag separator (`<indent>image: <registry>/<owner>/<repo>`), group 2
-// is the tag.
-//
-// Anchored on the configured CV_REGISTRY host (regex-escaped) rather than a
-// hard-coded `registry.cv-registry` prefix: the chart derives that host from
-// its namespacePrefix, so a prefix-based anchor silently stops matching on a
-// deploy that renames the namespaces while this generator keeps emitting the
-// real value. Requiring the registry host verbatim also means the `:5000` in
-// the host can never be mistaken for the tag separator, and an off-registry
-// image (`postgres:16-alpine`) never matches. The path class excludes `@` so
-// a digest-form reference (`<registry>/o/r@sha256:<hex>`) is NOT an image line
-// to either caller: the pin endpoint must not rewrite it into `@sha256:<tag>`
-// (a corrupt reference) and the generator must not lift `<hex>` out as if it
-// were a tag (a nonexistent one). Digest form is hand-edit-only and treated
-// like an off-registry image — left alone by the pin, bootstrap fallback on
-// regeneration. The tag class is Docker's tag grammar: no whitespace, `:`,
-// `#`, or newlines can pass, so a tag lifted from a hand-edited file can't
-// inject YAML structure when it's stamped back into a generated file.
-//
-// Returns a fresh RegExp per call: it carries the `g` flag, and a shared /g
-// regex is stateful (lastIndex) across callers.
+// A container `image:` line on the platform registry. Group 1 is everything up
+// to the tag separator, group 2 the tag. Shared with the Build workflow's pin
+// endpoint (routes/internal.ts) so what it pins is exactly what a regeneration
+// preserves. Anchored on the configured CV_REGISTRY host, not a hard-coded
+// `registry.cv-registry` prefix, which stops matching on a deploy with a
+// non-default namespacePrefix. The path class excludes `@` so a digest-form
+// reference (`.../o/r@sha256:<hex>`) is not an image line to either caller.
+// The tag class is Docker's tag grammar. Fresh RegExp per call: it carries `g`.
 export function projectImageLineRe(): RegExp {
   return new RegExp(`^([ \\t]*image:[ \\t]+${escapeRe(REGISTRY)}/[^\\s:@]+):([A-Za-z0-9_.-]{1,128})[ \\t]*$`, 'mg');
 }
 
-// The image tag an existing deployment.yaml is pinned to, or null when there
-// is nothing to carry forward: no file, no platform-registry image line, or
-// every such line still on the bootstrap placeholder. UNTRUSTED INPUT — only a
-// tag that matched projectImageLineRe's tag class is ever returned.
-//
-// Mixed tags (containers on different tags in the same file) can only arise
-// from hand-editing: the generator stamps one tag on every container and the
-// pin endpoint rewrites every matching line together. Decision: the FIRST
-// non-bootstrap tag in file order wins and is normalised onto every container.
-// In a generated file that's the static-site container, which is always
-// present and always first, so the choice is deterministic; and any real tag
-// beats falling back to `bootstrap`, which is exactly the un-pinning this
-// function exists to prevent (the placeholder tag doesn't exist in the
-// registry once the first build has run). A container still on `bootstrap`
-// while a sibling is pinned is likewise lifted onto the sibling's tag — one
-// image serves every container, so that image already has every module.
+// The tag an existing deployment.yaml is pinned to, or null when there is
+// nothing to carry forward (no file, no platform-registry image line, or every
+// such line still on the bootstrap placeholder). The input is a hand-editable
+// repo file; only a tag matching projectImageLineRe's tag class is returned.
+// Mixed tags can only come from hand-editing. The first non-bootstrap tag in
+// file order wins (in a generated file, the always-first static-site
+// container): any real tag beats un-pinning every container to `bootstrap`.
 export function extractPinnedTag(existing: string | null | undefined): string | null {
   if (!existing) return null;
   const re = projectImageLineRe();
@@ -275,12 +246,9 @@ function containerBlock(opts: {
 }
 
 export function buildDeploymentYaml(opts: ManifestOpts): string {
-  // Every container runs the same image, so a newly enabled capability's
-  // container inherits the tag its siblings are already pinned to. Only a
-  // project with no pinned tag yet (brand-new, or still on the template's
-  // placeholder) gets BOOTSTRAP_TAG — the pin endpoint replaces it after the
-  // first build. Without this, every capability toggle rewound a live project
-  // to a tag that no longer exists in the registry.
+  // One image serves every container, so a newly enabled capability's container
+  // gets the tag its siblings are already pinned to. Without this, a capability
+  // toggle rewound a live project to a tag that no longer exists in the registry.
   const tag = extractPinnedTag(opts.existingDeployment) ?? BOOTSTRAP_TAG;
   const img = image(opts.owner, opts.repo, tag);
   const sharedVal = opts.caps.shared ? 'true' : 'false';
@@ -349,14 +317,11 @@ export function buildDeploymentYaml(opts: ManifestOpts): string {
   }
   return `# Generated by the Corpo Valley portal from this project's capabilities.
 # One container per enabled capability, all from the same image. Toggle
-# capabilities in the portal and the platform rewrites this — but it PRESERVES
-# two things: each container's \`resources:\` block, so you can tune cpu/memory
-# here and your values stick (the platform only fills defaults for a newly
-# added capability), and the currently pinned image tag, which every container
-# (including a newly added one) keeps. Anything else you hand-edit here is
-# replaced on the next regeneration. Memory is also bounded by the project's
-# ResourceQuota/LimitRange. The image tag is pinned by the Build workflow on
-# every push to main; \`bootstrap\` is only the placeholder before the first build.
+# capabilities in the portal and the platform rewrites this, preserving each
+# container's \`resources:\` block (tune cpu/memory here and your values stick)
+# and the pinned image tag; anything else you hand-edit is replaced. Memory is
+# also bounded by the project's ResourceQuota/LimitRange. The image tag is
+# pinned by the Build workflow on every push to main.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -500,15 +465,10 @@ export async function composeProjectManifests(opts: ManifestOpts): Promise<void>
   // Fetch the current deployment up front so regeneration can preserve the
   // owner's resource tuning (Layer 2). Reused below as the deployment's
   // existing blob for the sha + idempotency compare, so this is one GET, not
-  // two. A 404 (or any read error) → null → the chart defaults are used.
-  //
-  // NOTE on the .catch: a non-404 read failure (Gitea 5xx, network) nulls
-  // existingDeployment, so the regenerated file falls back to the bootstrap tag
-  // — but it ALSO drops the blob sha, so upsertRepoFile POSTs on a path that
-  // already exists and Gitea rejects it. The write fails loudly instead of
-  // silently un-pinning the live deployment. A future "retry without sha" or
-  // "fetch sha separately" change would reopen that un-pin bug; if one is ever
-  // needed, the read error must propagate (fail closed) rather than null out.
+  // two. A 404 (or any read error) → null → the chart defaults are used. A
+  // non-404 failure also drops the blob sha, so the upsert POSTs on an existing
+  // path and Gitea rejects it: the write fails loudly instead of silently
+  // un-pinning. Don't add a "retry without sha" here; propagate the error instead.
   const existingDeployment = await getFile({ owner: opts.owner, repo: opts.repo, path: 'k8s/deployment.yaml' }).catch(() => null);
   const files: Array<{ path: string; content: string; prefetched?: typeof existingDeployment }> = [
     {
