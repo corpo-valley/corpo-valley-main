@@ -18,6 +18,7 @@
 import {
   pool, Project, GrantLevel, EffectivePerm, maxPerm,
 } from './projects';
+import { projectTierFromGrants } from './project-tier';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -378,4 +379,14 @@ export async function effectiveRepoPerm(project: Project, userId: string): Promi
   if (project.owner_id === userId) return 'admin';
   const grants = await grantLevelsFor(project.id, userId);
   return maxPerm(...grants.map((g) => g.repo_perm));
+}
+
+// The viewer's DASHBOARD tier on the project (see services/project-tier.ts):
+// owner / platform admin → admin, otherwise the highest level across both
+// facets of their applicable grants. This is what gates the portal's project
+// pages and mutations so a user granted `admin` can actually administer.
+export async function projectTierFor(project: Project, userId: string, platformAdmin = false): Promise<EffectivePerm> {
+  if (platformAdmin || project.owner_id === userId) return 'admin';
+  const grants = await grantLevelsFor(project.id, userId);
+  return projectTierFromGrants(project, userId, false, grants);
 }
