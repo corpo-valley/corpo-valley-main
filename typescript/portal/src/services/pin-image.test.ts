@@ -40,3 +40,8 @@ test('anchors on the configured registry host, not a hard-coded one', () => {
   assert.ok(out.includes(`${other}/alice/shop:v1`), 'configured host is pinned');
   assert.ok(out.includes(`${HOST}/alice/shop:bootstrap`), 'other hosts are left alone');
 });
+
+test('leaves digest-pinned image lines alone', () => {
+  const y = `      image: ${HOST}/alice/shop@sha256:0123456789abcdef`;
+  assert.equal(rewritePinnedImageLines(y, { owner: 'bob', repo: 'shop', tag: 'v1' }), y);
+});

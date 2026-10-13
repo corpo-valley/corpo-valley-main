@@ -255,7 +255,11 @@ export async function executeOwnershipTransfer(
     deps.log(`${slug}: owner ${project.owner_id} → ${target.id}, gitea_repo ${project.gitea_repo} → ${newGiteaRepo}`);
   } catch (e: any) {
     deps.error(`${slug}: DB update failed AFTER the Gitea transfer: ${e?.message}`);
-    const fix = `UPDATE projects SET owner_id = '${target.id}', gitea_repo = '${newGiteaRepo}' WHERE id = '${project.id}';`;
+    // Only the repo path: with gitea_repo pointing at the new owner, a re-submit
+    // of the form takes the "already under <newOwner>" branch above and runs the
+    // remaining steps (owner row, grants, collaborators, Argo). Setting owner_id
+    // by hand would make the re-submit refuse with "already owns this project".
+    const fix = `UPDATE projects SET gitea_repo = '${newGiteaRepo}' WHERE id = '${project.id}';`;
     await deps.recordAudit(input.actorEmail, slug, {
       action: TRANSFER_AUDIT_ACTION, fromOwnerId: project.owner_id, toOwnerId: target.id,
       fromEmail, toEmail, giteaFrom, giteaTo: newGiteaRepo,
@@ -263,7 +267,7 @@ export async function executeOwnershipTransfer(
     } satisfies TransferAuditChange);
     return {
       ok: false, changed: true, project,
-      message: `The Gitea repository is now ${newGiteaRepo} but the portal record could NOT be updated (${e?.message}). The project is inconsistent until this is fixed by hand, then re-submit this form to finish the remaining steps.`,
+      message: `The Gitea repository is now ${newGiteaRepo} but the portal record could NOT be updated (${e?.message}). The project is inconsistent until this is fixed by hand; after running the SQL below, re-submit this form to finish the remaining steps.`,
       details: [...details, `Run against the portal database: ${fix}`],
     };
   }

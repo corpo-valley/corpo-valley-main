@@ -27,6 +27,8 @@ export function rewritePinnedImageLines(
 ): string {
   const path = `${target.owner}/${target.repo}`;
   const host = registry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`^(\\s*image:\\s+${host})\\/[^\\s:]+:[A-Za-z0-9_.-]+$`, 'mg');
+  // Path class excludes `@` so digest-pinned lines (`…/foo@sha256:…`) are left
+  // alone, matching projectImageLineRe() in services/manifests.ts.
+  const re = new RegExp(`^(\\s*image:\\s+${host})\\/[^\\s:@]+:[A-Za-z0-9_.-]+$`, 'mg');
   return content.replace(re, (_m, prefix: string) => `${prefix}/${path}:${target.tag}`);
 }

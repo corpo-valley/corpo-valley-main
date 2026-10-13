@@ -821,6 +821,11 @@ router.post('/projects/:slug/transfer', async (req: Request, res: Response) => {
       await render(400, { ok: false, message: 'Provide the new owner\'s email or username.' }, project);
       return;
     }
+    // Cheap checks before the Kratos directory walk (the plan re-checks this).
+    if (confirmSlug.trim() !== project.slug) {
+      await render(400, { ok: false, message: `Type the project slug (${project.slug}) to confirm the transfer.` }, project);
+      return;
+    }
     const target = form.target.includes('@')
       ? await findIdentityByEmail(form.target)
       : await findIdentityByUsername(form.target);

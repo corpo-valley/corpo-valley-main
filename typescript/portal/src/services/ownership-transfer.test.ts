@@ -182,7 +182,7 @@ test('execute: a DB failure after the Gitea transfer is reported with the manual
   assert.equal(out.ok, false);
   assert.equal(out.changed, true);
   assert.match(out.message, /bob\/shop/);
-  assert.ok(out.details.some((d) => d.includes("UPDATE projects SET owner_id = 'u-bob', gitea_repo = 'bob/shop' WHERE id = 'p-1';")));
+  assert.ok(out.details.some((d) => d.includes("UPDATE projects SET gitea_repo = 'bob/shop' WHERE id = 'p-1';")));
   assert.ok(!calls.some((c) => c.startsWith('setGrantFacet') || c.startsWith('patchArgo')), 'later steps skipped');
   assert.equal(audits.length, 1);
   assert.deepEqual(audits[0].partial, ['portal row not updated: db down']);
