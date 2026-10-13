@@ -808,6 +808,7 @@ function dashboardLayout(
     adminNav = `
       <div class="nav-section">Admin</div>
       <a href="/admin/users"${activeNav === 'users' ? ' class="active"' : ''}>Users</a>
+      <a href="/admin/projects"${activeNav === 'admin-projects' ? ' class="active"' : ''}>All projects</a>
       <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>SSO Apps</a>
       <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
       <a href="/admin/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Resources</a>
@@ -3264,6 +3265,182 @@ export function renderAdminProjectResourceDetail(
   }
 
   return dashboardLayout(`Resources — ${view.slug}`, body, email, true, 'resources');
+}
+
+// ── Admin: all projects + ownership transfer ───────────────────────────────
+
+// One row of the /admin/projects table.
+export interface AdminProjectRow {
+  slug: string;
+  name: string;
+  ownerId: string;
+  ownerEmail: string;      // resolved email, or the raw id when Kratos can't
+  status: string;          // provisioning | ready | failed
+  createdAt: string;       // ISO
+  giteaRepo: string | null;
+}
+
+function projectStatusBadge(status: string): string {
+  const color = status === 'ready' ? '#84a25a' : status === 'failed' ? '#d9734a' : '#e8b94a';
+  return `<span style="color:${color};">${escapeHtml(status)}</span>`;
+}
+
+// /admin/projects — every project on the platform with its owner, for admins
+// to find a project and hand it to someone else.
+export function renderAdminProjectsIndex(projects: AdminProjectRow[], email: string): string {
+  let body = `<p>Every project on the platform, whoever owns it. Open a project to
+    <strong>transfer ownership</strong> to another member (the Gitea repository,
+    access grants and the ArgoCD deployment move with it), or jump to its resource
+    budget.</p>`;
+
+  const rows = projects.map((p) => {
+    const site = projectSiteUrl(escapeHtml(p.slug));
+    return `
+        <tr>
+          <td><a href="/admin/projects/${escapeHtml(p.slug)}">${escapeHtml(p.name)}</a><br>
+              <code style="font-size:0.75rem;">${escapeHtml(p.slug)}</code></td>
+          <td><a href="/admin/users/${escapeHtml(p.ownerId)}">${escapeHtml(p.ownerEmail)}</a></td>
+          <td>${projectStatusBadge(p.status)}</td>
+          <td>${escapeHtml(whenLabel(p.createdAt))}</td>
+          <td style="white-space:nowrap;">
+            <a href="/admin/projects/${escapeHtml(p.slug)}" class="btn btn-secondary btn-sm">Transfer</a>
+            <a href="/admin/resources/${escapeHtml(p.slug)}" class="btn btn-secondary btn-sm">Resources</a>
+            <a href="${site}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Site ↗</a>
+          </td>
+        </tr>`;
+  }).join('');
+
+  body += `
+    <h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:1.5rem;">Projects (${projects.length})</h2>
+    ${projects.length === 0 ? '<p class="help">No projects yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Project</th><th>Owner</th><th>Status</th><th>Created</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`}`;
+
+  return dashboardLayout('All projects', body, email, true, 'admin-projects');
+}
+
+export interface AdminProjectTransferView {
+  slug: string;
+  name: string;
+  status: string;
+  createdAt: string;
+  ownerId: string;
+  ownerEmail: string;
+  giteaRepo: string | null;
+  argoNamespace: string;
+  audit: ProjectResourceAuditRow[];
+}
+
+// The admin's raw form input, echoed back after a failed submit.
+export interface TransferFormState {
+  target: string;
+  keepPreviousOwner: boolean;
+}
+
+// /admin/projects/:slug — project summary + the ownership-transfer form.
+// Mirrors the dashboard Danger-zone idiom: the submit button is gated on the
+// admin typing the slug (JS), and the server re-checks `confirm_slug`.
+export function renderAdminProjectTransfer(
+  view: AdminProjectTransferView,
+  result: ResourcesResultView | null,
+  email: string,
+  csrf: string = '',
+  form: TransferFormState = { target: '', keepPreviousOwner: true },
+): string {
+  let body = `<p style="margin-bottom:1rem;"><a href="/admin/projects" class="btn btn-secondary btn-sm">Back to All projects</a>
+    <a href="/admin/resources/${escapeHtml(view.slug)}" class="btn btn-secondary btn-sm">Resources</a></p>`;
+  body += resourceResultBanner(result);
+
+  const site = projectSiteUrl(escapeHtml(view.slug));
+  const repo = view.giteaRepo
+    ? `<a href="${escapeHtml(GITEA_PUBLIC_URL)}/${escapeHtml(view.giteaRepo)}" target="_blank" rel="noopener"><code>${escapeHtml(view.giteaRepo)}</code> ↗</a>`
+    : '<span style="color:#8a7a5a;">none recorded</span>';
+  body += `
+    <div class="app-card">
+      <h3 style="margin:0 0 0.5rem 0;">${escapeHtml(view.name)} <code style="font-size:0.8rem;">${escapeHtml(view.slug)}</code></h3>
+      <div class="table-wrap"><table class="table" style="max-width:44rem;">
+        <tbody>
+          <tr><th style="width:9rem;">Owner</th><td><a href="/admin/users/${escapeHtml(view.ownerId)}">${escapeHtml(view.ownerEmail)}</a>
+              <span style="color:#8a7a5a; font-size:0.75rem;">${escapeHtml(view.ownerId)}</span></td></tr>
+          <tr><th>Status</th><td>${projectStatusBadge(view.status)}</td></tr>
+          <tr><th>Created</th><td>${escapeHtml(whenLabel(view.createdAt))}</td></tr>
+          <tr><th>Gitea repo</th><td>${repo}</td></tr>
+          <tr><th>Site</th><td><a href="${site}" target="_blank" rel="noopener">${escapeHtml(view.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></td></tr>
+          <tr><th>ArgoCD</th><td><code>${escapeHtml(view.argoNamespace)}/${escapeHtml(view.slug)}</code></td></tr>
+        </tbody>
+      </table></div>
+    </div>`;
+
+  const disabled = view.status !== 'ready' || !view.giteaRepo;
+  body += `
+    <div class="app-card" style="margin-top:1.25rem;border-color:#7f3d1d;">
+      <h3 style="margin:0 0 0.35rem 0;color:#f3a5a5;">Transfer ownership</h3>
+      <p class="help" style="margin-bottom:0.75rem;">
+        Moves the Gitea repository to the new owner's account, re-points the ArgoCD
+        deployment at it, re-converges collaborators, and records the change. The
+        new owner gets full access; any explicit grant they held is removed. The
+        running deployment is not restarted — it keeps the currently pinned image
+        until the next build. This cannot be undone from here (transfer it back
+        instead).
+      </p>
+      ${disabled ? `<p class="help" style="color:#e8b94a;">Transfers are only possible for <strong>ready</strong> projects with a recorded Gitea repository.</p>` : ''}
+      <form method="POST" action="/admin/projects/${escapeHtml(view.slug)}/transfer"
+            class="cv-transfer-form" style="max-width:34rem;"
+            data-confirm="Transfer ${escapeHtml(view.slug)} to the member below? The repository and deployment move with it.">
+        ${csrf}
+        <div class="field">
+          <label for="cv-transfer-target">New owner (email or username)</label>
+          <input type="text" id="cv-transfer-target" name="target" value="${escapeHtml(form.target)}"
+                 autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                 maxlength="254" placeholder="member@example.com"${disabled ? ' disabled' : ''}>
+        </div>
+        <div class="field">
+          <label style="display:flex; align-items:center; gap:0.5rem;">
+            <input type="checkbox" name="keep_previous_owner" value="on"${form.keepPreviousOwner ? ' checked' : ''}${disabled ? ' disabled' : ''}>
+            Keep previous owner as admin (site + repo)
+          </label>
+        </div>
+        <div class="field">
+          <label for="cv-transfer-confirm">Type <code>${escapeHtml(view.slug)}</code> to confirm</label>
+          <input type="text" id="cv-transfer-confirm" name="confirm_slug" class="cv-transfer-confirm"
+                 autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                 placeholder="${escapeHtml(view.slug)}"${disabled ? ' disabled' : ''}>
+        </div>
+        <button type="submit" class="btn btn-danger cv-transfer-btn"${disabled ? ' disabled' : ''}>Transfer ownership</button>
+      </form>
+      <script nonce="${cspNonce()}">
+        (function(){
+          var form = document.currentScript.closest('.app-card').querySelector('.cv-transfer-form');
+          if (!form) return;
+          var input = form.querySelector('.cv-transfer-confirm');
+          var btn = form.querySelector('.cv-transfer-btn');
+          var slug = ${JSON.stringify(view.slug)};
+          var locked = ${JSON.stringify(disabled)};
+          if (!input || !btn || locked) return;
+          function sync(){ btn.disabled = input.value.trim() !== slug; }
+          input.addEventListener('input', sync);
+          sync();
+        })();
+      </script>
+    </div>`;
+
+  if (view.audit.length) {
+    body += `
+    <h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">Recent admin changes</h2>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>When</th><th>Who</th><th>Change</th></tr></thead>
+      <tbody>${view.audit.map((a) => `
+        <tr>
+          <td>${escapeHtml(whenLabel(a.createdAt))}</td>
+          <td>${escapeHtml(a.actor)}</td>
+          <td style="font-size:0.8rem;">${escapeHtml(a.summary)}</td>
+        </tr>`).join('')}</tbody>
+    </table></div>`;
+  }
+
+  return dashboardLayout(`Project — ${view.slug}`, body, email, true, 'admin-projects');
 }
 
 export interface CooldepsResultView { ok: boolean; message: string; }

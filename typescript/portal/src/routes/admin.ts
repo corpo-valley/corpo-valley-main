@@ -5,7 +5,7 @@ import { csrfHiddenField } from '../middleware/csrf';
 import { isUserAdmin, setUserAdmin, setServiceAdminOnly, listAllServices } from '../services/keto';
 import {
   listIdentities, getIdentity, createIdentity, updateIdentityTraits,
-  createRecoveryCodeForIdentity,
+  createRecoveryCodeForIdentity, findIdentityByEmail, findIdentityByUsername,
 } from '../services/kratos-admin';
 import { listClients, getClient, createClient, deleteClient, API_KEY_TYPE } from '../services/hydra-admin';
 import { ensureProvisioned } from '../services/provisioning';
@@ -18,9 +18,14 @@ import {
   renderAdminResourcesIndex, renderAdminProjectResourceDetail,
   renderStorageHelp, renderError,
   renderAdminCooldeps,
+  renderAdminProjectsIndex, renderAdminProjectTransfer,
   UserRow, AppRow, DefaultsGroupView, ResourceProjectRow, ResourcesResultView,
-  ProjectResourceDetailView,
+  ProjectResourceDetailView, AdminProjectRow, AdminProjectTransferView, TransferFormState,
 } from '../templates';
+import {
+  executeOwnershipTransfer, summarizeTransferAudit, TRANSFER_AUDIT_ACTION,
+  CV_PROJECTS_ARGOCD_NAMESPACE,
+} from '../services/ownership-transfer';
 import {
   cooldepsEnabled, loadCooldepsConfig, saveCooldepsConfig,
   parseCooldepsConfig, reconcileCooldepsConfig, CooldepsConfigError,
@@ -612,6 +617,7 @@ function auditSummary(change: Record<string, unknown>): string {
   if (action === 'clear-overrides') return 'cleared overrides (back to platform defaults)';
   if (action === 'apply-all') return `apply-all defaults sweep (${change.applied ?? '?'} applied, ${change.failures ?? 0} failed)`;
   if (action === 'save-defaults') return 'platform defaults saved';
+  if (action === TRANSFER_AUDIT_ACTION) return summarizeTransferAudit(change);
   return JSON.stringify(change).slice(0, 200);
 }
 
@@ -728,8 +734,128 @@ async function buildProjectResourceView(project: Project): Promise<ProjectResour
 }
 
 // The old URL, kept as a redirect so bookmarks and stale nav links land right.
+// MUST stay registered before `/projects/:slug` below (`resources` is also in
+// RESERVED_SLUGS, so no project can claim it).
 router.get('/projects/resources', (req: Request, res: Response) => {
   res.redirect(302, '/admin/resources');
+});
+
+// ── All projects + ownership transfer ──────────────────────────────────────
+
+router.get('/projects', async (req: Request, res: Response) => {
+  try {
+    const projects = await listAllProjects();
+    const owners = await resolveOwnerEmails(projects);
+    const rows: AdminProjectRow[] = projects.map((p) => ({
+      slug: p.slug, name: p.name, ownerId: p.owner_id,
+      ownerEmail: owners.get(p.owner_id) || p.owner_id,
+      status: p.status, createdAt: new Date(p.created_at).toISOString(),
+      giteaRepo: p.gitea_repo,
+    }));
+    res.send(renderAdminProjectsIndex(rows, req.portalSession!.email));
+  } catch (err: any) {
+    console.error('Admin projects index error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load projects.'));
+  }
+});
+
+async function buildProjectTransferView(project: Project): Promise<AdminProjectTransferView> {
+  const owners = await resolveOwnerEmails([project]);
+  const audit = (await listResourceAudit(project.slug, 10)).map((a) => ({
+    createdAt: a.createdAt, actor: a.actorEmail, summary: auditSummary(a.change),
+  }));
+  return {
+    slug: project.slug, name: project.name, status: project.status,
+    createdAt: new Date(project.created_at).toISOString(),
+    ownerId: project.owner_id, ownerEmail: owners.get(project.owner_id) || project.owner_id,
+    giteaRepo: project.gitea_repo, argoNamespace: CV_PROJECTS_ARGOCD_NAMESPACE, audit,
+  };
+}
+
+router.get('/projects/:slug', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const project = await getProjectBySlug(req.params.slug);
+    if (!project) {
+      res.status(404).send(renderError('Not Found', 'No project with that slug.'));
+      return;
+    }
+    res.send(renderAdminProjectTransfer(
+      await buildProjectTransferView(project), null, session.email, csrfHiddenField(req, res),
+    ));
+  } catch (err: any) {
+    console.error('Admin project detail error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load project.'));
+  }
+});
+
+// Transfer a project to another human member. Form: `target` (email or
+// username), `keep_previous_owner` (checkbox), `confirm_slug` (must equal the
+// slug — the server check, not just the JS gate). The service owns the step
+// ordering and the partial-failure contract; this route only resolves the
+// target identity (same rules as the dashboard grant picker: human, by email
+// or preferred_username) and renders the outcome banner.
+router.post('/projects/:slug/transfer', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const csrf = csrfHiddenField(req, res);
+  const form: TransferFormState = {
+    target: typeof body.target === 'string' ? body.target.trim() : '',
+    keepPreviousOwner: body.keep_previous_owner === 'on',
+  };
+  const confirmSlug = typeof body.confirm_slug === 'string' ? body.confirm_slug : '';
+
+  const project = await getProjectBySlug(req.params.slug).catch(() => null);
+  if (!project) {
+    res.status(404).send(renderError('Not Found', 'No project with that slug.'));
+    return;
+  }
+
+  const render = async (status: number, result: ResourcesResultView, current: Project) => {
+    const view = await buildProjectTransferView(current);
+    res.status(status).send(renderAdminProjectTransfer(view, result, session.email, csrf, form));
+  };
+
+  try {
+    if (!form.target || form.target.length > 254) {
+      await render(400, { ok: false, message: 'Provide the new owner\'s email or username.' }, project);
+      return;
+    }
+    // Cheap checks before the Kratos directory walk (the plan re-checks this).
+    if (confirmSlug.trim() !== project.slug) {
+      await render(400, { ok: false, message: `Type the project slug (${project.slug}) to confirm the transfer.` }, project);
+      return;
+    }
+    const target = form.target.includes('@')
+      ? await findIdentityByEmail(form.target)
+      : await findIdentityByUsername(form.target);
+    if (!target) {
+      await render(404, { ok: false, message: `No Corpo Valley member matches "${form.target}".` }, project);
+      return;
+    }
+
+    console.log(`[admin] transfer-ownership ${project.slug}: requested by ${session.email} → ${target.id} (keepPrev=${form.keepPreviousOwner})`);
+    const outcome = await executeOwnershipTransfer({
+      project, target, actorEmail: session.email,
+      keepPreviousOwnerAsAdmin: form.keepPreviousOwner, confirmSlug,
+    });
+    // Re-read the row so the page reflects whatever actually persisted (the
+    // outcome's project is the intended state; the DB is the truth).
+    const current = (await getProjectBySlug(project.slug).catch(() => null)) ?? outcome.project;
+    if (outcome.ok) form.target = '';
+    await render(
+      outcome.ok ? 200 : outcome.changed ? 500 : 400,
+      { ok: outcome.ok, message: outcome.message, details: outcome.details },
+      current,
+    );
+  } catch (err: any) {
+    console.error(`[admin] transfer-ownership ${project.slug}: unexpected error:`, err?.message);
+    const current = (await getProjectBySlug(project.slug).catch(() => null)) ?? project;
+    await render(500, {
+      ok: false,
+      message: 'Transfer failed unexpectedly — see portal logs. Check the project row, Gitea repo owner and ArgoCD source agree before retrying.',
+    }, current);
+  }
 });
 
 router.get('/resources', async (req: Request, res: Response) => {
