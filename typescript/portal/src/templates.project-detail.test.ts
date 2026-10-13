@@ -8,9 +8,9 @@ const project: ProjectRow = {
   giteaRepo: 'ana/garden', postgresEnabled: true, storageEnabled: false, status: 'ready',
 };
 const secrets = [{ name: 'api-credentials' }];
-const render = (tier: 'read' | 'write' | 'admin', isOwner = false, platformAdmin = false) =>
+const render = (tier: 'read' | 'write' | 'admin', isOwner = false, platformAdmin = false, canRepo?: boolean) =>
   renderProjectDetail('me@example.com', platformAdmin, project, '<input type="hidden" name="_csrf_token" value="t">',
-    secrets, null, [], [], null, { tier, isOwner, platformAdmin });
+    secrets, null, [], [], null, { tier, isOwner, platformAdmin, canRepo });
 
 test('owner/admin tier sees every control', () => {
   const html = render('admin', true);
@@ -20,6 +20,7 @@ test('owner/admin tier sees every control', () => {
   assert.ok(html.includes('name="destroy_data"'));
   assert.ok(html.includes('Add people'));
   assert.ok(!html.includes('Your access:'), 'owners get no access line');
+  assert.ok(html.includes('/cli-token'), 'owner can mint a clone token');
 });
 
 test('write tier can change secrets and capabilities but not delete, destroy data or share', () => {
@@ -33,6 +34,10 @@ test('write tier can change secrets and capabilities but not delete, destroy dat
   assert.ok(html.includes('Sharing is managed by the project owner and project admins.'));
   assert.ok(html.includes('Your access:'));
   assert.ok(html.includes('shared with you by the owner'));
+  assert.ok(!html.includes('/cli-token'), 'no clone token without repo access');
+  assert.ok(html.includes('ask the owner for a repo grant'));
+  assert.ok(html.includes('the data volume stays.') && !html.includes('also delete the data'), 'confirm copy matches the hidden checkbox');
+  assert.ok(render('write', false, false, true).includes('/cli-token'), 'repo grantee can mint');
 });
 
 test('read tier is view-only', () => {

@@ -142,11 +142,14 @@ function toProjectRow(p: {
 type ViewerProject = { project: Project; tier: EffectivePerm; isAdmin: boolean };
 async function loadProjectForViewer(
   req: Request, res: Response, min: GrantLevel,
-  opts: { json?: boolean; facet?: 'repo' } = {},
+  opts: { json?: boolean; facet?: 'repo'; needAdminFlag?: boolean } = {},
 ): Promise<ViewerProject | null> {
   const session = req.portalSession!;
   const project = await getProjectById(req.params.id);
-  const isAdmin = project ? await isUserAdmin(session.id).catch(() => false) : false;
+  // Owners don't need the Keto round-trip for the tier (they're admin anyway);
+  // the platform-admin flag is only consulted for the nav on the detail page.
+  const isOwner = !!project && project.owner_id === session.id;
+  const isAdmin = project && (!isOwner || opts.needAdminFlag) ? await isUserAdmin(session.id).catch(() => false) : false;
   const tier: EffectivePerm = project ? await projectTierFor(project, session.id, isAdmin) : 'none';
   if (!project || tier === 'none') {
     if (opts.json) res.status(404).json({ error: 'not_found' });
@@ -545,9 +548,12 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
 router.get('/projects/:id', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const vp = await loadProjectForViewer(req, res, 'read');
+    const vp = await loadProjectForViewer(req, res, 'read', { needAdminFlag: true });
     if (!vp) return;
     const { project, tier, isAdmin } = vp;
+    const isOwner = project.owner_id === session.id;
+    // Whether the Get-started card may offer a clone token: needs REPO access.
+    const canRepo = isOwner || tierAtLeast(await effectiveRepoPerm(project, session.id), 'read');
     // Still provisioning (or failed)? Show the initializing screen and bail —
     // the repo/postgres/garage/grants lookups below would fail because those
     // resources don't exist yet. The screen polls /projects/:id/status and
@@ -578,7 +584,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       csrf, secrets, null,
       grants, groups.map((g) => ({ name: g.name, memberCount: g.member_count })),
       metrics,
-      { tier, isOwner: project.owner_id === session.id, platformAdmin: isAdmin && project.owner_id !== session.id },
+      { tier, isOwner, platformAdmin: isAdmin && !isOwner, canRepo },
     ));
   } catch (err: any) {
     console.error('Project detail error:', err.message);

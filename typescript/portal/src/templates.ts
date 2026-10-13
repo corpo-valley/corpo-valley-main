@@ -1494,6 +1494,8 @@ export interface ProjectViewer {
   tier: 'none' | 'read' | 'write' | 'admin';
   isOwner: boolean;
   platformAdmin?: boolean;
+  // Has REPO access (owner or a repo-facet grant) — gates the clone-token form.
+  canRepo?: boolean;
 }
 const VIEWER_RANK = { none: 0, read: 1, write: 2, admin: 3 } as const;
 
@@ -1511,11 +1513,14 @@ export function renderProjectDetail(
 ): string {
   const canWrite = VIEWER_RANK[viewer.tier] >= VIEWER_RANK.write;
   const canAdmin = VIEWER_RANK[viewer.tier] >= VIEWER_RANK.admin;
+  const canRepo = viewer.canRepo ?? viewer.isOwner;
   // Read-only renderings of the toggle cards: drop the POST forms (the route
   // enforces the same tier server-side; this just keeps the UI honest).
   const stripForms = (html: string) => html.replace(/<form\b[\s\S]*?<\/form>/g,
     '<p class="help" style="margin:0;">You need write access on this project to change this.</p>');
-  const stripDestroy = (html: string) => html.replace(/<label style="display:flex;[\s\S]*?name="destroy_data"[\s\S]*?<\/label>/g, '');
+  const stripDestroy = (html: string) => html
+    .replace(/<label style="display:flex;[\s\S]*?name="destroy_data"[\s\S]*?<\/label>/g, '')
+    .replace(/ the data volume stays unless you check &quot;also delete the data&quot; below\./g, ' the data volume stays.');
   const secretsList = secrets.length === 0
     ? '<div class="message info">No secrets yet.</div>'
     : `<div class="table-wrap"><table class="table">
@@ -1612,12 +1617,14 @@ claude`
           <pre class="snippet" id="cv-clone-cmd">${escapeHtml(cloneCommands)}</pre>
           <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.5rem;">
             <button type="button" class="btn btn-sm btn-secondary cv-copy" data-target="cv-clone-cmd">Copy commands</button>
-            <form method="POST" action="/projects/${escapeHtml(project.id)}/cli-token" class="inline-form" style="display:inline;">
+            ${canRepo ? `<form method="POST" action="/projects/${escapeHtml(project.id)}/cli-token" class="inline-form" style="display:inline;">
               ${csrf}
               <button type="submit" class="btn btn-sm btn-primary">Get a CLI password</button>
-            </form>
+            </form>` : ''}
           </div>
-          <p class="help" style="margin-top:0.75rem;margin-bottom:0;">First clone needs a Gitea password — click <strong>Get a CLI password</strong> and Corpo Valley hands you a one-shot token with a ready-to-paste clone command.</p>
+          <p class="help" style="margin-top:0.75rem;margin-bottom:0;">${canRepo
+            ? 'First clone needs a Gitea password — click <strong>Get a CLI password</strong> and Corpo Valley hands you a one-shot token with a ready-to-paste clone command.'
+            : 'Cloning needs repo access on this project — ask the owner for a repo grant.'}</p>
 
           <p class="help" style="margin:1rem 0 0.4rem 0;"><strong style="color:#fdf6e8;">2.</strong> Talk to Claude in your project: <em>"Build a homepage with our name and a sign-up form."</em></p>
         </div>
