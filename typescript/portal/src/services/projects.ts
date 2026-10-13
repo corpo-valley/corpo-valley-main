@@ -478,6 +478,19 @@ export async function setGiteaRepo(id: string, fullName: string): Promise<void> 
   await pool.query('UPDATE projects SET gitea_repo = $2 WHERE id = $1', [id, fullName]);
 }
 
+// Reassign a project's owner together with its Gitea repo path. The two MUST
+// move together: every reader derives the repo's Gitea owner from
+// `gitea_repo.split('/')[0]` and the MCP token path refuses a repo whose owner
+// differs from the caller's username — so a transferred repo recorded under the
+// old owner would be unreachable for the new one. Called by the admin
+// ownership-transfer flow immediately after the Gitea transfer succeeds.
+export async function setProjectOwner(id: string, ownerId: string, giteaRepo: string): Promise<void> {
+  await pool.query(
+    'UPDATE projects SET owner_id = $2, gitea_repo = $3 WHERE id = $1',
+    [id, ownerId, giteaRepo]
+  );
+}
+
 // Atomically claim the project's postgres password, or read it back if
 // another caller already claimed. Two concurrent `enable_postgres` calls
 // would otherwise race: both generate a candidate, both write the password

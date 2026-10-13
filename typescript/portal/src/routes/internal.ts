@@ -3,6 +3,7 @@ import { getFile, upsertRepoFile, getBranchHead, getCommitStatus } from '../serv
 import { getProjectBySlug, getProjectByPinTokenHash } from '../services/projects';
 import { effectiveSitePerm } from '../services/access';
 import { hashPinToken, pinTokenHashMatches } from '../services/pin-token';
+import { rewritePinnedImageLines } from '../services/pin-image';
 import { recordActivity } from '../services/achievements';
 import { requireInternalSecret } from '../middleware/internalAuth';
 import { ensureProvisionedById } from '../services/provisioning';
@@ -278,16 +279,10 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
     }
 
     // Line-anchored rewrite of every `image: registry.cv-registry.../<owner>/<slug>:<tag>`
-    // line. Greedy `.*` plus an end-of-line tag pattern back-tracks to the
-    // tag's separator colon (not the `:5000` in the host). The `g` flag pins
-    // ALL container image lines: a multi-capability project runs several
-    // containers from the same image, so they must all move to the new tag
-    // together. The postgres StatefulSet's `image: postgres:16-alpine` doesn't
-    // match the registry host, so it's left alone.
-    const updated = file.content.replace(
-      /^(\s*image:\s+registry\.cv-registry.*):[A-Za-z0-9_.-]+$/mg,
-      `$1:${tag}`
-    );
+    // line to the project's CURRENT `<owner>/<repo>` path plus the new tag (see
+    // services/pin-image.ts for why the path is rewritten too: the build pushes
+    // under the repo's current Gitea owner, which an admin transfer can change).
+    const updated = rewritePinnedImageLines(file.content, { owner, repo, tag });
 
     if (updated === file.content) {
       res.json({

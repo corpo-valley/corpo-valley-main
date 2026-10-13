@@ -446,6 +446,25 @@ export async function triggerArgoSync(opts: {
   }
 }
 
+// Repoint an Application at a new Git URL (ownership transfer moves the repo
+// to `<newOwner>/<slug>.git`). Merge-patch on spec.source only — targetRevision,
+// path and the sync policy stay as created. ArgoCD picks the change up on its
+// next reconcile and syncs from the new URL. A missing Application is an error
+// (not a no-op): the caller must know the deployment is NOT following the repo.
+export async function patchArgoApplicationRepoUrl(opts: {
+  name: string; namespace: string; repoUrl: string;
+}): Promise<void> {
+  if (!k8sEnabled()) {
+    throw new K8sApiError(0, { message: 'k8s integration disabled' });
+  }
+  await call({
+    method: 'PATCH',
+    path: `/apis/argoproj.io/v1alpha1/namespaces/${encodeURIComponent(opts.namespace)}/applications/${encodeURIComponent(opts.name)}`,
+    body: { spec: { source: { repoURL: opts.repoUrl } } },
+    contentType: 'application/merge-patch+json',
+  });
+}
+
 // ── Pod delete (used by rollout-restart) ───────────────────────────────────
 //
 // Powers the MCP `restart_project` tool. Deleting pods is the rollout-restart

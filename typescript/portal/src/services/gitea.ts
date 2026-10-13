@@ -319,6 +319,54 @@ export async function generateFromTemplate(opts: {
   }
 }
 
+// ── Ownership transfer (admin) ───────────────────────────────────────────
+//
+// Gitea semantics (services/repository/transfer.go, StartRepositoryTransfer):
+// when the DOER is a site admin the transfer is applied directly — no
+// acceptance step. The portal always calls as the site-admin account, so the
+// repo is under the new owner by the time the POST returns. For a non-admin
+// doer Gitea instead parks the repo in `pending transfer` (status 201 with a
+// `repo_transfer` object; 202 on a completed transfer) and only the RECIPIENT
+// can accept — the admin token cannot. Rather than trusting the status code we
+// verify the outcome with a GET under the new owner and treat anything else as
+// failure, so a mis-scoped token can never leave the portal thinking the repo
+// moved when it didn't.
+export interface RepoTransferResult {
+  fullName: string;   // `<newOwner>/<repo>` as Gitea reports it
+}
+
+export async function transferRepo(opts: {
+  owner: string; repo: string; newOwner: string;
+}): Promise<RepoTransferResult> {
+  if (!giteaEnabled()) {
+    throw new GiteaApiError(0, { message: 'Gitea integration disabled' });
+  }
+  if (isReservedUsername(opts.newOwner) || !isValidUsername(opts.newOwner)) {
+    throw new GiteaApiError(0, { message: `refusing to transfer to reserved or invalid user "${opts.newOwner}"` });
+  }
+  await call(
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/transfer`,
+    { method: 'POST', body: JSON.stringify({ new_owner: opts.newOwner }) }
+  );
+  // Verify: the repo must now resolve under the new owner AND carry no pending
+  // transfer marker. (Gitea leaves a redirect from the old path, so a GET of
+  // the OLD path would also "succeed" — never use that as the check.)
+  let after: { full_name?: string; owner?: { login?: string }; repo_transfer?: unknown } | null = null;
+  try {
+    after = await call(`/repos/${encodeURIComponent(opts.newOwner)}/${encodeURIComponent(opts.repo)}`);
+  } catch (err) {
+    if (!(err instanceof GiteaApiError && err.status === 404)) throw err;
+  }
+  const login = after?.owner?.login ?? '';
+  if (!after || login.toLowerCase() !== opts.newOwner.toLowerCase() || after.repo_transfer) {
+    throw new GiteaApiError(409, {
+      message: `transfer of ${opts.owner}/${opts.repo} to ${opts.newOwner} did not complete`
+        + (after?.repo_transfer ? ' (pending acceptance by the recipient)' : ' (repo not found under the new owner)'),
+    });
+  }
+  return { fullName: after.full_name || `${opts.newOwner}/${opts.repo}` };
+}
+
 // ── Template-repo provisioning (template-seed.ts) ────────────────────────
 
 // Fetch a repo's metadata, or null if it doesn't exist.
