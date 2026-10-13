@@ -757,11 +757,21 @@ export function renderPublicProfile(
   isAdmin: boolean,
   displayName: string,
   badges: Badge[],
+  // Projects this resident has shared with everyone (same visibility rule as
+  // the Community Feed) — never private ones.
+  publicProjects: Array<{ name: string; slug: string }> = [],
 ): string {
+  const projectsHtml = publicProjects.length
+    ? `<ul style="margin:0.25rem 0 0;padding-left:1.2rem;">${publicProjects.map((p) =>
+        `<li><a href="${projectSiteUrl(escapeHtml(p.slug))}" target="_blank" rel="noopener">${escapeHtml(p.name)} ↗</a>
+          <span class="help" style="margin:0;display:inline;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)}</span></li>`).join('')}</ul>`
+    : '<p style="color:#c4b698;margin:0.25rem 0 0;">Nothing shared with everyone yet.</p>';
   const body = `
     <p class="tagline">${escapeHtml(displayName)}'s badges in the valley.</p>
     ${achievementsBoard(badges, false)}
-    <div style="margin-top:1.5rem;"><a href="/community">← Back to Community</a></div>`;
+    <h2 class="achv-cat" style="margin-top:1.5rem;">Shared projects</h2>
+    ${projectsHtml}
+    <div style="margin-top:1.5rem;"><a href="/community/users">← Back to Community</a></div>`;
   return dashboardLayout(`${displayName}'s Achievements`, body, email, isAdmin, 'community');
 }
 
@@ -951,6 +961,133 @@ export const COMMUNITY_DEFAULT_DIR: Record<CommunitySort, CommunityDir> = {
   trending: 'desc',
 };
 
+// The Community page has two tabs: Projects (the feed) and Users (residents).
+// Server-rendered links, so the heavier Users query only runs on that tab.
+function communityTabs(active: 'projects' | 'users'): string {
+  const tab = (key: 'projects' | 'users', href: string, label: string) =>
+    `<a class="cv-tab${active === key ? ' active' : ''}" href="${href}" role="tab" aria-selected="${active === key ? 'true' : 'false'}">${label}</a>`;
+  return `
+    <style>
+      .cm-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid #5a4a36; margin: 0 0 1rem; }
+      .cm-tabs .cv-tab { display: inline-block; padding: 0.5rem 0.9rem; color: #c4b698; text-decoration: none; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+      .cm-tabs .cv-tab:hover { color: #e8b94a; }
+      .cm-tabs .cv-tab.active { color: #e8b94a; border-bottom-color: #e8b94a; }
+    </style>
+    <div class="cm-tabs" role="tablist">
+      ${tab('projects', '/community', '🏘️ Projects')}
+      ${tab('users', '/community/users', '🧑‍🌾 Users')}
+    </div>`;
+}
+
+export const COMMUNITY_USER_SORTS = ['badges', 'projects', 'name'] as const;
+export type CommunityUserSort = typeof COMMUNITY_USER_SORTS[number];
+
+export interface CommunityUserRow {
+  displayName: string;       // name (first last) or username/email fallback
+  username?: string;         // preferred_username, for the profile link
+  badges: BadgeChip[];       // earned badges (from the grant cache)
+  projects: Array<{ name: string; slug: string }>; // public (everyone-shared) projects
+}
+
+// GET /community/users — browse residents: who they are, the badges they've
+// earned, and the projects they've shared with everyone. Badges belong to users
+// (not projects), which is why they live here and on profiles, not on the feed.
+export function renderCommunityUsers(
+  email: string,
+  rows: CommunityUserRow[],
+  isAdmin: boolean,
+  sort: CommunityUserSort,
+): string {
+  const quickSort = (key: CommunityUserSort, label: string) =>
+    `<a class="cf-quick${sort === key ? ' is-active' : ''}" href="/community/users?sort=${key}">${label}</a>`;
+  let body = `
+    ${communityTabs('users')}
+    <p class="tagline">Residents of the valley — their badges and what they've shared.</p>
+    <div class="cf-quicksort">Sort: ${quickSort('badges', '🏆 Most badges')} ${quickSort('projects', '🏘️ Most shared')} ${quickSort('name', '🔤 Name')}</div>
+    <style>
+      .cf-quicksort { margin: 0.25rem 0 0.5rem; font-size: 0.85rem; color: #a89878; }
+      .cf-quick { display: inline-block; margin: 0 0.15rem; padding: 0.2rem 0.55rem; border-radius: 9999px; border: 1px solid #5a4a36; color: #c4b698; text-decoration: none; }
+      .cf-quick:hover { border-color: #e8b94a; color: #e8b94a; }
+      .cf-quick.is-active { background: #4a3c2c; color: #e8b94a; border-color: #e8b94a; }
+      .cf-filter-wrap { margin: 1rem 0 0; }
+      .cf-filter { width: 100%; max-width: 22rem; box-sizing: border-box; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #5a4a36; background: #2a2118; color: #fdf6e8; font-size: 0.9rem; }
+      .cf-filter::placeholder { color: #a89878; }
+      .cf-filter:focus { outline: none; border-color: #e8b94a; }
+      .cu-nomatch { display: none; }
+      .cu-nomatch td { color: #a89878; text-align: center; padding: 1.5rem 0.75rem; font-style: italic; }
+      .cu-projects a { display: inline-block; margin: 0 0.5rem 0.2rem 0; }
+      .cu-muted { color: #8a7a5e; font-style: italic; }
+    </style>`;
+
+  if (rows.length === 0) {
+    body += `
+      <div class="app-card" style="text-align:center;padding:2rem 1.5rem;">
+        <div style="font-size:2rem;margin-bottom:0.5rem;">🧑‍🌾</div>
+        <h3 style="color:#fdf6e8;margin:0 0 0.35rem 0;">No residents yet</h3>
+        <p class="help" style="margin-bottom:0;">Nobody has moved in. Once people sign up they show up here.</p>
+      </div>`;
+    return dashboardLayout('Community · Users', body, email, isAdmin, 'community');
+  }
+
+  body += `
+    <div class="cf-filter-wrap">
+      <input type="text" id="cu-filter" class="cf-filter" placeholder="Filter by name or username…"
+             aria-label="Filter residents by name or username" autocomplete="off">
+    </div>
+    <div class="table-wrap"><table class="table" id="cu-table">
+      <thead><tr>
+        <th>Resident</th>
+        <th>Badges</th>
+        <th>Shared projects</th>
+      </tr></thead>
+      <tbody>`;
+  for (const r of rows) {
+    const nameHtml = r.username
+      ? `<a href="/achievements/u/${encodeURIComponent(r.username)}">${escapeHtml(r.displayName)}</a>`
+      : escapeHtml(r.displayName);
+    const handle = r.username && r.username !== r.displayName
+      ? `<div class="help" style="margin:0;">@${escapeHtml(r.username)}</div>` : '';
+    const badgesHtml = r.badges.length
+      ? `<div class="chip-row">${r.badges.map(badgeChip).join('')}</div>`
+      : '<span class="cu-muted">none yet</span>';
+    const projectsHtml = r.projects.length
+      ? `<div class="cu-projects">${r.projects.map((p) =>
+          `<a href="${projectSiteUrl(escapeHtml(p.slug))}" target="_blank" rel="noopener">${escapeHtml(p.name)} ↗</a>`).join('')}</div>`
+      : '<span class="cu-muted">nothing shared</span>';
+    body += `
+        <tr class="cu-row" data-name="${escapeHtml(r.displayName)}" data-username="${escapeHtml(r.username ?? '')}">
+          <td>${nameHtml}${handle}</td>
+          <td>${badgesHtml}</td>
+          <td>${projectsHtml}</td>
+        </tr>`;
+  }
+  body += `
+        <tr class="cu-nomatch"><td colspan="3">No residents match your filter.</td></tr>
+      </tbody></table></div>
+    <script nonce="${cspNonce()}">
+      (function(){
+        var input = document.getElementById('cu-filter');
+        var table = document.getElementById('cu-table');
+        if (!table || !input) return;
+        var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr.cu-row'));
+        var noMatch = table.querySelector('tbody tr.cu-nomatch');
+        input.addEventListener('input', function(){
+          var q = input.value.trim().toLowerCase();
+          var shown = 0;
+          rows.forEach(function(tr){
+            var name = (tr.getAttribute('data-name') || '').toLowerCase();
+            var user = (tr.getAttribute('data-username') || '').toLowerCase();
+            var hit = !q || name.indexOf(q) !== -1 || user.indexOf(q) !== -1;
+            tr.style.display = hit ? '' : 'none';
+            if (hit) shown++;
+          });
+          if (noMatch) noMatch.style.display = shown === 0 ? 'table-row' : 'none';
+        });
+      })();
+    </script>`;
+  return dashboardLayout('Community · Users', body, email, isAdmin, 'community');
+}
+
 export interface CommunityRow {
   name: string;
   slug: string;
@@ -961,7 +1098,6 @@ export interface CommunityRow {
   createdRel: string; // relative "2d ago" label
   updatedRel: string; // relative "3w ago" label
   creatorUsername?: string; // owner's preferred_username, for the profile link
-  creatorBadges: BadgeChip[]; // owner's earned badges (from the grant cache)
   visitors: number;   // distinct site visitors (popularity)
   builds: number;     // deploys shipped
   contributors: number; // distinct PR authors/mergers
@@ -998,6 +1134,7 @@ export function renderCommunityFeed(
   const quickSort = (key: CommunitySort, label: string) =>
     `<a class="cf-quick${sort === key ? ' is-active' : ''}" href="/community?sort=${key}&dir=${COMMUNITY_DEFAULT_DIR[key]}">${label}</a>`;
   let body = `
+    ${communityTabs('projects')}
     <p class="tagline">Internal projects shared across the valley. Open one to see what folks are building.</p>
     <div class="cf-quicksort">Sort: ${quickSort('trending', '🔥 Trending')} ${quickSort('popular', '👀 Popular')} ${quickSort('updated', '🕒 Recently active')} ${quickSort('created', '🆕 Newest')}</div>
   `;
@@ -1076,7 +1213,6 @@ export function renderCommunityFeed(
             ${r.creatorUsername
               ? `<a href="/achievements/u/${encodeURIComponent(r.creatorUsername)}">${escapeHtml(r.creator)}</a>`
               : escapeHtml(r.creator)}
-            ${r.creatorBadges.length ? `<div class="chip-row" style="margin-top:0.3rem;">${r.creatorBadges.map(badgeChip).join('')}</div>` : ''}
           </td>
           <td class="cf-metrics">
             <span title="distinct visitors">👀 ${r.visitors}</span>
@@ -1089,7 +1225,7 @@ export function renderCommunityFeed(
         </tr>`;
   }
   body += `
-        <tr class="cf-nomatch"><td colspan="5">No projects match your filter.</td></tr>
+        <tr class="cf-nomatch"><td colspan="6">No projects match your filter.</td></tr>
       </tbody></table></div>
     <script nonce="${cspNonce()}">
       (function(){

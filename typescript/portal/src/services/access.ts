@@ -318,6 +318,21 @@ export async function listProjectsWithEveryoneSiteGrant(): Promise<Array<Project
   return rows;
 }
 
+// The subset of the above owned by one user — the "public projects" list on a
+// resident's profile / the Community Users tab. Same visibility rule (an
+// `everyone` site grant), so nothing private can leak through a profile.
+export async function listPublicProjectsByOwner(ownerId: string): Promise<Array<Project & { everyone_site_perm: GrantLevel }>> {
+  const { rows } = await pool.query<Project & { everyone_site_perm: GrantLevel }>(
+    `SELECT p.*, g.site_perm AS everyone_site_perm
+     FROM projects p JOIN project_grants g ON g.project_id = p.id
+     WHERE g.subject_type = 'everyone' AND g.site_perm IN ('read', 'write')
+       AND p.owner_id = $1
+     ORDER BY p.created_at DESC`,
+    [ownerId]
+  );
+  return rows;
+}
+
 // Projects shared with a user via a direct or group grant (any area) — the
 // dashboard's "Shared with you" section.
 export async function listProjectsSharedWith(userId: string): Promise<Array<Project & { site_perm: EffectivePerm; repo_perm: EffectivePerm }>> {

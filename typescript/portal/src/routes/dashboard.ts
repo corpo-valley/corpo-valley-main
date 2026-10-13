@@ -18,12 +18,13 @@ import {
   listProjectGrants, upsertProjectGrant, getGrantById, findGrantBySubject,
   setGrantFacet, revokeGrantFacet, getEveryoneGrants,
   getGroupByName, listGroups, listProjectsSharedWith,
-  listProjectsWithEveryoneSiteGrant,
+  listProjectsWithEveryoneSiteGrant, listPublicProjectsByOwner,
   EVERYONE_SUBJECT_ID, EVERYONE_SUBJECT_NAME,
   SubjectType, GrantFacet,
 } from '../services/access';
 import { syncRepoAccess, giteaUsernameForIdentity } from '../services/repo-access';
 import { findIdentityByEmail, findIdentityByUsername, listAllHumanIdentities } from '../services/kratos-admin';
+import type { Identity } from '@ory/client';
 import { ensureProvisionedLazy } from '../services/provisioning';
 import { generatePinToken, hashPinToken } from '../services/pin-token';
 import {
@@ -64,6 +65,7 @@ import {
   renderAchievements, renderPublicProfile, BadgeChip,
   ProjectRow, ApiKeyRow, CommunityRow, COMMUNITY_SORTS, CommunitySort,
   COMMUNITY_DIRS, CommunityDir, COMMUNITY_DEFAULT_DIR,
+  renderCommunityUsers, CommunityUserRow, COMMUNITY_USER_SORTS, CommunityUserSort,
 } from '../templates';
 import {
   computeBadges, maybeReconcile, takePendingToasts, earnedBadgeKeys, BADGE_META,
@@ -239,11 +241,85 @@ router.get('/achievements/u/:username', profileLimiter, requireSession, async (r
     if (!identity) {
       return res.status(404).send(renderError('Not found', 'No resident found with that username.'));
     }
-    const badges = await computeBadges(identity.id);
-    res.send(renderPublicProfile(session.email, isAdmin, identity.displayName, badges));
+    const [badges, publicProjects] = await Promise.all([
+      computeBadges(identity.id),
+      listPublicProjectsByOwner(identity.id).catch(() => []),
+    ]);
+    res.send(renderPublicProfile(session.email, isAdmin, identity.displayName, badges,
+      publicProjects.map((p) => ({ name: p.name, slug: p.slug }))));
   } catch (err: any) {
     console.error('Public profile error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load profile.'));
+  }
+});
+
+// Short-TTL cache of the human identity directory. /community and
+// /community/users both need owner/resident lookups; one Kratos scan per minute
+// is plenty, and it keeps a member who reloads the Users tab from driving a
+// full identity walk each time.
+let identityDirCache: { val: Identity[]; exp: number } | null = null;
+const IDENTITY_DIR_TTL_MS = 60_000;
+async function cachedHumanIdentities(): Promise<Identity[]> {
+  if (identityDirCache && identityDirCache.exp > Date.now()) return identityDirCache.val;
+  const val = await listAllHumanIdentities();
+  identityDirCache = { val, exp: Date.now() + IDENTITY_DIR_TTL_MS };
+  return val;
+}
+
+// Earned badge keys → chips, shaped from the trusted catalog only.
+function badgeChipsFor(keys: string[]): BadgeChip[] {
+  return keys.filter((k) => BADGE_META[k]).map((k) => ({ key: k, name: BADGE_META[k].name, emoji: BADGE_META[k].emoji }));
+}
+
+// GET /community/users — the Users tab: every resident with their earned
+// badges and the projects they've shared with everyone. Badges belong to
+// users, so they show here and on profiles rather than on project rows. Three
+// batch lookups, independent of resident count: the (cached) identity
+// directory, one grant-cache query, and the everyone-shared projects query.
+// Rate-limited like profiles — it's authenticated but touches Kratos.
+router.get('/community/users', profileLimiter, requireSession, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const isAdmin = await isUserAdmin(session.id);
+    const sortParam = String(req.query.sort || '');
+    const sort: CommunityUserSort = (COMMUNITY_USER_SORTS as readonly string[]).includes(sortParam)
+      ? (sortParam as CommunityUserSort) : 'badges';
+
+    const [identities, projects] = await Promise.all([
+      cachedHumanIdentities(),
+      listProjectsWithEveryoneSiteGrant().catch(() => []),
+    ]);
+    const badgesByUser = await earnedBadgeKeys(identities.map((i) => i.id));
+    const projectsByOwner = new Map<string, Array<{ name: string; slug: string }>>();
+    for (const p of projects) {
+      const list = projectsByOwner.get(p.owner_id) ?? [];
+      list.push({ name: p.name, slug: p.slug });
+      projectsByOwner.set(p.owner_id, list);
+    }
+    const rows: CommunityUserRow[] = identities.map((i) => {
+      const t = (i.traits as any) ?? {};
+      const nm = t.name;
+      const fullName = typeof nm === 'string' ? nm : [nm?.first, nm?.last].filter(Boolean).join(' ');
+      const username = typeof t.preferred_username === 'string' && t.preferred_username ? t.preferred_username : undefined;
+      return {
+        displayName: fullName || username || (typeof t.email === 'string' ? t.email : 'resident'),
+        username,
+        badges: badgeChipsFor(badgesByUser.get(i.id) ?? []),
+        projects: projectsByOwner.get(i.id) ?? [],
+      };
+    });
+    const byName = (a: CommunityUserRow, b: CommunityUserRow) =>
+      a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' });
+    rows.sort((a, b) => {
+      if (sort === 'projects') return (b.projects.length - a.projects.length) || (b.badges.length - a.badges.length) || byName(a, b);
+      if (sort === 'name') return byName(a, b);
+      return (b.badges.length - a.badges.length) || (b.projects.length - a.projects.length) || byName(a, b);
+    });
+
+    res.send(renderCommunityUsers(session.email, rows, isAdmin, sort));
+  } catch (err: any) {
+    console.error('Community users error:', err.message);
+    res.status(500).send(renderError('Error', 'Failed to load the community users.'));
   }
 });
 
@@ -270,7 +346,7 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
 
     const projects = await listProjectsWithEveryoneSiteGrant();
     const [identities, repoUpdated] = await Promise.all([
-      listAllHumanIdentities().catch(() => []),
+      cachedHumanIdentities().catch(() => []),
       getRepoLastCommitMap(projects.map((p) => p.gitea_repo).filter(Boolean) as string[])
         .catch(() => new Map<string, string>()),
     ]);
@@ -283,12 +359,6 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
     }
     // Per-project engagement metrics (popularity/activity) — one grouped query.
     const metricsById = await projectMetrics(projects.map((p) => p.id));
-    // Earned badges for every creator shown — one cached lookup, no recompute.
-    const badgesByOwner = await earnedBadgeKeys(projects.map((p) => p.owner_id));
-    const chipsFor = (ownerId: string): BadgeChip[] =>
-      (badgesByOwner.get(ownerId) ?? [])
-        .filter((k) => BADGE_META[k])
-        .map((k) => ({ key: k, name: BADGE_META[k].name, emoji: BADGE_META[k].emoji }));
 
     // Enrich each project. "Last active" is the most recent of the last build
     // shipped (reliable, from our ledger) and the repo's latest default-branch
@@ -366,7 +436,6 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       createdRel: rel(e.createdIso),
       updatedRel: rel(e.updatedIso),
       creatorUsername: usernameById.get(e.ownerId),
-      creatorBadges: chipsFor(e.ownerId),
       visitors: e.visitors,
       builds: e.builds,
       contributors: e.contributors,
