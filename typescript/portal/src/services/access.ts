@@ -18,6 +18,7 @@
 import {
   pool, Project, GrantLevel, EffectivePerm, maxPerm,
 } from './projects';
+import { projectTierFromGrants } from './project-tier';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -362,9 +363,9 @@ export async function listProjectsSharedWith(userId: string): Promise<Array<Proj
 // All grant levels that apply to (project, user) in one query: direct user
 // grants, grants to any group the user belongs to, and the project's org-wide
 // `everyone` grant (which applies to every signed-in member).
-async function grantLevelsFor(projectId: string, userId: string): Promise<Array<{ site_perm: GrantLevel | null; repo_perm: GrantLevel | null }>> {
-  const { rows } = await pool.query<{ site_perm: GrantLevel | null; repo_perm: GrantLevel | null }>(
-    `SELECT g.site_perm, g.repo_perm
+async function grantLevelsFor(projectId: string, userId: string): Promise<Array<{ site_perm: GrantLevel | null; repo_perm: GrantLevel | null; subject_type: string }>> {
+  const { rows } = await pool.query<{ site_perm: GrantLevel | null; repo_perm: GrantLevel | null; subject_type: string }>(
+    `SELECT g.site_perm, g.repo_perm, g.subject_type
      FROM project_grants g
      LEFT JOIN group_members m ON g.subject_type = 'group' AND m.group_id::text = g.subject_id
      WHERE g.project_id = $1
@@ -393,4 +394,15 @@ export async function effectiveRepoPerm(project: Project, userId: string): Promi
   if (project.owner_id === userId) return 'admin';
   const grants = await grantLevelsFor(project.id, userId);
   return maxPerm(...grants.map((g) => g.repo_perm));
+}
+
+// The viewer's DASHBOARD tier on the project (see services/project-tier.ts):
+// owner / platform admin → admin; otherwise from their EXPLICIT grants only
+// (repo facet for read/write, admin on either facet). `everyone` rows are
+// fetched but ignored by the policy. This is what gates the portal's project
+// pages and mutations so a user granted `admin` can actually administer.
+export async function projectTierFor(project: Project, userId: string, platformAdmin = false): Promise<EffectivePerm> {
+  if (platformAdmin || project.owner_id === userId) return 'admin';
+  const grants = await grantLevelsFor(project.id, userId);
+  return projectTierFromGrants(project, userId, false, grants);
 }

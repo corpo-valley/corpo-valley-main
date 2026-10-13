@@ -1331,13 +1331,16 @@ export function renderProjects(
       body += `
         <div class="app-card">
           <div class="app-card-header">
-            <span class="app-card-name">${escapeHtml(p.name)}</span>
+            <a href="/projects/${escapeHtml(p.id)}" class="app-card-name" style="color:#fdf6e8;text-decoration:none;">${escapeHtml(p.name)}</a>
           </div>
           <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
           <div class="app-card-sub" style="margin-top:0.4rem;">Your access: site ${accessBadge(p.sitePerm)} &nbsp; repo ${accessBadge(p.repoPerm)}</div>
-          ${p.giteaRepo && p.repoPerm !== 'none'
-            ? `<div class="app-card-actions"><a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a></div>`
-            : ''}
+          <div class="app-card-actions">
+            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-primary btn-sm">${p.repoPerm === 'admin' || p.sitePerm === 'admin' ? 'Manage' : 'Open'}</a>
+            ${p.giteaRepo && p.repoPerm !== 'none'
+              ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a>`
+              : ''}
+          </div>
         </div>`;
     }
     body += '</div>';
@@ -1619,6 +1622,19 @@ export interface ProjectSecretRow {
   name: string;
 }
 
+// Who is looking at a project page and what they may do there. `tier` is the
+// viewer's dashboard tier (services/project-tier.ts): read = look, write =
+// secrets + capabilities, admin = delete / destroy data / sharing. The owner
+// and platform admins are admin; a grantee gets whatever the owner granted.
+export interface ProjectViewer {
+  tier: 'none' | 'read' | 'write' | 'admin';
+  isOwner: boolean;
+  platformAdmin?: boolean;
+  // Has REPO access (owner or a repo-facet grant) — gates the clone-token form.
+  canRepo?: boolean;
+}
+const VIEWER_RANK = { none: 0, read: 1, write: 2, admin: 3 } as const;
+
 export function renderProjectDetail(
   email: string,
   isAdmin: boolean,
@@ -1628,8 +1644,19 @@ export function renderProjectDetail(
   secretMessage: { type: 'error' | 'success'; text: string } | null = null,
   grants: ProjectGrantRow[] = [],
   groups: GroupOptionRow[] = [],
-  metrics: ProjectMetrics | null = null
+  metrics: ProjectMetrics | null = null,
+  viewer: ProjectViewer = { tier: 'admin', isOwner: true },
 ): string {
+  const canWrite = VIEWER_RANK[viewer.tier] >= VIEWER_RANK.write;
+  const canAdmin = VIEWER_RANK[viewer.tier] >= VIEWER_RANK.admin;
+  const canRepo = viewer.canRepo ?? viewer.isOwner;
+  // Read-only renderings of the toggle cards: drop the POST forms (the route
+  // enforces the same tier server-side; this just keeps the UI honest).
+  const stripForms = (html: string) => html.replace(/<form\b[\s\S]*?<\/form>/g,
+    '<p class="help" style="margin:0;">You need write access on this project to change this.</p>');
+  const stripDestroy = (html: string) => html
+    .replace(/<label style="display:flex;[\s\S]*?name="destroy_data"[\s\S]*?<\/label>/g, '')
+    .replace(/ the data volume stays unless you check &quot;also delete the data&quot; below\./g, ' the data volume stays.');
   const secretsList = secrets.length === 0
     ? '<div class="message info">No secrets yet.</div>'
     : `<div class="table-wrap"><table class="table">
@@ -1639,13 +1666,13 @@ export function renderProjectDetail(
           <tr>
             <td><code>${escapeHtml(s.name)}</code></td>
             <td>
-              <form method="POST"
+              ${canWrite ? `<form method="POST"
                     action="/projects/${escapeHtml(project.id)}/secrets/${escapeHtml(s.name)}/delete"
                     class="inline-form"
                     data-confirm="Delete sealed secret ${escapeHtml(s.name)}? This removes it from your repo on the next sync.">
                 ${csrf}
                 <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-              </form>
+              </form>` : ''}
             </td>
           </tr>
         `).join('')}
@@ -1684,6 +1711,7 @@ claude`
         </a>
       </div>
       ${metricsStrip}
+      ${viewer.isOwner ? '' : `<div style="font-size:0.85rem;color:#c4b698;margin-bottom:0.5rem;">Your access: ${accessBadge(viewer.tier)} ${viewer.platformAdmin ? '<span class="help" style="display:inline;margin:0;">(platform admin)</span>' : '<span class="help" style="display:inline;margin:0;">(shared with you by the owner)</span>'}</div>`}
       <div style="font-size:0.8rem;color:#a89878;">
         ${project.giteaRepo
           ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `
@@ -1725,12 +1753,14 @@ claude`
           <pre class="snippet" id="cv-clone-cmd">${escapeHtml(cloneCommands)}</pre>
           <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.5rem;">
             <button type="button" class="btn btn-sm btn-secondary cv-copy" data-target="cv-clone-cmd">Copy commands</button>
-            <form method="POST" action="/projects/${escapeHtml(project.id)}/cli-token" class="inline-form" style="display:inline;">
+            ${canRepo ? `<form method="POST" action="/projects/${escapeHtml(project.id)}/cli-token" class="inline-form" style="display:inline;">
               ${csrf}
               <button type="submit" class="btn btn-sm btn-primary">Get a CLI password</button>
-            </form>
+            </form>` : ''}
           </div>
-          <p class="help" style="margin-top:0.75rem;margin-bottom:0;">First clone needs a Gitea password — click <strong>Get a CLI password</strong> and Corpo Valley hands you a one-shot token with a ready-to-paste clone command.</p>
+          <p class="help" style="margin-top:0.75rem;margin-bottom:0;">${canRepo
+            ? 'First clone needs a Gitea password — click <strong>Get a CLI password</strong> and Corpo Valley hands you a one-shot token with a ready-to-paste clone command.'
+            : 'Cloning needs repo access on this project — ask the owner for a repo grant.'}</p>
 
           <p class="help" style="margin:1rem 0 0.4rem 0;"><strong style="color:#fdf6e8;">2.</strong> Talk to Claude in your project: <em>"Build a homepage with our name and a sign-up form."</em></p>
         </div>
@@ -1882,41 +1912,11 @@ claude`
         </div>
         <button type="submit" class="btn btn-primary btn-sm">Add</button>
       </div>
-      <p class="help" style="margin:0.4rem 0 0;">Pick a level for Site, Repo, or both. <strong>Site</strong> is the deployed website; <strong>Repo</strong> is the Gitea source. The highest applicable level wins; you always have admin on both.</p>
+      <p class="help" style="margin:0.4rem 0 0;">Pick a level for Site, Repo, or both. <strong>Site</strong> is the deployed website; <strong>Repo</strong> is the Gitea source. The highest applicable level wins; the owner and project admins always have admin on both.</p>
     </form>`;
 
-  // ── Configure card: Sealed Secrets + Access settings, grouped because
-  // both are "settings on the running project". Sub-sections inside the
-  // card use `<h4>` so they're visually subordinate to the card header.
-  const configureCard = `
-    <div class="app-card" style="margin-top:1.25rem;">
-      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">Configure</h3>
-      <p class="help" style="margin-bottom:1rem;">Settings that travel with your running project.</p>
-      ${msgBanner}
-
-      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Sealed secrets</h4>
-      <p class="help" style="margin-bottom:0.6rem;">Sealed in-cluster, committed to <code>k8s/secrets/&lt;name&gt;.sealed.yaml</code> in your repo; materialised as Kubernetes Secrets in the <code>${escapeHtml(project.slug)}</code> namespace. Reference from your Deployment via <code>envFrom</code> or <code>valueFrom: secretKeyRef</code>.</p>
-      ${secretsList}
-      <form method="POST" action="/projects/${escapeHtml(project.id)}/secrets" style="margin-top:0.85rem;">
-        ${csrf}
-        <div class="field">
-          <label for="secret_name">New secret name</label>
-          <input type="text" id="secret_name" name="secret_name" required
-                 pattern="[a-z0-9-]+"
-                 title="lowercase letters, digits, and hyphens"
-                 placeholder="api-credentials" />
-        </div>
-        <div class="field">
-          <label for="secret_data">Data (one <code>KEY=VALUE</code> per line)</label>
-          <textarea id="secret_data" name="secret_data" rows="4" required
-                    placeholder="API_KEY=hunter2&#10;DB_PASSWORD=correct horse battery staple"
-                    style="width:100%; font-family:monospace; padding:0.5rem;"></textarea>
-        </div>
-        <button type="submit" class="btn btn-primary">Seal &amp; save</button>
-      </form>
-
-      <hr style="border:none;border-top:1px solid #5a4a36;margin:1.5rem 0 1rem 0;" />
-
+  // Sharing is an admin-only surface: grantees below admin see a summary.
+  const shareSection = canAdmin ? `
       <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Share</h4>
       <p class="help" style="margin-bottom:0.85rem;"><strong>Private by default</strong> — only you and your bot can reach this project. Add people below, or open the site to everyone signed in.</p>
 
@@ -1932,6 +1932,45 @@ claude`
       ${groups.length > 0
         ? `<p class="help" style="margin-top:0.85rem;">Tip: add a <strong>group</strong> by name to grant many members at once. Groups: ${groups.map((g) => `<code>${escapeHtml(g.name)}</code> (${g.memberCount})`).join(', ')} — manage under <a href="/groups" style="color:#e8b94a;">Groups</a>.</p>`
         : `<p class="help" style="margin-top:0.85rem;">Tip: create a <a href="/groups" style="color:#e8b94a;">group</a> to grant many members at once, then add it by name above.</p>`}
+
+` : `
+      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Share</h4>
+      <p class="help" style="margin-bottom:0.5rem;">Sharing is managed by the project owner and project admins.</p>
+      <p class="help" style="margin:0;">Everyone signed in: site ${accessBadge(project.everyoneSite)} &nbsp; repo ${accessBadge(project.everyoneRepo)}</p>`;
+
+  // ── Configure card: Sealed Secrets + Access settings, grouped because
+  // both are "settings on the running project". Sub-sections inside the
+  // card use `<h4>` so they're visually subordinate to the card header.
+  const configureCard = `
+    <div class="app-card" style="margin-top:1.25rem;">
+      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">Configure</h3>
+      <p class="help" style="margin-bottom:1rem;">Settings that travel with your running project.</p>
+      ${msgBanner}
+
+      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Sealed secrets</h4>
+      <p class="help" style="margin-bottom:0.6rem;">Sealed in-cluster, committed to <code>k8s/secrets/&lt;name&gt;.sealed.yaml</code> in your repo; materialised as Kubernetes Secrets in the <code>${escapeHtml(project.slug)}</code> namespace. Reference from your Deployment via <code>envFrom</code> or <code>valueFrom: secretKeyRef</code>.</p>
+      ${secretsList}
+      ${canWrite ? `<form method="POST" action="/projects/${escapeHtml(project.id)}/secrets" style="margin-top:0.85rem;">
+        ${csrf}
+        <div class="field">
+          <label for="secret_name">New secret name</label>
+          <input type="text" id="secret_name" name="secret_name" required
+                 pattern="[a-z0-9-]+"
+                 title="lowercase letters, digits, and hyphens"
+                 placeholder="api-credentials" />
+        </div>
+        <div class="field">
+          <label for="secret_data">Data (one <code>KEY=VALUE</code> per line)</label>
+          <textarea id="secret_data" name="secret_data" rows="4" required
+                    placeholder="API_KEY=hunter2&#10;DB_PASSWORD=correct horse battery staple"
+                    style="width:100%; font-family:monospace; padding:0.5rem;"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">Seal &amp; save</button>
+      </form>` : '<p class="help" style="margin-top:0.85rem;">You need write access on this project to add or remove secrets.</p>'}
+
+      <hr style="border:none;border-top:1px solid #5a4a36;margin:1.5rem 0 1rem 0;" />
+
+      ${shareSection}
 
       <details class="share-dev">
         <summary>For developers</summary>
@@ -2093,14 +2132,16 @@ claude`
     </div>
   `;
 
+  const dbCardView = !canWrite ? stripForms(dbCard) : (!canAdmin ? stripDestroy(dbCard) : dbCard);
+  const storageCardView = !canWrite ? stripForms(storageCard) : (!canAdmin ? stripDestroy(storageCard) : storageCard);
   const body = `
     <p style="margin-bottom:1rem;"><a href="/" class="btn btn-secondary btn-sm">← All projects</a></p>
     ${overviewCard}
     ${getStartedCard}
     ${configureCard}
-    ${dbCard}
-    ${storageCard}
-    ${dangerCard}
+    ${dbCardView}
+    ${storageCardView}
+    ${canAdmin ? dangerCard : ''}
   `;
   return dashboardLayout(`Project: ${project.name}`, body, email, isAdmin, 'projects');
 }
