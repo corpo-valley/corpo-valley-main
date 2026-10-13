@@ -1,3 +1,5 @@
+import { CV_REGISTRY } from './platform-config';
+
 // The pin rewrite for k8s/deployment.yaml, as a pure function so it is unit
 // testable without Gitea.
 //
@@ -11,17 +13,20 @@
 // the project row (the source of truth for the repo's current owner) makes the
 // first post-transfer build converge on its own.
 //
-// Only lines on the in-cluster registry host match: the postgres StatefulSet's
+// Only lines on the configured in-cluster registry host match: the postgres StatefulSet's
 // `image: postgres:16-alpine` is left alone. The `g` flag pins ALL matching
 // container lines — a multi-capability project runs several containers from
 // the same image and they must move together.
 export function rewritePinnedImageLines(
   content: string,
   target: { owner: string; repo: string; tag: string },
+  // The in-cluster registry host (with port) the project images live on.
+  // Anchored on the configured value rather than a hard-coded `registry.cv-registry`
+  // so a deployment with another namespacePrefix / registry still pins.
+  registry: string = CV_REGISTRY,
 ): string {
   const path = `${target.owner}/${target.repo}`;
-  return content.replace(
-    /^(\s*image:\s+registry\.cv-registry[^/\s]*)\/[^\s:]+:[A-Za-z0-9_.-]+$/mg,
-    (_m, host: string) => `${host}/${path}:${target.tag}`,
-  );
+  const host = registry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^(\\s*image:\\s+${host})\\/[^\\s:]+:[A-Za-z0-9_.-]+$`, 'mg');
+  return content.replace(re, (_m, prefix: string) => `${prefix}/${path}:${target.tag}`);
 }

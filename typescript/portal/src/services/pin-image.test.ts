@@ -32,3 +32,11 @@ test('is a no-op when already pinned to the same owner and tag', () => {
   const pinned = rewritePinnedImageLines(yaml, { owner: 'alice', repo: 'shop', tag: 'x1' });
   assert.equal(rewritePinnedImageLines(pinned, { owner: 'alice', repo: 'shop', tag: 'x1' }), pinned);
 });
+
+test('anchors on the configured registry host, not a hard-coded one', () => {
+  const other = 'registry.acme-registry.svc:5000';
+  const y = `      image: ${other}/alice/shop:bootstrap\n      image: ${HOST}/alice/shop:bootstrap`;
+  const out = rewritePinnedImageLines(y, { owner: 'alice', repo: 'shop', tag: 'v1' }, other);
+  assert.ok(out.includes(`${other}/alice/shop:v1`), 'configured host is pinned');
+  assert.ok(out.includes(`${HOST}/alice/shop:bootstrap`), 'other hosts are left alone');
+});
