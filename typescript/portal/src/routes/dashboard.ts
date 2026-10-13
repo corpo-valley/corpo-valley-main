@@ -262,7 +262,8 @@ const IDENTITY_DIR_TTL_MS = 60_000;
 async function cachedHumanIdentities(): Promise<Identity[]> {
   if (identityDirCache && identityDirCache.exp > Date.now()) return identityDirCache.val;
   const val = await listAllHumanIdentities();
-  identityDirCache = { val, exp: Date.now() + IDENTITY_DIR_TTL_MS };
+  // Don't pin an empty directory for a minute if Kratos returned nothing.
+  if (val.length) identityDirCache = { val, exp: Date.now() + IDENTITY_DIR_TTL_MS };
   return val;
 }
 
@@ -301,8 +302,11 @@ router.get('/community/users', profileLimiter, requireSession, async (req: Reque
       const nm = t.name;
       const fullName = typeof nm === 'string' ? nm : [nm?.first, nm?.last].filter(Boolean).join(' ');
       const username = typeof t.preferred_username === 'string' && t.preferred_username ? t.preferred_username : undefined;
+      // Never fall back to the full email: this tab is visible to every member
+      // and must not double as an address book. The local part is enough.
+      const emailLocal = typeof t.email === 'string' && t.email.includes('@') ? t.email.split('@')[0] : '';
       return {
-        displayName: fullName || username || (typeof t.email === 'string' ? t.email : 'resident'),
+        displayName: fullName || username || emailLocal || 'resident',
         username,
         badges: badgeChipsFor(badgesByUser.get(i.id) ?? []),
         projects: projectsByOwner.get(i.id) ?? [],

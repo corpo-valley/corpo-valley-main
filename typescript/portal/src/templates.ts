@@ -687,9 +687,9 @@ export function roleBadge(isAdmin: boolean): string {
 
 export interface BadgeChip { key: string; name: string; emoji: string; }
 
-// A small pill used to surface an earned badge on other surfaces (project cards,
-// Community Feed). Pass already-shaped, trusted metadata (name/emoji from the
-// catalog) — never user input.
+// A small pill used to surface an earned badge on other surfaces (the Community
+// Users tab, the badge toast). Pass already-shaped, trusted metadata (name/emoji
+// from the catalog) — never user input.
 export function badgeChip(c: BadgeChip): string {
   return `<span class="badge badge-achievement" title="${escapeHtml(c.name)}">${c.emoji} ${escapeHtml(c.name)}</span>`;
 }
