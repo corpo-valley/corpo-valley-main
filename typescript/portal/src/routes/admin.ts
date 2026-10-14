@@ -19,6 +19,7 @@ import {
   renderStorageHelp, renderError,
   renderAdminCooldeps,
   renderAdminProjectsIndex, renderAdminProjectTransfer,
+  renderAdminHealthIndex, renderAdminHealthDetail, HealthLogView,
   UserRow, AppRow, DefaultsGroupView, ResourceProjectRow, ResourcesResultView,
   ProjectResourceDetailView, AdminProjectRow, AdminProjectTransferView, TransferFormState,
 } from '../templates';
@@ -45,6 +46,10 @@ import {
 import {
   getProjectBySlug, listAllProjects, setProjectResourceOverrides, Project,
 } from '../services/projects';
+import {
+  collectAllProjectHealth, getProjectHealth, scoreProject, toHealthRow, sortHealthRows,
+  logsUrlFor, readContainerLog,
+} from '../services/project-health';
 import {
   isQuantity, isCount, quantityToNumber, TENANT_MAX_PVC_SIZE,
 } from '../services/platform-config';
@@ -1133,6 +1138,60 @@ router.post('/resources/:slug/clear', async (req: Request, res: Response) => {
 
 // Help page linked from the resource form when a volume's StorageClass can't be
 // expanded online — describes the manual data-migration path.
+// ── Project health ─────────────────────────────────────────────────────────
+// Read-only cluster view across every project: pods, warning events, quota,
+// metrics.k8s.io usage and the Argo Application, scored red/amber/green
+// (services/project-health.ts). Snapshots are cached 30 s per project. Lives
+// under /admin/health (not /admin/projects/...) so it never competes with the
+// `/projects/:slug` routes above.
+
+router.get('/health', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const projects = await listAllProjects();
+    const snapshots = await collectAllProjectHealth(projects);
+    const rows = sortHealthRows(snapshots.map((snap) => toHealthRow(snap, scoreProject(snap))));
+    res.send(renderAdminHealthIndex(rows, session.email, (slug) => logsUrlFor(slug)));
+  } catch (err: any) {
+    console.error('Admin health index error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load project health.'));
+  }
+});
+
+// `?pod=<name>&container=<name>` adds the last 200 log lines of ONE container.
+// Both names are matched against the snapshot's own pod list before anything
+// is sent to the API server — unknown names render an error, never a request.
+router.get('/health/:slug', async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const project = await getProjectBySlug(req.params.slug);
+    if (!project) {
+      res.status(404).send(renderError('Not Found', 'No project with that slug.'));
+      return;
+    }
+    const snapshot = await getProjectHealth(project);
+    const score = scoreProject(snapshot);
+
+    let logs: HealthLogView | null = null;
+    const pod = typeof req.query.pod === 'string' ? req.query.pod : '';
+    const container = typeof req.query.container === 'string' ? req.query.container : '';
+    if (pod || container) {
+      const result = await readContainerLog(snapshot, pod, container, 200);
+      logs = result.ok
+        ? { pod, container, text: result.text, error: null }
+        : { pod, container, text: null, error: result.error };
+    }
+
+    res.send(renderAdminHealthDetail(
+      { snapshot, score, logs, logsUrl: logsUrlFor(project.slug) },
+      session.email,
+    ));
+  } catch (err: any) {
+    console.error('Admin health detail error:', err?.message);
+    res.status(500).send(renderError('Error', 'Failed to load project health.'));
+  }
+});
+
 router.get('/help/storage', (req: Request, res: Response) => {
   res.send(renderStorageHelp(req.portalSession!.email));
 });

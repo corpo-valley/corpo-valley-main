@@ -45,3 +45,15 @@ test('leaves digest-pinned image lines alone', () => {
   const y = `      image: ${HOST}/alice/shop@sha256:0123456789abcdef`;
   assert.equal(rewritePinnedImageLines(y, { owner: 'bob', repo: 'shop', tag: 'v1' }), y);
 });
+
+import { projectImageLineRe, extractPinnedTag } from './manifests';
+
+test('agrees with the generator grammar: what the pin writes, the generator reads back', () => {
+  const out = rewritePinnedImageLines(yaml, { owner: 'bob', repo: 'shop', tag: '20260202030405' });
+  assert.equal(extractPinnedTag(out), '20260202030405');
+  const lines = out.split('\n').filter((l) => projectImageLineRe().test(l));
+  assert.equal(lines.length, 2, 'both rewritten lines match projectImageLineRe');
+  const digest = `      image: ${HOST}/alice/shop@sha256:0123456789abcdef`;
+  assert.equal(projectImageLineRe().test(digest), false);
+  assert.equal(rewritePinnedImageLines(digest, { owner: 'bob', repo: 'shop', tag: 'v1' }), digest);
+});

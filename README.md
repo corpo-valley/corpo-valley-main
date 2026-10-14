@@ -112,6 +112,19 @@ the change is recorded in the project's audit trail. Deleting a user cascades cl
 their projects, groups, grants, API keys, bot identity, and Gitea accounts are
 all torn down.
 
+**Project health** (`/admin/health`) monitors every project namespace from the
+cluster itself: pods and per-container state (waiting reasons, restarts, last
+termination), Warning events from the last hour, ResourceQuota usage, live CPU and
+memory from `metrics.k8s.io`, and the ArgoCD sync/health status. Each project is
+scored red (CrashLoopBackOff / image pull failures, OOMKilled, Failed pods, Argo
+Degraded or Missing), amber (recent restarts, FailedScheduling / BackOff /
+Unhealthy events, ≥ 80 % of quota, Argo OutOfSync or Progressing) or green, and
+the detail page shows the last 200 log lines of any container. Snapshots are
+cached for 30 s. Set the optional `CV_LOGS_URL` env var (a URL template; `{slug}`
+is replaced with the project namespace, otherwise `?namespace=<slug>` is appended)
+to add a "Logs in SigNoz" deep link per project. Missing `metrics.k8s.io` RBAC
+degrades to "n/a" rather than failing the page.
+
 ### Secure by default
 
 Each project lands in a **sealed namespace** (Pod Security Admission, a
