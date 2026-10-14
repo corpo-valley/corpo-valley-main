@@ -162,7 +162,14 @@ export function scoreProject(s: ProjectHealthSnapshot, now?: number): HealthScor
     if (pod.phase === 'Failed') red.push(`pod ${pod.name} is Failed`);
     for (const c of pod.containers) {
       if (c.waitingReason && RED_WAITING.has(c.waitingReason)) {
-        red.push(`${pod.name}/${c.name} ${c.waitingReason}`);
+        // A project still on the template's `:bootstrap` placeholder tag has
+        // simply not had its first successful build yet: the image does not
+        // exist, so ImagePullBackOff is the expected state, not an outage.
+        if (c.imageTag === 'bootstrap' && c.waitingReason !== 'CrashLoopBackOff') {
+          amber.push(`${pod.name}/${c.name} awaiting first build (image :bootstrap not built yet)`);
+        } else {
+          red.push(`${pod.name}/${c.name} ${c.waitingReason}`);
+        }
       }
       // OOMKilled either as the last termination (restarted since) or as the
       // current terminal state (restartPolicy Never/OnFailure).

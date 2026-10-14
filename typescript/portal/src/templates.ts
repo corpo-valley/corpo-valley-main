@@ -3330,8 +3330,9 @@ export function renderAdminHealthIndex(
 
   const tr = rows.map((r) => {
     const reason = r.reasons[0] || (r.warnings.length ? 'lookups incomplete' : 'ok');
+    // Every reason is available on hover; the cell shows the first and a count.
     const more = r.reasons.length > 1
-      ? `<br><span style="color:#8a7a5a; font-size:0.75rem;">+${r.reasons.length - 1} more</span>` : '';
+      ? `<br><span style="color:#8a7a5a; font-size:0.75rem;" title="${escapeHtml(r.reasons.join('\n'))}">+${r.reasons.length - 1} more (hover)</span>` : '';
     const warn = r.warnings.length
       ? `<br><span style="color:#e8b94a; font-size:0.75rem;" title="${escapeHtml(r.warnings.join('\n'))}">⚠ ${r.warnings.length} lookup${r.warnings.length === 1 ? '' : 's'} failed</span>` : '';
     const logs = logsUrl(r.slug);
@@ -3340,7 +3341,7 @@ export function renderAdminHealthIndex(
           <td><a href="/admin/health/${escapeHtml(r.slug)}">${escapeHtml(r.name)}</a><br>
               <code style="font-size:0.75rem;">${escapeHtml(r.slug)}</code></td>
           <td>${healthPill(r.level, r.level)}<br>
-              <span style="font-size:0.8rem;">${escapeHtml(reason)}</span>${more}${warn}</td>
+              <span style="font-size:0.8rem;" title="${escapeHtml(r.reasons.join('\n'))}">${escapeHtml(reason)}</span>${more}${warn}</td>
           <td>${r.podsTotal ? `${r.podsReady}/${r.podsTotal}` : '<span style="color:#8a7a5a;">—</span>'}</td>
           <td>${r.restartsLastHour ? `<span style="color:#e8b94a;">${r.restartsLastHour}</span>` : '0'}</td>
           <td style="font-size:0.8rem;">${r.worstEvent ? escapeHtml(r.worstEvent) : '<span style="color:#8a7a5a;">—</span>'}</td>
@@ -3416,7 +3417,7 @@ export function renderAdminHealthDetail(view: HealthDetailView, email: string): 
     ${healthPill(view.score.level, view.score.level)}
     ${healthPill(s.pods.length && s.pods.every((p) => p.phase === 'Running' && p.readyContainers === p.totalContainers) ? 'green' : s.pods.length ? 'amber' : 'green',
       `${s.pods.filter((p) => p.phase === 'Running' && p.readyContainers === p.totalContainers).length}/${s.pods.length} pods ready`)}
-    ${healthPill(totalRestarts1h ? 'amber' : 'green', `${totalRestarts1h} restarts (1h)`)}
+    ${healthPill(totalRestarts1h ? 'amber' : 'green', `${totalRestarts1h} container${totalRestarts1h === 1 ? '' : 's'} restarted (1h)`)}
     ${healthPill(s.events.length ? 'amber' : 'green', `${s.events.length} warning events (1h)`)}
     ${s.metrics ? healthPill('green', `${fmtMillicores(s.metrics.cpuMillicores)} CPU · ${fmtBytes(s.metrics.memoryBytes)} live`) : healthPill('amber', 'live usage n/a')}
   </p>`;
@@ -3441,7 +3442,7 @@ export function renderAdminHealthDetail(view: HealthDetailView, email: string): 
           <td colspan="6"><strong>${escapeHtml(p.name)}</strong>
             <span style="color:${podColour}; margin-left:0.5rem;">${escapeHtml(p.phase)}</span>
             <span style="color:#8a7a5a; font-size:0.8rem; margin-left:0.5rem;">${p.readyContainers}/${p.totalContainers} ready
-              · ${p.restarts} restarts${p.restartsLastHour ? ` (<span style="color:#e8b94a;">${p.restartsLastHour} in 1h</span>)` : ''}
+              · ${p.restarts} restarts${p.restartsLastHour ? ` (<span style="color:#e8b94a;">${p.restartsLastHour} container${p.restartsLastHour === 1 ? '' : 's'} restarted in the last hour</span>)` : ''}
               · ${escapeHtml(fmtMillicores(p.cpuMillicores))} · ${escapeHtml(fmtBytes(p.memoryBytes))}
               ${p.startedAt ? ` · started ${escapeHtml(whenLabel(p.startedAt))}` : ''}</span></td>
         </tr>`;

@@ -344,3 +344,20 @@ test('Succeeded pods (completed jobs) do not count as unready', () => {
   assert.equal(row.podsReady, 1);
   assert.equal(row.podsTotal, 1);
 });
+
+test('amber, not red: a bootstrap-tagged image that cannot be pulled is a project awaiting its first build', () => {
+  const s = snapshot({ pods: [pod({}, [container({ state: 'waiting', ready: false, waitingReason: 'ImagePullBackOff', imageTag: 'bootstrap', image: 'registry/x/web:bootstrap' })])] });
+  const score = scoreProject(s, NOW);
+  assert.equal(score.level, 'amber');
+  assert.ok(score.reasons.some((r) => /awaiting first build/.test(r)));
+  const real = snapshot({ pods: [pod({}, [container({ state: 'waiting', ready: false, waitingReason: 'ImagePullBackOff', imageTag: '20260101000000' })])] });
+  assert.equal(scoreProject(real, NOW).level, 'red');
+});
+
+test('health index exposes every reason on hover', () => {
+  const html = renderAdminHealthIndex([
+    { slug: 'p', name: 'P', level: 'red', reasons: ['a/b CrashLoopBackOff', 'c/d ImagePullBackOff'], podsReady: 0, podsTotal: 2, restartsLastHour: 1, worstEvent: null, cpuPct: null, memPct: null, argoSync: null, argoHealth: null, warnings: [], logsUrl: null } as any,
+  ], 'me@example.com');
+  assert.ok(html.includes('+1 more (hover)'));
+  assert.ok(html.includes('a/b CrashLoopBackOff\nc/d ImagePullBackOff') || html.includes('a/b CrashLoopBackOff&#10;c/d ImagePullBackOff') || /title="a\/b CrashLoopBackOff[\s\S]{1,6}c\/d ImagePullBackOff"/.test(html));
+});
