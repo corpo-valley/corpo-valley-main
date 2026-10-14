@@ -8,7 +8,6 @@ import { recordActivity } from '../services/achievements';
 import { requireInternalSecret } from '../middleware/internalAuth';
 import { ensureProvisionedById } from '../services/provisioning';
 
-
 const router = Router();
 
 // In-cluster-only guard for /internal/* routes that aren't Kratos webhooks

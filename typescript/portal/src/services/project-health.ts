@@ -34,6 +34,7 @@ export interface ContainerHealth {
   restarts: number;                 // restartCount
   lastTerminatedReason: string | null;  // lastState.terminated.reason, e.g. OOMKilled
   lastTerminatedAt: string | null;      // lastState.terminated.finishedAt (ISO)
+  terminatedReason: string | null;      // state.terminated.reason when the container is currently terminated
 }
 
 export interface PodHealth {
@@ -152,18 +153,27 @@ export function scoreProject(s: ProjectHealthSnapshot, now?: number): HealthScor
   const red: string[] = [];
   const amber: string[] = [];
 
+  // The portal's own view of the project comes first: a failed provisioning
+  // has nothing healthy to show, and a provisioning one is not settled yet.
+  if (s.projectStatus === 'failed') red.push('project provisioning failed');
+  else if (s.projectStatus === 'provisioning') amber.push('project still provisioning');
+
   for (const pod of s.pods) {
     if (pod.phase === 'Failed') red.push(`pod ${pod.name} is Failed`);
     for (const c of pod.containers) {
       if (c.waitingReason && RED_WAITING.has(c.waitingReason)) {
         red.push(`${pod.name}/${c.name} ${c.waitingReason}`);
       }
-      if (c.lastTerminatedReason === 'OOMKilled' && isRecent(c.lastTerminatedAt, at, RECENT_WINDOW_MS)) {
+      // OOMKilled either as the last termination (restarted since) or as the
+      // current terminal state (restartPolicy Never/OnFailure).
+      if (c.terminatedReason === 'OOMKilled') {
+        red.push(`${pod.name}/${c.name} OOMKilled`);
+      } else if (c.lastTerminatedReason === 'OOMKilled' && isRecent(c.lastTerminatedAt, at, RECENT_WINDOW_MS)) {
         red.push(`${pod.name}/${c.name} OOMKilled in the last hour`);
       }
     }
     if (pod.restartsLastHour > 0) {
-      amber.push(`${pod.name} restarted ${pod.restartsLastHour}× in the last hour`);
+      amber.push(`${pod.name}: ${pod.restartsLastHour} container${pod.restartsLastHour === 1 ? '' : 's'} restarted in the last hour`);
     }
   }
 
@@ -243,7 +253,8 @@ export function toHealthRow(s: ProjectHealthSnapshot, score: HealthScore = score
     level: score.level,
     reasons: score.reasons,
     podsReady: s.pods.filter((p) => p.phase === 'Running' && p.readyContainers === p.totalContainers).length,
-    podsTotal: s.pods.length,
+    // Completed Jobs/hooks (Succeeded) are not unready pods; leave them out.
+    podsTotal: s.pods.filter((p) => p.phase !== 'Succeeded').length,
     restartsLastHour: s.pods.reduce((n, p) => n + p.restartsLastHour, 0),
     worstEvent: ev ? `${ev.reason}${ev.count > 1 ? ` ×${ev.count}` : ''} ${ev.involvedKind}/${ev.involvedName}` : null,
     cpuPct: pct(s.quota?.cpuFraction ?? null),
@@ -297,6 +308,7 @@ function containerFrom(cs: any, init: boolean): ContainerHealth {
     restarts: Number(cs?.restartCount) || 0,
     lastTerminatedReason: cs?.lastState?.terminated?.reason || null,
     lastTerminatedAt: cs?.lastState?.terminated?.finishedAt || null,
+    terminatedReason: state.terminated?.reason || null,
   };
 }
 

@@ -3357,7 +3357,7 @@ export function renderAdminHealthIndex(
   body += `
     <div class="table-wrap"><table class="table">
       <thead><tr>
-        <th>Project</th><th>Status</th><th>Pods</th><th>Restarts (1h)</th><th>Worst event (1h)</th>
+        <th>Project</th><th>Status</th><th>Pods</th><th>Containers restarted (1h)</th><th>Worst event (1h)</th>
         <th>CPU</th><th>Memory</th><th>Argo (sync / health)</th><th>Links</th>
       </tr></thead>
       <tbody>${tr}</tbody>

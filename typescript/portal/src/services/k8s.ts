@@ -62,6 +62,8 @@ interface K8sCallOpts {
   contentType?: string;
 }
 
+const K8S_REQUEST_TIMEOUT_MS = Number(process.env.K8S_REQUEST_TIMEOUT_MS) || 15_000;
+
 function call<T>(opts: K8sCallOpts): Promise<T> {
   return new Promise((resolve, reject) => {
     const payload = opts.body !== undefined ? Buffer.from(JSON.stringify(opts.body)) : undefined;
@@ -92,6 +94,9 @@ function call<T>(opts: K8sCallOpts): Promise<T> {
       }
     );
     req.on('error', reject);
+    // A hung API server must not hang the caller (and, for the admin health
+    // page, wedge its in-flight cache entry): fail the request after 15 s.
+    req.setTimeout(K8S_REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`k8s API request timed out after ${K8S_REQUEST_TIMEOUT_MS} ms`)));
     if (payload) req.write(payload);
     req.end();
   });
@@ -244,6 +249,7 @@ export async function k8sPodLogs(opts: {
       }
     );
     req.on('error', reject);
+    req.setTimeout(K8S_REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`k8s API request timed out after ${K8S_REQUEST_TIMEOUT_MS} ms`)));
     req.end();
   });
 }
@@ -291,6 +297,7 @@ export async function k8sServiceProxyGet(opts: {
       }
     );
     req.on('error', reject);
+    req.setTimeout(K8S_REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`k8s API request timed out after ${K8S_REQUEST_TIMEOUT_MS} ms`)));
     req.end();
   });
 }

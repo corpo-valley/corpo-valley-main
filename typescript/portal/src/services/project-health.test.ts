@@ -15,6 +15,7 @@ function container(over: Partial<ContainerHealth> = {}): ContainerHealth {
   return {
     name: 'web', image: 'registry/x/web:abc', imageTag: 'abc', init: false, ready: true,
     state: 'running', waitingReason: null, restarts: 0, lastTerminatedReason: null, lastTerminatedAt: null,
+    terminatedReason: null,
     ...over,
   };
 }
@@ -70,7 +71,7 @@ test('red: Failed pod phase; Argo Degraded or Missing', () => {
 test('amber: restarts in the last hour', () => {
   const r = scoreProject(snapshot({ pods: [pod({ restartsLastHour: 2 })] }), NOW);
   assert.equal(r.level, 'amber');
-  assert.match(r.reasons[0], /restarted 2×/);
+  assert.match(r.reasons[0], /2 containers restarted in the last hour/);
 });
 
 test('amber: FailedScheduling / BackOff / Unhealthy warning events, but not other warnings or stale ones', () => {
@@ -322,4 +323,24 @@ test('health detail reports a refused log fetch instead of a snippet', () => {
   assert.ok(html.includes('Unknown pod or container for this project.'));
   assert.ok(!html.includes('<pre class="snippet">'));
   assert.ok(html.includes('href="https://logs.example/?namespace=shop"'));
+});
+
+test('project status drives the score: failed → red, provisioning → amber', () => {
+  assert.equal(scoreProject(snapshot({ projectStatus: 'failed' }), NOW).level, 'red');
+  assert.equal(scoreProject(snapshot({ projectStatus: 'provisioning' }), NOW).level, 'amber');
+  assert.equal(scoreProject(snapshot({ projectStatus: 'ready' }), NOW).level, 'green');
+});
+
+test('red: a container currently terminated with OOMKilled, even without a restart', () => {
+  const s = snapshot({ pods: [pod({}, [container({ state: 'terminated', ready: false, terminatedReason: 'OOMKilled' })])] });
+  const score = scoreProject(s, NOW);
+  assert.equal(score.level, 'red');
+  assert.ok(score.reasons.some((r) => /OOMKilled/.test(r)));
+});
+
+test('Succeeded pods (completed jobs) do not count as unready', () => {
+  const s = snapshot({ pods: [pod(), pod({ name: 'hook-1', phase: 'Succeeded', readyContainers: 0 }, [container({ ready: false, state: 'terminated', terminatedReason: 'Completed' })])] });
+  const row = toHealthRow(s);
+  assert.equal(row.podsReady, 1);
+  assert.equal(row.podsTotal, 1);
 });
