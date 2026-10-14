@@ -10,9 +10,9 @@
 # attack surface if the app is ever compromised.
 
 # Pin the builder to an immutable patch tag. For supply-chain hardening, append
-# a digest at build time (`node:20.18.1-slim@sha256:<digest>`) and bump
-# intentionally rather than tracking the floating `node:20-slim` tag.
-FROM node:20.18.1-slim AS builder
+# a digest at build time (`node:24.21.0-slim@sha256:<digest>`) and bump
+# intentionally rather than tracking the floating `node:24-slim` tag.
+FROM node:24.21.0-slim AS builder
 
 WORKDIR /app
 
@@ -32,7 +32,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ── Runtime: distroless, non-root, no shell ───────────────────────────────────
-FROM gcr.io/distroless/nodejs20-debian12:nonroot
+FROM gcr.io/distroless/nodejs24-debian12:nonroot
 
 WORKDIR /app
 ENV NODE_ENV=production

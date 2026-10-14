@@ -104,7 +104,11 @@ Corpo Valley speaks the Model Context Protocol on two surfaces:
 
 A scoped admin UI manages members (create, delete, set/clear the admin role,
 issue recovery codes), gates first-party OAuth **services** to admins-only or
-all members, and resets the project template. Deleting a user cascades cleanly:
+all members, and resets the project template. **All projects** lists every
+project with its owner; from there an admin can **transfer ownership** to
+another member — the Gitea repository, access grants and the ArgoCD deployment
+source move with it, the previous owner can optionally be kept as admin, and
+the change is recorded in the project's audit trail. Deleting a user cascades cleanly:
 their projects, groups, grants, API keys, bot identity, and Gitea accounts are
 all torn down.
 

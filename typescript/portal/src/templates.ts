@@ -687,9 +687,9 @@ export function roleBadge(isAdmin: boolean): string {
 
 export interface BadgeChip { key: string; name: string; emoji: string; }
 
-// A small pill used to surface an earned badge on other surfaces (project cards,
-// Community Feed). Pass already-shaped, trusted metadata (name/emoji from the
-// catalog) — never user input.
+// A small pill used to surface an earned badge on other surfaces (the Community
+// Users tab, the badge toast). Pass already-shaped, trusted metadata (name/emoji
+// from the catalog) — never user input.
 export function badgeChip(c: BadgeChip): string {
   return `<span class="badge badge-achievement" title="${escapeHtml(c.name)}">${c.emoji} ${escapeHtml(c.name)}</span>`;
 }
@@ -757,11 +757,21 @@ export function renderPublicProfile(
   isAdmin: boolean,
   displayName: string,
   badges: Badge[],
+  // Projects this resident has shared with everyone (same visibility rule as
+  // the Community Feed) — never private ones.
+  publicProjects: Array<{ name: string; slug: string }> = [],
 ): string {
+  const projectsHtml = publicProjects.length
+    ? `<ul style="margin:0.25rem 0 0;padding-left:1.2rem;">${publicProjects.map((p) =>
+        `<li><a href="${projectSiteUrl(escapeHtml(p.slug))}" target="_blank" rel="noopener">${escapeHtml(p.name)} ↗</a>
+          <span class="help" style="margin:0;display:inline;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)}</span></li>`).join('')}</ul>`
+    : '<p style="color:#c4b698;margin:0.25rem 0 0;">Nothing shared with everyone yet.</p>';
   const body = `
     <p class="tagline">${escapeHtml(displayName)}'s badges in the valley.</p>
     ${achievementsBoard(badges, false)}
-    <div style="margin-top:1.5rem;"><a href="/community">← Back to Community</a></div>`;
+    <h2 class="achv-cat" style="margin-top:1.5rem;">Shared projects</h2>
+    ${projectsHtml}
+    <div style="margin-top:1.5rem;"><a href="/community/users">← Back to Community</a></div>`;
   return dashboardLayout(`${displayName}'s Achievements`, body, email, isAdmin, 'community');
 }
 
@@ -798,6 +808,7 @@ function dashboardLayout(
     adminNav = `
       <div class="nav-section">Admin</div>
       <a href="/admin/users"${activeNav === 'users' ? ' class="active"' : ''}>Users</a>
+      <a href="/admin/projects"${activeNav === 'admin-projects' ? ' class="active"' : ''}>All projects</a>
       <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>SSO Apps</a>
       <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
       <a href="/admin/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Resources</a>
@@ -951,6 +962,133 @@ export const COMMUNITY_DEFAULT_DIR: Record<CommunitySort, CommunityDir> = {
   trending: 'desc',
 };
 
+// The Community page has two tabs: Projects (the feed) and Users (residents).
+// Server-rendered links, so the heavier Users query only runs on that tab.
+function communityTabs(active: 'projects' | 'users'): string {
+  const tab = (key: 'projects' | 'users', href: string, label: string) =>
+    `<a class="cv-tab${active === key ? ' active' : ''}" href="${href}" role="tab" aria-selected="${active === key ? 'true' : 'false'}">${label}</a>`;
+  return `
+    <style>
+      .cm-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid #5a4a36; margin: 0 0 1rem; }
+      .cm-tabs .cv-tab { display: inline-block; padding: 0.5rem 0.9rem; color: #c4b698; text-decoration: none; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+      .cm-tabs .cv-tab:hover { color: #e8b94a; }
+      .cm-tabs .cv-tab.active { color: #e8b94a; border-bottom-color: #e8b94a; }
+    </style>
+    <div class="cm-tabs" role="tablist">
+      ${tab('projects', '/community', '🏘️ Projects')}
+      ${tab('users', '/community/users', '🧑‍🌾 Users')}
+    </div>`;
+}
+
+export const COMMUNITY_USER_SORTS = ['badges', 'projects', 'name'] as const;
+export type CommunityUserSort = typeof COMMUNITY_USER_SORTS[number];
+
+export interface CommunityUserRow {
+  displayName: string;       // name (first last) or username/email fallback
+  username?: string;         // preferred_username, for the profile link
+  badges: BadgeChip[];       // earned badges (from the grant cache)
+  projects: Array<{ name: string; slug: string }>; // public (everyone-shared) projects
+}
+
+// GET /community/users — browse residents: who they are, the badges they've
+// earned, and the projects they've shared with everyone. Badges belong to users
+// (not projects), which is why they live here and on profiles, not on the feed.
+export function renderCommunityUsers(
+  email: string,
+  rows: CommunityUserRow[],
+  isAdmin: boolean,
+  sort: CommunityUserSort,
+): string {
+  const quickSort = (key: CommunityUserSort, label: string) =>
+    `<a class="cf-quick${sort === key ? ' is-active' : ''}" href="/community/users?sort=${key}">${label}</a>`;
+  let body = `
+    ${communityTabs('users')}
+    <p class="tagline">Residents of the valley — their badges and what they've shared.</p>
+    <div class="cf-quicksort">Sort: ${quickSort('badges', '🏆 Most badges')} ${quickSort('projects', '🏘️ Most shared')} ${quickSort('name', '🔤 Name')}</div>
+    <style>
+      .cf-quicksort { margin: 0.25rem 0 0.5rem; font-size: 0.85rem; color: #a89878; }
+      .cf-quick { display: inline-block; margin: 0 0.15rem; padding: 0.2rem 0.55rem; border-radius: 9999px; border: 1px solid #5a4a36; color: #c4b698; text-decoration: none; }
+      .cf-quick:hover { border-color: #e8b94a; color: #e8b94a; }
+      .cf-quick.is-active { background: #4a3c2c; color: #e8b94a; border-color: #e8b94a; }
+      .cf-filter-wrap { margin: 1rem 0 0; }
+      .cf-filter { width: 100%; max-width: 22rem; box-sizing: border-box; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #5a4a36; background: #2a2118; color: #fdf6e8; font-size: 0.9rem; }
+      .cf-filter::placeholder { color: #a89878; }
+      .cf-filter:focus { outline: none; border-color: #e8b94a; }
+      .cu-nomatch { display: none; }
+      .cu-nomatch td { color: #a89878; text-align: center; padding: 1.5rem 0.75rem; font-style: italic; }
+      .cu-projects a { display: inline-block; margin: 0 0.5rem 0.2rem 0; }
+      .cu-muted { color: #8a7a5e; font-style: italic; }
+    </style>`;
+
+  if (rows.length === 0) {
+    body += `
+      <div class="app-card" style="text-align:center;padding:2rem 1.5rem;">
+        <div style="font-size:2rem;margin-bottom:0.5rem;">🧑‍🌾</div>
+        <h3 style="color:#fdf6e8;margin:0 0 0.35rem 0;">No residents yet</h3>
+        <p class="help" style="margin-bottom:0;">Nobody has moved in. Once people sign up they show up here.</p>
+      </div>`;
+    return dashboardLayout('Community · Users', body, email, isAdmin, 'community');
+  }
+
+  body += `
+    <div class="cf-filter-wrap">
+      <input type="text" id="cu-filter" class="cf-filter" placeholder="Filter by name or username…"
+             aria-label="Filter residents by name or username" autocomplete="off">
+    </div>
+    <div class="table-wrap"><table class="table" id="cu-table">
+      <thead><tr>
+        <th>Resident</th>
+        <th>Badges</th>
+        <th>Shared projects</th>
+      </tr></thead>
+      <tbody>`;
+  for (const r of rows) {
+    const nameHtml = r.username
+      ? `<a href="/achievements/u/${encodeURIComponent(r.username)}">${escapeHtml(r.displayName)}</a>`
+      : escapeHtml(r.displayName);
+    const handle = r.username && r.username !== r.displayName
+      ? `<div class="help" style="margin:0;">@${escapeHtml(r.username)}</div>` : '';
+    const badgesHtml = r.badges.length
+      ? `<div class="chip-row">${r.badges.map(badgeChip).join('')}</div>`
+      : '<span class="cu-muted">none yet</span>';
+    const projectsHtml = r.projects.length
+      ? `<div class="cu-projects">${r.projects.map((p) =>
+          `<a href="${projectSiteUrl(escapeHtml(p.slug))}" target="_blank" rel="noopener">${escapeHtml(p.name)} ↗</a>`).join('')}</div>`
+      : '<span class="cu-muted">nothing shared</span>';
+    body += `
+        <tr class="cu-row" data-name="${escapeHtml(r.displayName)}" data-username="${escapeHtml(r.username ?? '')}">
+          <td>${nameHtml}${handle}</td>
+          <td>${badgesHtml}</td>
+          <td>${projectsHtml}</td>
+        </tr>`;
+  }
+  body += `
+        <tr class="cu-nomatch"><td colspan="3">No residents match your filter.</td></tr>
+      </tbody></table></div>
+    <script nonce="${cspNonce()}">
+      (function(){
+        var input = document.getElementById('cu-filter');
+        var table = document.getElementById('cu-table');
+        if (!table || !input) return;
+        var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr.cu-row'));
+        var noMatch = table.querySelector('tbody tr.cu-nomatch');
+        input.addEventListener('input', function(){
+          var q = input.value.trim().toLowerCase();
+          var shown = 0;
+          rows.forEach(function(tr){
+            var name = (tr.getAttribute('data-name') || '').toLowerCase();
+            var user = (tr.getAttribute('data-username') || '').toLowerCase();
+            var hit = !q || name.indexOf(q) !== -1 || user.indexOf(q) !== -1;
+            tr.style.display = hit ? '' : 'none';
+            if (hit) shown++;
+          });
+          if (noMatch) noMatch.style.display = shown === 0 ? 'table-row' : 'none';
+        });
+      })();
+    </script>`;
+  return dashboardLayout('Community · Users', body, email, isAdmin, 'community');
+}
+
 export interface CommunityRow {
   name: string;
   slug: string;
@@ -961,7 +1099,6 @@ export interface CommunityRow {
   createdRel: string; // relative "2d ago" label
   updatedRel: string; // relative "3w ago" label
   creatorUsername?: string; // owner's preferred_username, for the profile link
-  creatorBadges: BadgeChip[]; // owner's earned badges (from the grant cache)
   visitors: number;   // distinct site visitors (popularity)
   builds: number;     // deploys shipped
   contributors: number; // distinct PR authors/mergers
@@ -998,6 +1135,7 @@ export function renderCommunityFeed(
   const quickSort = (key: CommunitySort, label: string) =>
     `<a class="cf-quick${sort === key ? ' is-active' : ''}" href="/community?sort=${key}&dir=${COMMUNITY_DEFAULT_DIR[key]}">${label}</a>`;
   let body = `
+    ${communityTabs('projects')}
     <p class="tagline">Internal projects shared across the valley. Open one to see what folks are building.</p>
     <div class="cf-quicksort">Sort: ${quickSort('trending', '🔥 Trending')} ${quickSort('popular', '👀 Popular')} ${quickSort('updated', '🕒 Recently active')} ${quickSort('created', '🆕 Newest')}</div>
   `;
@@ -1076,7 +1214,6 @@ export function renderCommunityFeed(
             ${r.creatorUsername
               ? `<a href="/achievements/u/${encodeURIComponent(r.creatorUsername)}">${escapeHtml(r.creator)}</a>`
               : escapeHtml(r.creator)}
-            ${r.creatorBadges.length ? `<div class="chip-row" style="margin-top:0.3rem;">${r.creatorBadges.map(badgeChip).join('')}</div>` : ''}
           </td>
           <td class="cf-metrics">
             <span title="distinct visitors">👀 ${r.visitors}</span>
@@ -1089,7 +1226,7 @@ export function renderCommunityFeed(
         </tr>`;
   }
   body += `
-        <tr class="cf-nomatch"><td colspan="5">No projects match your filter.</td></tr>
+        <tr class="cf-nomatch"><td colspan="6">No projects match your filter.</td></tr>
       </tbody></table></div>
     <script nonce="${cspNonce()}">
       (function(){
@@ -1195,13 +1332,16 @@ export function renderProjects(
       body += `
         <div class="app-card">
           <div class="app-card-header">
-            <span class="app-card-name">${escapeHtml(p.name)}</span>
+            <a href="/projects/${escapeHtml(p.id)}" class="app-card-name" style="color:#fdf6e8;text-decoration:none;">${escapeHtml(p.name)}</a>
           </div>
           <div class="app-card-sub"><a href="${url}" target="_blank" rel="noopener" style="color:#e8b94a;">${escapeHtml(p.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></div>
           <div class="app-card-sub" style="margin-top:0.4rem;">Your access: site ${accessBadge(p.sitePerm)} &nbsp; repo ${accessBadge(p.repoPerm)}</div>
-          ${p.giteaRepo && p.repoPerm !== 'none'
-            ? `<div class="app-card-actions"><a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a></div>`
-            : ''}
+          <div class="app-card-actions">
+            <a href="/projects/${escapeHtml(p.id)}" class="btn btn-primary btn-sm">${p.repoPerm === 'admin' || p.sitePerm === 'admin' ? 'Manage' : 'Open'}</a>
+            ${p.giteaRepo && p.repoPerm !== 'none'
+              ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(p.giteaRepo)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Repo ↗</a>`
+              : ''}
+          </div>
         </div>`;
     }
     body += '</div>';
@@ -1483,6 +1623,19 @@ export interface ProjectSecretRow {
   name: string;
 }
 
+// Who is looking at a project page and what they may do there. `tier` is the
+// viewer's dashboard tier (services/project-tier.ts): read = look, write =
+// secrets + capabilities, admin = delete / destroy data / sharing. The owner
+// and platform admins are admin; a grantee gets whatever the owner granted.
+export interface ProjectViewer {
+  tier: 'none' | 'read' | 'write' | 'admin';
+  isOwner: boolean;
+  platformAdmin?: boolean;
+  // Has REPO access (owner or a repo-facet grant) — gates the clone-token form.
+  canRepo?: boolean;
+}
+const VIEWER_RANK = { none: 0, read: 1, write: 2, admin: 3 } as const;
+
 export function renderProjectDetail(
   email: string,
   isAdmin: boolean,
@@ -1492,8 +1645,19 @@ export function renderProjectDetail(
   secretMessage: { type: 'error' | 'success'; text: string } | null = null,
   grants: ProjectGrantRow[] = [],
   groups: GroupOptionRow[] = [],
-  metrics: ProjectMetrics | null = null
+  metrics: ProjectMetrics | null = null,
+  viewer: ProjectViewer = { tier: 'admin', isOwner: true },
 ): string {
+  const canWrite = VIEWER_RANK[viewer.tier] >= VIEWER_RANK.write;
+  const canAdmin = VIEWER_RANK[viewer.tier] >= VIEWER_RANK.admin;
+  const canRepo = viewer.canRepo ?? viewer.isOwner;
+  // Read-only renderings of the toggle cards: drop the POST forms (the route
+  // enforces the same tier server-side; this just keeps the UI honest).
+  const stripForms = (html: string) => html.replace(/<form\b[\s\S]*?<\/form>/g,
+    '<p class="help" style="margin:0;">You need write access on this project to change this.</p>');
+  const stripDestroy = (html: string) => html
+    .replace(/<label style="display:flex;[\s\S]*?name="destroy_data"[\s\S]*?<\/label>/g, '')
+    .replace(/ the data volume stays unless you check &quot;also delete the data&quot; below\./g, ' the data volume stays.');
   const secretsList = secrets.length === 0
     ? '<div class="message info">No secrets yet.</div>'
     : `<div class="table-wrap"><table class="table">
@@ -1503,13 +1667,13 @@ export function renderProjectDetail(
           <tr>
             <td><code>${escapeHtml(s.name)}</code></td>
             <td>
-              <form method="POST"
+              ${canWrite ? `<form method="POST"
                     action="/projects/${escapeHtml(project.id)}/secrets/${escapeHtml(s.name)}/delete"
                     class="inline-form"
                     data-confirm="Delete sealed secret ${escapeHtml(s.name)}? This removes it from your repo on the next sync.">
                 ${csrf}
                 <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-              </form>
+              </form>` : ''}
             </td>
           </tr>
         `).join('')}
@@ -1548,6 +1712,7 @@ claude`
         </a>
       </div>
       ${metricsStrip}
+      ${viewer.isOwner ? '' : `<div style="font-size:0.85rem;color:#c4b698;margin-bottom:0.5rem;">Your access: ${accessBadge(viewer.tier)} ${viewer.platformAdmin ? '<span class="help" style="display:inline;margin:0;">(platform admin)</span>' : '<span class="help" style="display:inline;margin:0;">(shared with you by the owner)</span>'}</div>`}
       <div style="font-size:0.8rem;color:#a89878;">
         ${project.giteaRepo
           ? `<a href="${GITEA_PUBLIC_URL}/${escapeHtml(project.giteaRepo)}" target="_blank" rel="noopener" style="color:#a89878;text-decoration:underline;">${escapeHtml(project.giteaRepo)}</a> · `
@@ -1589,12 +1754,14 @@ claude`
           <pre class="snippet" id="cv-clone-cmd">${escapeHtml(cloneCommands)}</pre>
           <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.5rem;">
             <button type="button" class="btn btn-sm btn-secondary cv-copy" data-target="cv-clone-cmd">Copy commands</button>
-            <form method="POST" action="/projects/${escapeHtml(project.id)}/cli-token" class="inline-form" style="display:inline;">
+            ${canRepo ? `<form method="POST" action="/projects/${escapeHtml(project.id)}/cli-token" class="inline-form" style="display:inline;">
               ${csrf}
               <button type="submit" class="btn btn-sm btn-primary">Get a CLI password</button>
-            </form>
+            </form>` : ''}
           </div>
-          <p class="help" style="margin-top:0.75rem;margin-bottom:0;">First clone needs a Gitea password — click <strong>Get a CLI password</strong> and Corpo Valley hands you a one-shot token with a ready-to-paste clone command.</p>
+          <p class="help" style="margin-top:0.75rem;margin-bottom:0;">${canRepo
+            ? 'First clone needs a Gitea password — click <strong>Get a CLI password</strong> and Corpo Valley hands you a one-shot token with a ready-to-paste clone command.'
+            : 'Cloning needs repo access on this project — ask the owner for a repo grant.'}</p>
 
           <p class="help" style="margin:1rem 0 0.4rem 0;"><strong style="color:#fdf6e8;">2.</strong> Talk to Claude in your project: <em>"Build a homepage with our name and a sign-up form."</em></p>
         </div>
@@ -1746,41 +1913,11 @@ claude`
         </div>
         <button type="submit" class="btn btn-primary btn-sm">Add</button>
       </div>
-      <p class="help" style="margin:0.4rem 0 0;">Pick a level for Site, Repo, or both. <strong>Site</strong> is the deployed website; <strong>Repo</strong> is the Gitea source. The highest applicable level wins; you always have admin on both.</p>
+      <p class="help" style="margin:0.4rem 0 0;">Pick a level for Site, Repo, or both. <strong>Site</strong> is the deployed website; <strong>Repo</strong> is the Gitea source. The highest applicable level wins; the owner and project admins always have admin on both.</p>
     </form>`;
 
-  // ── Configure card: Sealed Secrets + Access settings, grouped because
-  // both are "settings on the running project". Sub-sections inside the
-  // card use `<h4>` so they're visually subordinate to the card header.
-  const configureCard = `
-    <div class="app-card" style="margin-top:1.25rem;">
-      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">Configure</h3>
-      <p class="help" style="margin-bottom:1rem;">Settings that travel with your running project.</p>
-      ${msgBanner}
-
-      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Sealed secrets</h4>
-      <p class="help" style="margin-bottom:0.6rem;">Sealed in-cluster, committed to <code>k8s/secrets/&lt;name&gt;.sealed.yaml</code> in your repo; materialised as Kubernetes Secrets in the <code>${escapeHtml(project.slug)}</code> namespace. Reference from your Deployment via <code>envFrom</code> or <code>valueFrom: secretKeyRef</code>.</p>
-      ${secretsList}
-      <form method="POST" action="/projects/${escapeHtml(project.id)}/secrets" style="margin-top:0.85rem;">
-        ${csrf}
-        <div class="field">
-          <label for="secret_name">New secret name</label>
-          <input type="text" id="secret_name" name="secret_name" required
-                 pattern="[a-z0-9-]+"
-                 title="lowercase letters, digits, and hyphens"
-                 placeholder="api-credentials" />
-        </div>
-        <div class="field">
-          <label for="secret_data">Data (one <code>KEY=VALUE</code> per line)</label>
-          <textarea id="secret_data" name="secret_data" rows="4" required
-                    placeholder="API_KEY=hunter2&#10;DB_PASSWORD=correct horse battery staple"
-                    style="width:100%; font-family:monospace; padding:0.5rem;"></textarea>
-        </div>
-        <button type="submit" class="btn btn-primary">Seal &amp; save</button>
-      </form>
-
-      <hr style="border:none;border-top:1px solid #5a4a36;margin:1.5rem 0 1rem 0;" />
-
+  // Sharing is an admin-only surface: grantees below admin see a summary.
+  const shareSection = canAdmin ? `
       <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Share</h4>
       <p class="help" style="margin-bottom:0.85rem;"><strong>Private by default</strong> — only you and your bot can reach this project. Add people below, or open the site to everyone signed in.</p>
 
@@ -1796,6 +1933,45 @@ claude`
       ${groups.length > 0
         ? `<p class="help" style="margin-top:0.85rem;">Tip: add a <strong>group</strong> by name to grant many members at once. Groups: ${groups.map((g) => `<code>${escapeHtml(g.name)}</code> (${g.memberCount})`).join(', ')} — manage under <a href="/groups" style="color:#e8b94a;">Groups</a>.</p>`
         : `<p class="help" style="margin-top:0.85rem;">Tip: create a <a href="/groups" style="color:#e8b94a;">group</a> to grant many members at once, then add it by name above.</p>`}
+
+` : `
+      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Share</h4>
+      <p class="help" style="margin-bottom:0.5rem;">Sharing is managed by the project owner and project admins.</p>
+      <p class="help" style="margin:0;">Everyone signed in: site ${accessBadge(project.everyoneSite)} &nbsp; repo ${accessBadge(project.everyoneRepo)}</p>`;
+
+  // ── Configure card: Sealed Secrets + Access settings, grouped because
+  // both are "settings on the running project". Sub-sections inside the
+  // card use `<h4>` so they're visually subordinate to the card header.
+  const configureCard = `
+    <div class="app-card" style="margin-top:1.25rem;">
+      <h3 style="margin:0 0 0.35rem 0;color:#fdf6e8;">Configure</h3>
+      <p class="help" style="margin-bottom:1rem;">Settings that travel with your running project.</p>
+      ${msgBanner}
+
+      <h4 style="margin:0 0 0.35rem 0;color:#fdf6e8;font-size:0.95rem;">Sealed secrets</h4>
+      <p class="help" style="margin-bottom:0.6rem;">Sealed in-cluster, committed to <code>k8s/secrets/&lt;name&gt;.sealed.yaml</code> in your repo; materialised as Kubernetes Secrets in the <code>${escapeHtml(project.slug)}</code> namespace. Reference from your Deployment via <code>envFrom</code> or <code>valueFrom: secretKeyRef</code>.</p>
+      ${secretsList}
+      ${canWrite ? `<form method="POST" action="/projects/${escapeHtml(project.id)}/secrets" style="margin-top:0.85rem;">
+        ${csrf}
+        <div class="field">
+          <label for="secret_name">New secret name</label>
+          <input type="text" id="secret_name" name="secret_name" required
+                 pattern="[a-z0-9-]+"
+                 title="lowercase letters, digits, and hyphens"
+                 placeholder="api-credentials" />
+        </div>
+        <div class="field">
+          <label for="secret_data">Data (one <code>KEY=VALUE</code> per line)</label>
+          <textarea id="secret_data" name="secret_data" rows="4" required
+                    placeholder="API_KEY=hunter2&#10;DB_PASSWORD=correct horse battery staple"
+                    style="width:100%; font-family:monospace; padding:0.5rem;"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">Seal &amp; save</button>
+      </form>` : '<p class="help" style="margin-top:0.85rem;">You need write access on this project to add or remove secrets.</p>'}
+
+      <hr style="border:none;border-top:1px solid #5a4a36;margin:1.5rem 0 1rem 0;" />
+
+      ${shareSection}
 
       <details class="share-dev">
         <summary>For developers</summary>
@@ -1957,14 +2133,16 @@ claude`
     </div>
   `;
 
+  const dbCardView = !canWrite ? stripForms(dbCard) : (!canAdmin ? stripDestroy(dbCard) : dbCard);
+  const storageCardView = !canWrite ? stripForms(storageCard) : (!canAdmin ? stripDestroy(storageCard) : storageCard);
   const body = `
     <p style="margin-bottom:1rem;"><a href="/" class="btn btn-secondary btn-sm">← All projects</a></p>
     ${overviewCard}
     ${getStartedCard}
     ${configureCard}
-    ${dbCard}
-    ${storageCard}
-    ${dangerCard}
+    ${dbCardView}
+    ${storageCardView}
+    ${canAdmin ? dangerCard : ''}
   `;
   return dashboardLayout(`Project: ${project.name}`, body, email, isAdmin, 'projects');
 }
@@ -3087,6 +3265,182 @@ export function renderAdminProjectResourceDetail(
   }
 
   return dashboardLayout(`Resources — ${view.slug}`, body, email, true, 'resources');
+}
+
+// ── Admin: all projects + ownership transfer ───────────────────────────────
+
+// One row of the /admin/projects table.
+export interface AdminProjectRow {
+  slug: string;
+  name: string;
+  ownerId: string;
+  ownerEmail: string;      // resolved email, or the raw id when Kratos can't
+  status: string;          // provisioning | ready | failed
+  createdAt: string;       // ISO
+  giteaRepo: string | null;
+}
+
+function projectStatusBadge(status: string): string {
+  const color = status === 'ready' ? '#84a25a' : status === 'failed' ? '#d9734a' : '#e8b94a';
+  return `<span style="color:${color};">${escapeHtml(status)}</span>`;
+}
+
+// /admin/projects — every project on the platform with its owner, for admins
+// to find a project and hand it to someone else.
+export function renderAdminProjectsIndex(projects: AdminProjectRow[], email: string): string {
+  let body = `<p>Every project on the platform, whoever owns it. Open a project to
+    <strong>transfer ownership</strong> to another member (the Gitea repository,
+    access grants and the ArgoCD deployment move with it), or jump to its resource
+    budget.</p>`;
+
+  const rows = projects.map((p) => {
+    const site = projectSiteUrl(escapeHtml(p.slug));
+    return `
+        <tr>
+          <td><a href="/admin/projects/${escapeHtml(p.slug)}">${escapeHtml(p.name)}</a><br>
+              <code style="font-size:0.75rem;">${escapeHtml(p.slug)}</code></td>
+          <td><a href="/admin/users/${escapeHtml(p.ownerId)}">${escapeHtml(p.ownerEmail)}</a></td>
+          <td>${projectStatusBadge(p.status)}</td>
+          <td>${escapeHtml(whenLabel(p.createdAt))}</td>
+          <td style="white-space:nowrap;">
+            <a href="/admin/projects/${escapeHtml(p.slug)}" class="btn btn-secondary btn-sm">Transfer</a>
+            <a href="/admin/resources/${escapeHtml(p.slug)}" class="btn btn-secondary btn-sm">Resources</a>
+            <a href="${site}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Site ↗</a>
+          </td>
+        </tr>`;
+  }).join('');
+
+  body += `
+    <h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:1.5rem;">Projects (${projects.length})</h2>
+    ${projects.length === 0 ? '<p class="help">No projects yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Project</th><th>Owner</th><th>Status</th><th>Created</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`}`;
+
+  return dashboardLayout('All projects', body, email, true, 'admin-projects');
+}
+
+export interface AdminProjectTransferView {
+  slug: string;
+  name: string;
+  status: string;
+  createdAt: string;
+  ownerId: string;
+  ownerEmail: string;
+  giteaRepo: string | null;
+  argoNamespace: string;
+  audit: ProjectResourceAuditRow[];
+}
+
+// The admin's raw form input, echoed back after a failed submit.
+export interface TransferFormState {
+  target: string;
+  keepPreviousOwner: boolean;
+}
+
+// /admin/projects/:slug — project summary + the ownership-transfer form.
+// Mirrors the dashboard Danger-zone idiom: the submit button is gated on the
+// admin typing the slug (JS), and the server re-checks `confirm_slug`.
+export function renderAdminProjectTransfer(
+  view: AdminProjectTransferView,
+  result: ResourcesResultView | null,
+  email: string,
+  csrf: string = '',
+  form: TransferFormState = { target: '', keepPreviousOwner: true },
+): string {
+  let body = `<p style="margin-bottom:1rem;"><a href="/admin/projects" class="btn btn-secondary btn-sm">Back to All projects</a>
+    <a href="/admin/resources/${escapeHtml(view.slug)}" class="btn btn-secondary btn-sm">Resources</a></p>`;
+  body += resourceResultBanner(result);
+
+  const site = projectSiteUrl(escapeHtml(view.slug));
+  const repo = view.giteaRepo
+    ? `<a href="${escapeHtml(GITEA_PUBLIC_URL)}/${escapeHtml(view.giteaRepo)}" target="_blank" rel="noopener"><code>${escapeHtml(view.giteaRepo)}</code> ↗</a>`
+    : '<span style="color:#8a7a5a;">none recorded</span>';
+  body += `
+    <div class="app-card">
+      <h3 style="margin:0 0 0.5rem 0;">${escapeHtml(view.name)} <code style="font-size:0.8rem;">${escapeHtml(view.slug)}</code></h3>
+      <div class="table-wrap"><table class="table" style="max-width:44rem;">
+        <tbody>
+          <tr><th style="width:9rem;">Owner</th><td><a href="/admin/users/${escapeHtml(view.ownerId)}">${escapeHtml(view.ownerEmail)}</a>
+              <span style="color:#8a7a5a; font-size:0.75rem;">${escapeHtml(view.ownerId)}</span></td></tr>
+          <tr><th>Status</th><td>${projectStatusBadge(view.status)}</td></tr>
+          <tr><th>Created</th><td>${escapeHtml(whenLabel(view.createdAt))}</td></tr>
+          <tr><th>Gitea repo</th><td>${repo}</td></tr>
+          <tr><th>Site</th><td><a href="${site}" target="_blank" rel="noopener">${escapeHtml(view.slug)}.${escapeHtml(PROJECTS_DOMAIN)} ↗</a></td></tr>
+          <tr><th>ArgoCD</th><td><code>${escapeHtml(view.argoNamespace)}/${escapeHtml(view.slug)}</code></td></tr>
+        </tbody>
+      </table></div>
+    </div>`;
+
+  const disabled = view.status !== 'ready' || !view.giteaRepo;
+  body += `
+    <div class="app-card" style="margin-top:1.25rem;border-color:#7f3d1d;">
+      <h3 style="margin:0 0 0.35rem 0;color:#f3a5a5;">Transfer ownership</h3>
+      <p class="help" style="margin-bottom:0.75rem;">
+        Moves the Gitea repository to the new owner's account, re-points the ArgoCD
+        deployment at it, re-converges collaborators, and records the change. The
+        new owner gets full access; any explicit grant they held is removed. The
+        running deployment is not restarted — it keeps the currently pinned image
+        until the next build. This cannot be undone from here (transfer it back
+        instead).
+      </p>
+      ${disabled ? `<p class="help" style="color:#e8b94a;">Transfers are only possible for <strong>ready</strong> projects with a recorded Gitea repository.</p>` : ''}
+      <form method="POST" action="/admin/projects/${escapeHtml(view.slug)}/transfer"
+            class="cv-transfer-form" style="max-width:34rem;"
+            data-confirm="Transfer ${escapeHtml(view.slug)} to the member below? The repository and deployment move with it.">
+        ${csrf}
+        <div class="field">
+          <label for="cv-transfer-target">New owner (email or username)</label>
+          <input type="text" id="cv-transfer-target" name="target" value="${escapeHtml(form.target)}"
+                 autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                 maxlength="254" placeholder="member@example.com"${disabled ? ' disabled' : ''}>
+        </div>
+        <div class="field">
+          <label style="display:flex; align-items:center; gap:0.5rem;">
+            <input type="checkbox" name="keep_previous_owner" value="on"${form.keepPreviousOwner ? ' checked' : ''}${disabled ? ' disabled' : ''}>
+            Keep previous owner as admin (site + repo)
+          </label>
+        </div>
+        <div class="field">
+          <label for="cv-transfer-confirm">Type <code>${escapeHtml(view.slug)}</code> to confirm</label>
+          <input type="text" id="cv-transfer-confirm" name="confirm_slug" class="cv-transfer-confirm"
+                 autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                 placeholder="${escapeHtml(view.slug)}"${disabled ? ' disabled' : ''}>
+        </div>
+        <button type="submit" class="btn btn-danger cv-transfer-btn"${disabled ? ' disabled' : ''}>Transfer ownership</button>
+      </form>
+      <script nonce="${cspNonce()}">
+        (function(){
+          var form = document.currentScript.closest('.app-card').querySelector('.cv-transfer-form');
+          if (!form) return;
+          var input = form.querySelector('.cv-transfer-confirm');
+          var btn = form.querySelector('.cv-transfer-btn');
+          var slug = ${JSON.stringify(view.slug)};
+          var locked = ${JSON.stringify(disabled)};
+          if (!input || !btn || locked) return;
+          function sync(){ btn.disabled = input.value.trim() !== slug; }
+          input.addEventListener('input', sync);
+          sync();
+        })();
+      </script>
+    </div>`;
+
+  if (view.audit.length) {
+    body += `
+    <h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">Recent admin changes</h2>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>When</th><th>Who</th><th>Change</th></tr></thead>
+      <tbody>${view.audit.map((a) => `
+        <tr>
+          <td>${escapeHtml(whenLabel(a.createdAt))}</td>
+          <td>${escapeHtml(a.actor)}</td>
+          <td style="font-size:0.8rem;">${escapeHtml(a.summary)}</td>
+        </tr>`).join('')}</tbody>
+    </table></div>`;
+  }
+
+  return dashboardLayout(`Project — ${view.slug}`, body, email, true, 'admin-projects');
 }
 
 export interface CooldepsResultView { ok: boolean; message: string; }

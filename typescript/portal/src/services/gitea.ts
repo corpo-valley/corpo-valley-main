@@ -319,6 +319,54 @@ export async function generateFromTemplate(opts: {
   }
 }
 
+// ── Ownership transfer (admin) ───────────────────────────────────────────
+//
+// Gitea semantics (services/repository/transfer.go, StartRepositoryTransfer):
+// when the DOER is a site admin the transfer is applied directly — no
+// acceptance step. The portal always calls as the site-admin account, so the
+// repo is under the new owner by the time the POST returns. For a non-admin
+// doer Gitea instead parks the repo in `pending transfer` (status 201 with a
+// `repo_transfer` object; 202 on a completed transfer) and only the RECIPIENT
+// can accept — the admin token cannot. Rather than trusting the status code we
+// verify the outcome with a GET under the new owner and treat anything else as
+// failure, so a mis-scoped token can never leave the portal thinking the repo
+// moved when it didn't.
+export interface RepoTransferResult {
+  fullName: string;   // `<newOwner>/<repo>` as Gitea reports it
+}
+
+export async function transferRepo(opts: {
+  owner: string; repo: string; newOwner: string;
+}): Promise<RepoTransferResult> {
+  if (!giteaEnabled()) {
+    throw new GiteaApiError(0, { message: 'Gitea integration disabled' });
+  }
+  if (isReservedUsername(opts.newOwner) || !isValidUsername(opts.newOwner)) {
+    throw new GiteaApiError(0, { message: `refusing to transfer to reserved or invalid user "${opts.newOwner}"` });
+  }
+  await call(
+    `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/transfer`,
+    { method: 'POST', body: JSON.stringify({ new_owner: opts.newOwner }) }
+  );
+  // Verify: the repo must now resolve under the new owner AND carry no pending
+  // transfer marker. (Gitea leaves a redirect from the old path, so a GET of
+  // the OLD path would also "succeed" — never use that as the check.)
+  let after: { full_name?: string; owner?: { login?: string }; repo_transfer?: unknown } | null = null;
+  try {
+    after = await call(`/repos/${encodeURIComponent(opts.newOwner)}/${encodeURIComponent(opts.repo)}`);
+  } catch (err) {
+    if (!(err instanceof GiteaApiError && err.status === 404)) throw err;
+  }
+  const login = after?.owner?.login ?? '';
+  if (!after || login.toLowerCase() !== opts.newOwner.toLowerCase() || after.repo_transfer) {
+    throw new GiteaApiError(409, {
+      message: `transfer of ${opts.owner}/${opts.repo} to ${opts.newOwner} did not complete`
+        + (after?.repo_transfer ? ' (pending acceptance by the recipient)' : ' (repo not found under the new owner)'),
+    });
+  }
+  return { fullName: after.full_name || `${opts.newOwner}/${opts.repo}` };
+}
+
 // ── Template-repo provisioning (template-seed.ts) ────────────────────────
 
 // Fetch a repo's metadata, or null if it doesn't exist.
@@ -522,31 +570,60 @@ export async function deleteRepo(opts: { owner: string; repo: string }): Promise
 
 export type GiteaRepoPermission = 'read' | 'write' | 'admin';
 
-// Current collaborators with their effective permission level. Gitea reports
-// permissions as a {admin, push, pull} object; collapse to our three levels.
+// Collapse Gitea's {admin, push, pull} permission object to our three levels.
+// Returns null when the object is absent: Gitea 1.22 omits `permissions` from
+// the collaborator LIST entirely (verified on 1.22.6), and treating "absent" as
+// `read` made syncRepoAccess believe every collaborator was read-only — so a
+// downgrade to read was never applied and every write/admin collaborator was
+// re-PUT on each reconcile.
+export function collapseCollaboratorPermission(
+  permissions: { admin?: boolean; push?: boolean; pull?: boolean } | undefined | null,
+): GiteaRepoPermission | null {
+  if (!permissions) return null;
+  return permissions.admin ? 'admin' : permissions.push ? 'write' : 'read';
+}
+
+// Gitea's per-collaborator permission endpoint reports a role name; map it to
+// our levels (an `owner` is at least admin; `none` has no access).
+export function roleNameToPermission(role: string | undefined): GiteaRepoPermission | null {
+  switch (role) {
+    case 'owner':
+    case 'admin': return 'admin';
+    case 'write': return 'write';
+    case 'read': return 'read';
+    default: return null;
+  }
+}
+
+// Current collaborators with their effective permission level. Gitea ≥1.23
+// reports permissions inline as a {admin, push, pull} object; on 1.22 the list
+// omits it and we fall back to GET /collaborators/{user}/permission per row.
 export async function listCollaborators(opts: {
   owner: string; repo: string;
 }): Promise<Array<{ username: string; permission: GiteaRepoPermission }>> {
   if (!giteaEnabled()) return [];
   const out: Array<{ username: string; permission: GiteaRepoPermission }> = [];
+  const base = `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}`;
   // Default-write fan-out can produce hundreds of collaborators; page through
   // (50/page, hard cap 40 pages = 2000) rather than truncating silently.
   for (let page = 1; page <= 40; page++) {
     let res: Array<{ login: string; permissions?: { admin?: boolean; push?: boolean; pull?: boolean } }>;
     try {
-      res = await call(
-        `/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(opts.repo)}/collaborators?limit=50&page=${page}`
-      );
+      res = await call(`${base}/collaborators?limit=50&page=${page}`);
     } catch (err) {
       if (err instanceof GiteaApiError && err.status === 404) return out;
       throw err;
     }
     if (!Array.isArray(res) || res.length === 0) break;
     for (const c of res) {
-      out.push({
-        username: c.login,
-        permission: c.permissions?.admin ? 'admin' : c.permissions?.push ? 'write' : 'read',
-      });
+      let permission = collapseCollaboratorPermission(c.permissions);
+      if (!permission) {
+        const detail = await call<{ permission?: string; role_name?: string }>(
+          `${base}/collaborators/${encodeURIComponent(c.login)}/permission`
+        ).catch(() => null);
+        permission = roleNameToPermission(detail?.role_name ?? detail?.permission) ?? 'read';
+      }
+      out.push({ username: c.login, permission });
     }
     if (res.length < 50) break;
   }

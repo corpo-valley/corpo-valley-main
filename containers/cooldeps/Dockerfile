@@ -2,7 +2,7 @@
 
 # Pinned to a current Go minor so the produced binary ships patched std-library
 # crypto/net packages (govulncheck-clean). Floats to the latest 1.26 patch.
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 
 # Cache deps first.

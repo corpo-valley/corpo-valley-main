@@ -254,7 +254,7 @@ sprawling, vulnerable tree of its own. So:
   ~20-module C-transpiler dependency tree the pure-Go SQLite drivers pull in.
 - **`govulncheck` clean.** `govulncheck ./...` reports **no vulnerabilities** in
   our code or imported packages, built with a current Go toolchain (the Dockerfile
-  pins `golang:1.26-bookworm` so the produced binary carries patched std-library
+  pins `golang:1.27-bookworm` so the produced binary carries patched std-library
   crypto/net packages). Re-run it in CI before merging dependency bumps.
 - **No CGO.** `CGO_ENABLED=0` → a static binary on distroless/static, trivially
   reproducible and cross-compiled to arm64.

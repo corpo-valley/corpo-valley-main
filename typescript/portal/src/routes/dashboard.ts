@@ -12,18 +12,21 @@ import {
   claimOrGetPostgresPassword, decodePostgresPassword,
   clearGarageCredentials, claimOrGetGarageCredentials, decodeGarageCredentials,
   setPinTokenHash, setProjectStatus,
-  GrantLevel,
+  GrantLevel, EffectivePerm, Project,
 } from '../services/projects';
 import {
   listProjectGrants, upsertProjectGrant, getGrantById, findGrantBySubject,
   setGrantFacet, revokeGrantFacet, getEveryoneGrants,
   getGroupByName, listGroups, listProjectsSharedWith,
-  listProjectsWithEveryoneSiteGrant,
+  listProjectsWithEveryoneSiteGrant, listPublicProjectsByOwner,
+  projectTierFor, effectiveRepoPerm,
   EVERYONE_SUBJECT_ID, EVERYONE_SUBJECT_NAME,
   SubjectType, GrantFacet,
 } from '../services/access';
+import { tierAtLeast, tierRequiredMessage } from '../services/project-tier';
 import { syncRepoAccess, giteaUsernameForIdentity } from '../services/repo-access';
 import { findIdentityByEmail, findIdentityByUsername, listAllHumanIdentities } from '../services/kratos-admin';
+import type { Identity } from '@ory/client';
 import { ensureProvisionedLazy } from '../services/provisioning';
 import { generatePinToken, hashPinToken } from '../services/pin-token';
 import {
@@ -64,6 +67,7 @@ import {
   renderAchievements, renderPublicProfile, BadgeChip,
   ProjectRow, ApiKeyRow, CommunityRow, COMMUNITY_SORTS, CommunitySort,
   COMMUNITY_DIRS, CommunityDir, COMMUNITY_DEFAULT_DIR,
+  renderCommunityUsers, CommunityUserRow, COMMUNITY_USER_SORTS, CommunityUserSort,
 } from '../templates';
 import {
   computeBadges, maybeReconcile, takePendingToasts, earnedBadgeKeys, BADGE_META,
@@ -128,6 +132,46 @@ function toProjectRow(p: {
 // ── Projects ───────────────────────────────────────────────
 
 // GET / — list MY projects
+// Load a project for the signed-in viewer together with their dashboard tier
+// (services/project-tier.ts). Owner and platform admins are `admin`; anyone
+// else gets what the owner granted (direct, group or `everyone`). Responds and
+// returns null when the viewer may not proceed:
+//   404 — no such project OR no access at all (identical, so this can't be
+//         used to probe which project ids exist);
+//   403 — the viewer can see the project but `min` needs a higher tier.
+// `facet: 'repo'` requires the REPO perm specifically (for things that only
+// make sense with Gitea access, like minting a clone token).
+type ViewerProject = { project: Project; tier: EffectivePerm; isAdmin: boolean };
+async function loadProjectForViewer(
+  req: Request, res: Response, min: GrantLevel,
+  opts: { json?: boolean; facet?: 'repo'; needAdminFlag?: boolean } = {},
+): Promise<ViewerProject | null> {
+  const session = req.portalSession!;
+  const project = await getProjectById(req.params.id);
+  // Owners don't need the Keto round-trip for the tier (they're admin anyway);
+  // the platform-admin flag is only consulted for the nav on the detail page.
+  const isOwner = !!project && project.owner_id === session.id;
+  const isAdmin = project && (!isOwner || opts.needAdminFlag) ? await isUserAdmin(session.id).catch(() => false) : false;
+  const tier: EffectivePerm = project ? await projectTierFor(project, session.id, isAdmin) : 'none';
+  if (!project || tier === 'none') {
+    if (opts.json) res.status(404).json({ error: 'not_found' });
+    else res.status(404).send(renderError('Not Found', 'Project not found.'));
+    return null;
+  }
+  let effective: EffectivePerm = tier;
+  if (opts.facet === 'repo' && project.owner_id !== session.id) {
+    effective = await effectiveRepoPerm(project, session.id);
+  }
+  if (!tierAtLeast(effective, min)) {
+    if (opts.json) res.status(403).json({ error: 'forbidden' });
+    else res.status(403).send(renderError('Forbidden', opts.facet === 'repo'
+      ? 'You need repo access on this project to do that.'
+      : tierRequiredMessage(min)));
+    return null;
+  }
+  return { project, tier, isAdmin };
+}
+
 router.get('/', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
 
@@ -239,11 +283,89 @@ router.get('/achievements/u/:username', profileLimiter, requireSession, async (r
     if (!identity) {
       return res.status(404).send(renderError('Not found', 'No resident found with that username.'));
     }
-    const badges = await computeBadges(identity.id);
-    res.send(renderPublicProfile(session.email, isAdmin, identity.displayName, badges));
+    const [badges, publicProjects] = await Promise.all([
+      computeBadges(identity.id),
+      listPublicProjectsByOwner(identity.id).catch(() => []),
+    ]);
+    res.send(renderPublicProfile(session.email, isAdmin, identity.displayName, badges,
+      publicProjects.map((p) => ({ name: p.name, slug: p.slug }))));
   } catch (err: any) {
     console.error('Public profile error:', err.message);
     res.status(500).send(renderError('Error', 'Failed to load profile.'));
+  }
+});
+
+// Short-TTL cache of the human identity directory. /community and
+// /community/users both need owner/resident lookups; one Kratos scan per minute
+// is plenty, and it keeps a member who reloads the Users tab from driving a
+// full identity walk each time.
+let identityDirCache: { val: Identity[]; exp: number } | null = null;
+const IDENTITY_DIR_TTL_MS = 60_000;
+async function cachedHumanIdentities(): Promise<Identity[]> {
+  if (identityDirCache && identityDirCache.exp > Date.now()) return identityDirCache.val;
+  const val = await listAllHumanIdentities();
+  // Don't pin an empty directory for a minute if Kratos returned nothing.
+  if (val.length) identityDirCache = { val, exp: Date.now() + IDENTITY_DIR_TTL_MS };
+  return val;
+}
+
+// Earned badge keys → chips, shaped from the trusted catalog only.
+function badgeChipsFor(keys: string[]): BadgeChip[] {
+  return keys.filter((k) => BADGE_META[k]).map((k) => ({ key: k, name: BADGE_META[k].name, emoji: BADGE_META[k].emoji }));
+}
+
+// GET /community/users — the Users tab: every resident with their earned
+// badges and the projects they've shared with everyone. Badges belong to
+// users, so they show here and on profiles rather than on project rows. Three
+// batch lookups, independent of resident count: the (cached) identity
+// directory, one grant-cache query, and the everyone-shared projects query.
+// Rate-limited like profiles — it's authenticated but touches Kratos.
+router.get('/community/users', profileLimiter, requireSession, async (req: Request, res: Response) => {
+  const session = req.portalSession!;
+  try {
+    const isAdmin = await isUserAdmin(session.id);
+    const sortParam = String(req.query.sort || '');
+    const sort: CommunityUserSort = (COMMUNITY_USER_SORTS as readonly string[]).includes(sortParam)
+      ? (sortParam as CommunityUserSort) : 'badges';
+
+    const [identities, projects] = await Promise.all([
+      cachedHumanIdentities(),
+      listProjectsWithEveryoneSiteGrant().catch(() => []),
+    ]);
+    const badgesByUser = await earnedBadgeKeys(identities.map((i) => i.id));
+    const projectsByOwner = new Map<string, Array<{ name: string; slug: string }>>();
+    for (const p of projects) {
+      const list = projectsByOwner.get(p.owner_id) ?? [];
+      list.push({ name: p.name, slug: p.slug });
+      projectsByOwner.set(p.owner_id, list);
+    }
+    const rows: CommunityUserRow[] = identities.map((i) => {
+      const t = (i.traits as any) ?? {};
+      const nm = t.name;
+      const fullName = typeof nm === 'string' ? nm : [nm?.first, nm?.last].filter(Boolean).join(' ');
+      const username = typeof t.preferred_username === 'string' && t.preferred_username ? t.preferred_username : undefined;
+      // Never fall back to the full email: this tab is visible to every member
+      // and must not double as an address book. The local part is enough.
+      const emailLocal = typeof t.email === 'string' && t.email.includes('@') ? t.email.split('@')[0] : '';
+      return {
+        displayName: fullName || username || emailLocal || 'resident',
+        username,
+        badges: badgeChipsFor(badgesByUser.get(i.id) ?? []),
+        projects: projectsByOwner.get(i.id) ?? [],
+      };
+    });
+    const byName = (a: CommunityUserRow, b: CommunityUserRow) =>
+      a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' });
+    rows.sort((a, b) => {
+      if (sort === 'projects') return (b.projects.length - a.projects.length) || (b.badges.length - a.badges.length) || byName(a, b);
+      if (sort === 'name') return byName(a, b);
+      return (b.badges.length - a.badges.length) || (b.projects.length - a.projects.length) || byName(a, b);
+    });
+
+    res.send(renderCommunityUsers(session.email, rows, isAdmin, sort));
+  } catch (err: any) {
+    console.error('Community users error:', err.message);
+    res.status(500).send(renderError('Error', 'Failed to load the community users.'));
   }
 });
 
@@ -270,7 +392,7 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
 
     const projects = await listProjectsWithEveryoneSiteGrant();
     const [identities, repoUpdated] = await Promise.all([
-      listAllHumanIdentities().catch(() => []),
+      cachedHumanIdentities().catch(() => []),
       getRepoLastCommitMap(projects.map((p) => p.gitea_repo).filter(Boolean) as string[])
         .catch(() => new Map<string, string>()),
     ]);
@@ -283,12 +405,6 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
     }
     // Per-project engagement metrics (popularity/activity) — one grouped query.
     const metricsById = await projectMetrics(projects.map((p) => p.id));
-    // Earned badges for every creator shown — one cached lookup, no recompute.
-    const badgesByOwner = await earnedBadgeKeys(projects.map((p) => p.owner_id));
-    const chipsFor = (ownerId: string): BadgeChip[] =>
-      (badgesByOwner.get(ownerId) ?? [])
-        .filter((k) => BADGE_META[k])
-        .map((k) => ({ key: k, name: BADGE_META[k].name, emoji: BADGE_META[k].emoji }));
 
     // Enrich each project. "Last active" is the most recent of the last build
     // shipped (reliable, from our ledger) and the repo's latest default-branch
@@ -366,7 +482,6 @@ router.get('/community', requireSession, async (req: Request, res: Response) => 
       createdRel: rel(e.createdIso),
       updatedRel: rel(e.updatedIso),
       creatorUsername: usernameById.get(e.ownerId),
-      creatorBadges: chipsFor(e.ownerId),
       visitors: e.visitors,
       builds: e.builds,
       contributors: e.contributors,
@@ -501,16 +616,17 @@ router.post('/projects', requireSession, requireVerifiedEmail, async (req: Reque
   }
 });
 
-// GET /projects/:id — view a project (owner only)
+// GET /projects/:id — view a project. Any viewer with access (owner, platform
+// admin, or a grantee) can open it; the cards shown match their tier.
 router.get('/projects/:id', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
-    const isAdmin = await isUserAdmin(session.id);
+    const vp = await loadProjectForViewer(req, res, 'read', { needAdminFlag: true });
+    if (!vp) return;
+    const { project, tier, isAdmin } = vp;
+    const isOwner = project.owner_id === session.id;
+    // Whether the Get-started card may offer a clone token: needs REPO access.
+    const canRepo = isOwner || tierAtLeast(await effectiveRepoPerm(project, session.id), 'read');
     // Still provisioning (or failed)? Show the initializing screen and bail —
     // the repo/postgres/garage/grants lookups below would fail because those
     // resources don't exist yet. The screen polls /projects/:id/status and
@@ -541,6 +657,7 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
       csrf, secrets, null,
       grants, groups.map((g) => ({ name: g.name, memberCount: g.member_count })),
       metrics,
+      { tier, isOwner, platformAdmin: isAdmin && !isOwner, canRepo },
     ));
   } catch (err: any) {
     console.error('Project detail error:', err.message);
@@ -549,15 +666,13 @@ router.get('/projects/:id', requireSession, async (req: Request, res: Response) 
 });
 
 // GET /projects/:id/status — JSON `{ status }` for the initializing screen's
-// poll (owner only; same 404 behaviour as GET /projects/:id).
+// poll (same access + 404 behaviour as GET /projects/:id).
 router.get('/projects/:id/status', requireSession, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).json({ error: 'not_found' });
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'read', { json: true });
+    if (!vp) return;
+    const { project } = vp;
     res.json({ status: project.status });
   } catch (err: any) {
     console.error('Project status error:', err.message);
@@ -583,11 +698,9 @@ async function listProjectSecretNames(project: { gitea_repo: string | null; }): 
 router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'read', { facet: 'repo' });
+    if (!vp) return;
+    const { project } = vp;
     const username = session.preferredUsername;
     if (!username) {
       res.status(400).send(renderError(
@@ -601,8 +714,10 @@ router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, asy
     // points at the old account, and minting a PAT for the new username would
     // be a user-wide token that doesn't even grant access to this repo. Refuse
     // rather than hand out a confusing/over-broad credential.
+    // (Collaborators mint a token on their OWN account — Gitea scopes it to the
+    // repos they can reach — so the owner-mismatch check only applies to owners.)
     const repoOwner = project.gitea_repo ? project.gitea_repo.split('/')[0] : null;
-    if (repoOwner && repoOwner !== username) {
+    if (project.owner_id === session.id && repoOwner && repoOwner !== username) {
       res.status(409).send(renderError(
         'Account mismatch',
         'This project repo is owned by a different Gitea account than your current username. Ask an admin to reconcile your account before minting a token.'
@@ -632,27 +747,27 @@ router.post('/projects/:id/cli-token', requireSession, requireVerifiedEmail, asy
 });
 
 // POST /projects/:id/secrets — seal KEY=VALUE pairs and commit
-// k8s/secrets/<name>.sealed.yaml to the user's repo (owner only).
+// k8s/secrets/<name>.sealed.yaml to the project repo (write tier).
 router.post('/projects/:id/secrets', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   const fail = async (msg: string, status = 400) => {
     const isAdmin = await isUserAdmin(session.id).catch(() => false);
     const project = await getProjectById(req.params.id);
     if (!project) { res.status(404).send(renderError('Not Found', 'Project not found.')); return; }
+    const tier = await projectTierFor(project, session.id, isAdmin);
     const csrf = csrfHiddenField(req, res);
     const secrets = await listProjectSecretNames(project);
     res.status(status).send(renderProjectDetail(
       session.email, isAdmin, toProjectRow(project), csrf, secrets,
-      { type: 'error', text: msg }
+      { type: 'error', text: msg }, [], [], null,
+      { tier, isOwner: project.owner_id === session.id, platformAdmin: isAdmin && project.owner_id !== session.id },
     ));
   };
 
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'write');
+    if (!vp) return;
+    const { project } = vp;
     if (!project.gitea_repo) return fail('Project has no Gitea repo yet.');
 
     const rawName = String(req.body?.secret_name || '').trim();
@@ -709,15 +824,13 @@ router.post('/projects/:id/secrets', requireSession, requireVerifiedEmail, async
 });
 
 // POST /projects/:id/secrets/:name/delete — remove the sealed secret file
-// from the user's repo (owner only).
+// from the project repo (write tier).
 router.post('/projects/:id/secrets/:name/delete', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'write');
+    if (!vp) return;
+    const { project } = vp;
     if (!project.gitea_repo) {
       res.status(400).send(renderError('Bad Request', 'Project has no Gitea repo.'));
       return;
@@ -755,11 +868,9 @@ router.post('/projects/:id/secrets/:name/delete', requireSession, requireVerifie
 router.post('/projects/:id/postgres/enable', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'write');
+    if (!vp) return;
+    const { project } = vp;
     if (!project.gitea_repo) {
       res.status(400).send(renderError('Bad Request', 'Project has no Gitea repo.'));
       return;
@@ -789,9 +900,11 @@ router.post('/projects/:id/postgres/disable', requireSession, requireVerifiedEma
   const session = req.portalSession!;
   const destroyData = req.body?.destroy_data === 'true' || req.body?.destroy_data === 'on';
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
+    const vp = await loadProjectForViewer(req, res, 'write');
+    if (!vp) return;
+    const { project } = vp;
+    if (destroyData && !tierAtLeast(vp.tier, 'admin')) {
+      res.status(403).send(renderError('Forbidden', 'Only the project owner and project admins can delete the data volume.'));
       return;
     }
     if (!project.gitea_repo) {
@@ -827,11 +940,9 @@ router.post('/projects/:id/postgres/disable', requireSession, requireVerifiedEma
 router.post('/projects/:id/storage/enable', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'write');
+    if (!vp) return;
+    const { project } = vp;
     if (!project.gitea_repo) {
       res.status(400).send(renderError('Bad Request', 'Project has no Gitea repo.'));
       return;
@@ -861,9 +972,11 @@ router.post('/projects/:id/storage/disable', requireSession, requireVerifiedEmai
   const session = req.portalSession!;
   const destroyData = req.body?.destroy_data === 'true' || req.body?.destroy_data === 'on';
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
+    const vp = await loadProjectForViewer(req, res, 'write');
+    if (!vp) return;
+    const { project } = vp;
+    if (destroyData && !tierAtLeast(vp.tier, 'admin')) {
+      res.status(403).send(renderError('Forbidden', 'Only the project owner and project admins can delete the data volume.'));
       return;
     }
     if (!project.gitea_repo) {
@@ -932,7 +1045,7 @@ async function resolveGrantSubject(
 }
 
 // POST /projects/:id/access — set a subject's (user, group, or everyone) access
-// on ONE OR BOTH areas (owner only). Form:
+// on ONE OR BOTH areas (admin tier). Form:
 //   - `subject_type` ('user'|'group'|'everyone') + `identifier`
 //     (email/username or group name; unused for everyone).
 //   - SINGLE-FACET (inline edit) contract: `facet` ('site'|'repo') + `level`
@@ -946,11 +1059,9 @@ async function resolveGrantSubject(
 router.post('/projects/:id/access', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'admin');
+    if (!vp) return;
+    const { project } = vp;
 
     // Build the list of facet operations. `null` level => revoke that facet.
     type FacetOp = { facet: GrantFacet; level: GrantLevel | null };
@@ -1040,18 +1151,16 @@ router.post('/projects/:id/access', requireSession, requireVerifiedEmail, async 
 });
 
 // POST /projects/:id/access/:grantId/revoke — remove a subject's level on ONE
-// area, or the WHOLE subject (owner only). Form: `facet` ('site'|'repo') for a
+// area, or the WHOLE subject (admin tier). Form: `facet` ('site'|'repo') for a
 // single area, or `all`='true' to remove both areas (the × in the people list).
 // When the subject is left with no grant on either area the grant row is
 // deleted entirely.
 router.post('/projects/:id/access/:grantId/revoke', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'admin');
+    if (!vp) return;
+    const { project } = vp;
     const grant = await getGrantById(req.params.grantId);
     if (grant && grant.project_id === project.id) {
       const hadRepo = !!grant.repo_perm;
@@ -1076,7 +1185,7 @@ router.post('/projects/:id/access/:grantId/revoke', requireSession, requireVerif
   }
 });
 
-// POST /projects/:id/delete — delete a project (owner only).
+// POST /projects/:id/delete — delete a project (admin tier).
 //
 // Cascade: tears down the Gitea repo + ArgoCD Application + project
 // namespace (which cascades pods/PVCs/secrets/etc.) before dropping the
@@ -1087,11 +1196,9 @@ router.post('/projects/:id/access/:grantId/revoke', requireSession, requireVerif
 router.post('/projects/:id/delete', requireSession, requireVerifiedEmail, async (req: Request, res: Response) => {
   const session = req.portalSession!;
   try {
-    const project = await getProjectById(req.params.id);
-    if (!project || project.owner_id !== session.id) {
-      res.status(404).send(renderError('Not Found', 'Project not found.'));
-      return;
-    }
+    const vp = await loadProjectForViewer(req, res, 'admin');
+    if (!vp) return;
+    const { project } = vp;
     const purge = await purgeProjectResources(project);
     if (purge.errors.length > 0) {
       console.warn(`[dashboard] partial cascade-delete for ${project.slug}:`, purge.errors.join('; '));
