@@ -8,6 +8,7 @@ import { recordActivity } from '../services/achievements';
 import { requireInternalSecret } from '../middleware/internalAuth';
 import { ensureProvisionedById } from '../services/provisioning';
 
+
 const router = Router();
 
 // In-cluster-only guard for /internal/* routes that aren't Kratos webhooks
@@ -278,10 +279,14 @@ router.post('/internal/projects/:slug/pin', requireInClusterCaller, async (req: 
       return;
     }
 
-    // Line-anchored rewrite of every `image: registry.cv-registry.../<owner>/<slug>:<tag>`
-    // line to the project's CURRENT `<owner>/<repo>` path plus the new tag (see
-    // services/pin-image.ts for why the path is rewritten too: the build pushes
-    // under the repo's current Gitea owner, which an admin transfer can change).
+    // Line-anchored rewrite of every project image line to the project's CURRENT
+    // `<owner>/<repo>` path plus the new tag. The line grammar is the same one the
+    // manifest generator reads the pinned tag back with (projectImageLineRe in
+    // services/manifests.ts) so what this pins is exactly what a later capability
+    // toggle preserves; the path is rewritten too because the build pushes under
+    // the repo's current Gitea owner, which an admin transfer can change (see
+    // services/pin-image.ts). `g`: a multi-capability project runs several
+    // containers from the same image. `postgres:16-alpine` doesn't match.
     const updated = rewritePinnedImageLines(file.content, { owner, repo, tag });
 
     if (updated === file.content) {

@@ -29,6 +29,9 @@ export function rewritePinnedImageLines(
   const host = registry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Path class excludes `@` so digest-pinned lines (`…/foo@sha256:…`) are left
   // alone, matching projectImageLineRe() in services/manifests.ts.
-  const re = new RegExp(`^(\\s*image:\\s+${host})\\/[^\\s:@]+:[A-Za-z0-9_.-]+$`, 'mg');
+  // Same grammar as projectImageLineRe() in services/manifests.ts (which the
+  // generator uses to read the pinned tag back), with the host split out so the
+  // path can be replaced: Docker tag class, 1-128 chars, trailing blanks allowed.
+  const re = new RegExp(`^([ \\t]*image:[ \\t]+${host})/[^\\s:@]+:[A-Za-z0-9_.-]{1,128}[ \\t]*$`, 'mg');
   return content.replace(re, (_m, prefix: string) => `${prefix}/${path}:${target.tag}`);
 }
