@@ -8,7 +8,10 @@
 # Two-stage: install production deps in a builder, copy the slim node_modules
 # into the runtime image so the npm cache never ships.
 {{CV_COOLDEPS_DOCKER_ENV}}
-FROM node:24-alpine AS deps
+# Pinned to a Node release with the Brotli decoder fix for CVE-2026-111497
+# (Node2Shell): 24.22.1 or newer. Bump deliberately; never float back to a
+# bare major tag.
+FROM node:24.22.1-alpine AS deps
 WORKDIR /app
 # .npmrc is copied with the manifests so `npm install` honors the platform's
 # cooldeps gating proxy when this deployment runs it (the file is empty
@@ -16,7 +19,7 @@ WORKDIR /app
 COPY package*.json .npmrc ./
 RUN npm install --omit=dev
 
-FROM node:24-alpine
+FROM node:24.22.1-alpine
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .

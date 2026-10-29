@@ -18,6 +18,9 @@
 #   X-CV-User-Id, X-CV-User-Email, X-CV-Perm (read|write|admin)
 # nginx overwrites any client-supplied copies of those headers, so your code
 # may trust them as-is — see ACCESS.md for the standard.
+#
+# The configuration-snippet refuses Brotli-encoded request bodies (415) before
+# nginx proxies them to your containers (CVE-2026-111497 defence in depth).
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -30,6 +33,12 @@ metadata:
     nginx.ingress.kubernetes.io/auth-response-headers: "X-CV-User-Id, X-CV-User-Email, X-CV-Perm"
     nginx.ingress.kubernetes.io/auth-signin: "{{CV_PORTAL_LOGIN_URL}}"
     nginx.ingress.kubernetes.io/auth-signin-redirect-param: "return_to"
+    # Defence in depth (CVE-2026-111497, Node2Shell): a request body declared as
+    # Brotli (`Content-Encoding: br`) is refused with 415 at the edge, so your
+    # Express body parser never Brotli-decodes member-supplied bytes. Only
+    # effective when ingress-nginx allows snippet annotations.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      if ($http_content_encoding ~* "br") { return 415; }
 spec:
   ingressClassName: nginx
   rules:
