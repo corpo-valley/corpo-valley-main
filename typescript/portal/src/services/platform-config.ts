@@ -52,6 +52,21 @@ export const PORTAL_INTERNAL_URL =
   (process.env.CV_PORTAL_INTERNAL_URL || 'http://portal.cv-portal.svc.cluster.local')
     .replace(/\/+$/, '');
 
+// Whether generated project Ingresses carry an ingress-nginx
+// configuration-snippet that rejects request bodies declared as
+// `Content-Encoding: br` (HTTP 415) before they reach a project container.
+// Defence in depth for CVE-2026-111497 (Node2Shell): Express 5 / body-parser 2
+// in the Community Center template transparently Brotli-decode request bodies,
+// so a signed-in member could hand a vulnerable Node runtime a crafted stream.
+// The chart sets this from `ingress.rejectBrotliRequestBodies`. Default ON.
+// NOTE: ingress-nginx only honours the snippet when its ConfigMap sets
+// `allow-snippet-annotations: "true"`; otherwise the controller drops the
+// annotation and serves the Ingress without it (no breakage, no protection).
+// Set to "false" on a cluster whose admission webhook REJECTS snippet
+// annotations outright, or project provisioning would fail.
+export const INGRESS_REJECT_BROTLI_BODIES =
+  (process.env.CV_INGRESS_REJECT_BROTLI_BODIES || 'true').toLowerCase() !== 'false';
+
 // In-cluster Kratos public endpoint — project Ingress auth-url and the
 // template's identity helper validate sessions against it. Falls back to the
 // cluster DNS literal (not session.ts's localhost dev default) because the

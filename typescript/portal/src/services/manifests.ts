@@ -15,7 +15,7 @@ import { getFile, upsertRepoFile } from './gitea';
 import type { Capabilities } from './templates';
 import {
   CV_REGISTRY, PORTAL_PUBLIC_URL, PORTAL_INTERNAL_URL, PROJECTS_DOMAIN,
-  isQuantity,
+  INGRESS_REJECT_BROTLI_BODIES, isQuantity,
 } from './platform-config';
 import { tenantDefaults } from './tenant-defaults';
 
@@ -353,6 +353,26 @@ function pathBlock(path: string, serviceName: string): string {
                   number: 80`;
 }
 
+// nginx location snippet stamped on every project Ingress (NOT the separate
+// /mcp Ingress — the mcp-gateway already strips content-encoding before it
+// proxies to the tenant). A request body declared as Brotli is refused with
+// 415 Unsupported Media Type before nginx proxies it, so the tenant's
+// Express 5 / body-parser 2 never runs Node's Brotli decoder on member-supplied
+// bytes (CVE-2026-111497, Node2Shell). `$http_content_encoding` is the raw
+// request header; the check is case-insensitive and also catches lists such as
+// `gzip, br`. Nothing in the template ever sends a Brotli body, so legitimate
+// traffic is unaffected. Emitted as a YAML block scalar, one directive per line.
+export const BROTLI_REJECT_SNIPPET = 'if ($http_content_encoding ~* "br") { return 415; }';
+
+function ingressHardeningAnnotations(): string {
+  if (!INGRESS_REJECT_BROTLI_BODIES) return '';
+  return `
+    # Defence in depth (CVE-2026-111497): refuse Brotli-encoded request bodies at
+    # the edge. Only effective when ingress-nginx allows snippet annotations.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      ${BROTLI_REJECT_SNIPPET}`;
+}
+
 export function buildIngressYaml(opts: ManifestOpts): string {
   // Most-specific paths first. The website's `/` is always last so it only
   // catches what the capability paths didn't. NOTE: `/mcp` is intentionally NOT
@@ -370,7 +390,9 @@ export function buildIngressYaml(opts: ManifestOpts): string {
 # without \`read\` on this project get 403 at the edge, and allowed requests
 # reach the containers carrying the trusted identity headers X-CV-User-Id /
 # X-CV-User-Email / X-CV-Perm (nginx overwrites any client-supplied copies —
-# your code may trust them; see ACCESS.md). Don't hand-edit.
+# your code may trust them; see ACCESS.md). The configuration-snippet refuses
+# Brotli-encoded request bodies (415) before they reach your containers. Don't
+# hand-edit.
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -382,7 +404,7 @@ metadata:
     nginx.ingress.kubernetes.io/auth-url: "${PORTAL_INTERNAL_URL}/access/site/${opts.slug}"
     nginx.ingress.kubernetes.io/auth-response-headers: "X-CV-User-Id, X-CV-User-Email, X-CV-Perm"
     nginx.ingress.kubernetes.io/auth-signin: "${PORTAL_PUBLIC_URL}/login"
-    nginx.ingress.kubernetes.io/auth-signin-redirect-param: "return_to"
+    nginx.ingress.kubernetes.io/auth-signin-redirect-param: "return_to"${ingressHardeningAnnotations()}
 spec:
   ingressClassName: nginx
   rules:
