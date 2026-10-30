@@ -62,6 +62,8 @@ interface K8sCallOpts {
   contentType?: string;
 }
 
+const K8S_REQUEST_TIMEOUT_MS = Number(process.env.K8S_REQUEST_TIMEOUT_MS) || 15_000;
+
 function call<T>(opts: K8sCallOpts): Promise<T> {
   return new Promise((resolve, reject) => {
     const payload = opts.body !== undefined ? Buffer.from(JSON.stringify(opts.body)) : undefined;
@@ -92,6 +94,9 @@ function call<T>(opts: K8sCallOpts): Promise<T> {
       }
     );
     req.on('error', reject);
+    // A hung API server must not hang the caller (and, for the admin health
+    // page, wedge its in-flight cache entry): fail the request after 15 s.
+    req.setTimeout(K8S_REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`k8s API request timed out after ${K8S_REQUEST_TIMEOUT_MS} ms`)));
     if (payload) req.write(payload);
     req.end();
   });
@@ -183,6 +188,19 @@ export async function k8sMergePatchNamespaced<T = any>(
   });
 }
 
+// Raw GET of an API-server path (must start with `/`), JSON-decoded. For
+// aggregated APIs that don't fit the group/version/plural helpers — the
+// Project health page reads `/apis/metrics.k8s.io/v1beta1/namespaces/<ns>/pods`
+// through this. Throws K8sApiError (403 when the SA lacks the metrics RBAC,
+// 404/503 when metrics-server is absent); callers degrade to "n/a".
+export async function k8sGetRaw<T = any>(path: string): Promise<T> {
+  if (!k8sEnabled()) {
+    throw new K8sApiError(0, { message: 'k8s integration disabled' });
+  }
+  if (!path.startsWith('/')) throw new Error('k8sGetRaw: path must be absolute');
+  return call<T>({ method: 'GET', path });
+}
+
 // Pod logs are served as text/plain, not JSON, so we make the request
 // ourselves rather than going through `call<T>` (which json-parses).
 export async function k8sPodLogs(opts: {
@@ -231,6 +249,7 @@ export async function k8sPodLogs(opts: {
       }
     );
     req.on('error', reject);
+    req.setTimeout(K8S_REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`k8s API request timed out after ${K8S_REQUEST_TIMEOUT_MS} ms`)));
     req.end();
   });
 }
@@ -278,6 +297,7 @@ export async function k8sServiceProxyGet(opts: {
       }
     );
     req.on('error', reject);
+    req.setTimeout(K8S_REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`k8s API request timed out after ${K8S_REQUEST_TIMEOUT_MS} ms`)));
     req.end();
   });
 }

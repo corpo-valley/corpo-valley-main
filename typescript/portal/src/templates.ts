@@ -7,6 +7,8 @@
 
 import { cspNonce } from './lib/csp-nonce';
 import type { Badge, ProjectMetrics } from './services/achievements';
+import type { HealthLevel, HealthIndexRow, HealthScore, ProjectHealthSnapshot } from './services/project-health';
+import { quotaFraction } from './services/project-health';
 import {
   GITEA_PUBLIC_URL, PROJECTS_DOMAIN, BASE_DOMAIN,
   PORTAL_PUBLIC_URL, MCP_ENDPOINT_URL, OAUTH_PUBLIC_URL,
@@ -812,6 +814,7 @@ function dashboardLayout(
       <a href="/admin/apps"${activeNav === 'apps' ? ' class="active"' : ''}>SSO Apps</a>
       <a href="/admin/template"${activeNav === 'template' ? ' class="active"' : ''}>Project Template</a>
       <a href="/admin/resources"${activeNav === 'resources' ? ' class="active"' : ''}>Resources</a>
+      <a href="/admin/health"${activeNav === 'admin-health' ? ' class="active"' : ''}>Health</a>
       ${COOLDEPS_ENABLED ? `<a href="/admin/cooldeps"${activeNav === 'cooldeps' ? ' class="active"' : ''}>cooldeps</a>` : ''}
     `;
   }
@@ -3265,6 +3268,269 @@ export function renderAdminProjectResourceDetail(
   }
 
   return dashboardLayout(`Resources — ${view.slug}`, body, email, true, 'resources');
+}
+
+// ── Admin: project health ──────────────────────────────────────────────────
+
+const HEALTH_COLOURS: Record<HealthLevel, string> = { red: '#d9734a', amber: '#e8b94a', green: '#84a25a' };
+
+function healthPill(level: HealthLevel, text: string): string {
+  const colour = HEALTH_COLOURS[level];
+  return `<span style="display:inline-block; padding:0.1rem 0.55rem; border-radius:999px; border:1px solid ${colour}; color:${colour}; font-size:0.78rem; white-space:nowrap;">${escapeHtml(text)}</span>`;
+}
+
+function pctCell(pct: number | null): string {
+  if (pct === null) return '<span style="color:#8a7a5a;">n/a</span>';
+  const colour = pct >= 100 ? '#d9734a' : pct >= 80 ? '#e8b94a' : '#f3ead9';
+  return `<span style="color:${colour};">${pct}%</span>`;
+}
+
+function fmtMillicores(m: number | null): string {
+  return m === null ? 'n/a' : `${m}m`;
+}
+
+function fmtBytes(b: number | null): string {
+  if (b === null) return 'n/a';
+  if (b >= 2 ** 30) return `${(b / 2 ** 30).toFixed(2)} Gi`;
+  if (b >= 2 ** 20) return `${(b / 2 ** 20).toFixed(0)} Mi`;
+  if (b >= 2 ** 10) return `${(b / 2 ** 10).toFixed(0)} Ki`;
+  return `${b} B`;
+}
+
+function argoCell(sync: string | null, health: string | null): string {
+  if (!sync && !health) return '<span style="color:#8a7a5a;">n/a</span>';
+  const hc = health === 'Healthy' ? '#84a25a' : health === 'Degraded' || health === 'Missing' ? '#d9734a' : '#e8b94a';
+  const sc = sync === 'Synced' ? '#84a25a' : '#e8b94a';
+  return `<span style="color:${sc};">${escapeHtml(sync || '?')}</span> / <span style="color:${hc};">${escapeHtml(health || '?')}</span>`;
+}
+
+// /admin/health — one row per project, worst first. `rows` must already be
+// sorted (sortHealthRows); `logsUrl` maps a slug to the operator's log store
+// deep link, or null when CV_LOGS_URL is unset.
+export function renderAdminHealthIndex(
+  rows: HealthIndexRow[],
+  email: string,
+  logsUrl: (slug: string) => string | null = () => null,
+): string {
+  const counts = { red: 0, amber: 0, green: 0 } as Record<HealthLevel, number>;
+  for (const r of rows) counts[r.level]++;
+
+  let body = `<p>Kubernetes health, resource usage and recent errors for every project
+    namespace, read live from the cluster and the projects ArgoCD. Snapshots are
+    <strong>cached for 30 s</strong>; open a project for pods, warning events, quota
+    bars and container logs.</p>
+    <p style="margin:0.5rem 0 1rem;">
+      ${healthPill('red', `${counts.red} red`)} ${healthPill('amber', `${counts.amber} amber`)} ${healthPill('green', `${counts.green} green`)}
+    </p>`;
+
+  if (!rows.length) {
+    body += '<p class="help">No projects yet.</p>';
+    return dashboardLayout('Health', body, email, true, 'admin-health');
+  }
+
+  const tr = rows.map((r) => {
+    const reason = r.reasons[0] || (r.warnings.length ? 'lookups incomplete' : 'ok');
+    // Every reason is available on hover; the cell shows the first and a count.
+    const more = r.reasons.length > 1
+      ? `<br><span style="color:#8a7a5a; font-size:0.75rem;" title="${escapeHtml(r.reasons.join('\n'))}">+${r.reasons.length - 1} more (hover)</span>` : '';
+    const warn = r.warnings.length
+      ? `<br><span style="color:#e8b94a; font-size:0.75rem;" title="${escapeHtml(r.warnings.join('\n'))}">⚠ ${r.warnings.length} lookup${r.warnings.length === 1 ? '' : 's'} failed</span>` : '';
+    const logs = logsUrl(r.slug);
+    return `
+        <tr>
+          <td><a href="/admin/health/${escapeHtml(r.slug)}">${escapeHtml(r.name)}</a><br>
+              <code style="font-size:0.75rem;">${escapeHtml(r.slug)}</code></td>
+          <td>${healthPill(r.level, r.level)}<br>
+              <span style="font-size:0.8rem;" title="${escapeHtml(r.reasons.join('\n'))}">${escapeHtml(reason)}</span>${more}${warn}</td>
+          <td>${r.podsTotal ? `${r.podsReady}/${r.podsTotal}` : '<span style="color:#8a7a5a;">—</span>'}</td>
+          <td>${r.restartsLastHour ? `<span style="color:#e8b94a;">${r.restartsLastHour}</span>` : '0'}</td>
+          <td style="font-size:0.8rem;">${r.worstEvent ? escapeHtml(r.worstEvent) : '<span style="color:#8a7a5a;">—</span>'}</td>
+          <td>${pctCell(r.cpuPct)}</td>
+          <td>${pctCell(r.memPct)}</td>
+          <td style="font-size:0.8rem;">${argoCell(r.argoSync, r.argoHealth)}</td>
+          <td style="font-size:0.8rem; white-space:nowrap;">
+            <a href="/admin/resources/${escapeHtml(r.slug)}">Resources</a>
+            ${logs ? ` · <a href="${escapeHtml(logs)}" target="_blank" rel="noopener">Logs in SigNoz ↗</a>` : ''}
+          </td>
+        </tr>`;
+  }).join('');
+
+  body += `
+    <div class="table-wrap"><table class="table">
+      <thead><tr>
+        <th>Project</th><th>Status</th><th>Pods</th><th>Containers restarted (1h)</th><th>Worst event (1h)</th>
+        <th>CPU</th><th>Memory</th><th>Argo (sync / health)</th><th>Links</th>
+      </tr></thead>
+      <tbody>${tr}</tbody>
+    </table></div>
+    <p class="help" style="margin-top:0.75rem;">CPU and memory are <em>requests</em> used
+      against the project's ResourceQuota. Red: CrashLoopBackOff / image pull failures,
+      OOMKilled or Failed pods, Argo Degraded/Missing. Amber: restarts, FailedScheduling /
+      BackOff / Unhealthy events, ≥ 80 % of quota, Argo OutOfSync/Progressing.</p>`;
+
+  return dashboardLayout('Health', body, email, true, 'admin-health');
+}
+
+export interface HealthLogView {
+  pod: string;
+  container: string;
+  text: string | null;      // null = fetch failed → `error` explains
+  error: string | null;
+}
+
+export interface HealthDetailView {
+  snapshot: ProjectHealthSnapshot;
+  score: HealthScore;
+  logs: HealthLogView | null;
+  logsUrl: string | null;
+}
+
+function quotaBar(label: string, used: string | null, hard: string | null, fraction: number | null): string {
+  const pct = fraction === null ? null : Math.round(fraction * 100);
+  const width = pct === null ? 0 : Math.min(100, pct);
+  const colour = pct === null ? '#5a4a36' : pct >= 100 ? '#d9734a' : pct >= 80 ? '#e8b94a' : '#84a25a';
+  return `
+    <div style="margin-bottom:0.6rem;">
+      <div style="display:flex; justify-content:space-between; font-size:0.85rem;">
+        <span>${escapeHtml(label)}</span>
+        <span style="color:#8a7a5a;">${escapeHtml(used ?? '—')} / ${escapeHtml(hard ?? '—')}${pct === null ? '' : ` · ${pct}%`}</span>
+      </div>
+      <div style="height:8px; background:#2b2118; border:1px solid #5a4a36; border-radius:4px; overflow:hidden;">
+        <div style="height:100%; width:${width}%; background:${colour};"></div>
+      </div>
+    </div>`;
+}
+
+// /admin/health/:slug — one project's snapshot, plus the log viewer when
+// `?pod=&container=` named a container the snapshot knows.
+export function renderAdminHealthDetail(view: HealthDetailView, email: string): string {
+  const s = view.snapshot;
+  const slug = escapeHtml(s.slug);
+  let body = `<p style="margin-bottom:1rem;"><a href="/admin/health" class="btn btn-secondary btn-sm">Back to Health</a>
+    <a href="/admin/resources/${slug}" class="btn btn-secondary btn-sm">Resources</a>
+    <a href="/admin/projects/${slug}" class="btn btn-secondary btn-sm">Project</a>
+    ${view.logsUrl ? `<a href="${escapeHtml(view.logsUrl)}" class="btn btn-secondary btn-sm" target="_blank" rel="noopener">Logs in SigNoz ↗</a>` : ''}
+  </p>`;
+
+  const totalRestarts1h = s.pods.reduce((n, p) => n + p.restartsLastHour, 0);
+  body += `<p style="margin-bottom:0.5rem;">
+    ${healthPill(view.score.level, view.score.level)}
+    ${healthPill(s.pods.length && s.pods.every((p) => p.phase === 'Running' && p.readyContainers === p.totalContainers) ? 'green' : s.pods.length ? 'amber' : 'green',
+      `${s.pods.filter((p) => p.phase === 'Running' && p.readyContainers === p.totalContainers).length}/${s.pods.length} pods ready`)}
+    ${healthPill(totalRestarts1h ? 'amber' : 'green', `${totalRestarts1h} container${totalRestarts1h === 1 ? '' : 's'} restarted (1h)`)}
+    ${healthPill(s.events.length ? 'amber' : 'green', `${s.events.length} warning events (1h)`)}
+    ${s.metrics ? healthPill('green', `${fmtMillicores(s.metrics.cpuMillicores)} CPU · ${fmtBytes(s.metrics.memoryBytes)} live`) : healthPill('amber', 'live usage n/a')}
+  </p>`;
+
+  if (view.score.reasons.length) {
+    body += `<ul style="margin:0.25rem 0 1rem 1.2rem; font-size:0.9rem;">${view.score.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>`;
+  }
+  if (s.warnings.length) {
+    body += `<p class="help" style="color:#e8b94a;">Some lookups failed — this snapshot is incomplete:
+      ${s.warnings.map((w) => `<br>⚠ ${escapeHtml(w)}`).join('')}</p>`;
+  }
+
+  // Pods
+  body += `<h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:1.5rem;">Pods</h2>`;
+  if (!s.pods.length) {
+    body += '<p class="help">No pods in this namespace.</p>';
+  } else {
+    const rows = s.pods.map((p) => {
+      const podColour = p.phase === 'Failed' ? '#d9734a' : p.phase === 'Running' ? '#84a25a' : '#e8b94a';
+      const head = `
+        <tr style="background:#2b2118;">
+          <td colspan="6"><strong>${escapeHtml(p.name)}</strong>
+            <span style="color:${podColour}; margin-left:0.5rem;">${escapeHtml(p.phase)}</span>
+            <span style="color:#8a7a5a; font-size:0.8rem; margin-left:0.5rem;">${p.readyContainers}/${p.totalContainers} ready
+              · ${p.restarts} restarts${p.restartsLastHour ? ` (<span style="color:#e8b94a;">${p.restartsLastHour} container${p.restartsLastHour === 1 ? '' : 's'} restarted in the last hour</span>)` : ''}
+              · ${escapeHtml(fmtMillicores(p.cpuMillicores))} · ${escapeHtml(fmtBytes(p.memoryBytes))}
+              ${p.startedAt ? ` · started ${escapeHtml(whenLabel(p.startedAt))}` : ''}</span></td>
+        </tr>`;
+      const cs = p.containers.map((c) => {
+        const stateText = c.state === 'waiting' && c.waitingReason ? `waiting: ${c.waitingReason}` : c.state;
+        const stateColour = c.state === 'running' && c.ready ? '#84a25a'
+          : c.waitingReason && ['CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull'].includes(c.waitingReason) ? '#d9734a'
+          : '#e8b94a';
+        const last = c.lastTerminatedReason
+          ? `${escapeHtml(c.lastTerminatedReason)}${c.lastTerminatedAt ? `<br><span style="color:#8a7a5a; font-size:0.75rem;">${escapeHtml(whenLabel(c.lastTerminatedAt))}</span>` : ''}`
+          : '<span style="color:#8a7a5a;">—</span>';
+        const q = `?pod=${encodeURIComponent(p.name)}&container=${encodeURIComponent(c.name)}`;
+        return `
+        <tr>
+          <td style="padding-left:1.5rem;">${c.init ? '<span style="color:#8a7a5a; font-size:0.75rem;">init </span>' : ''}${escapeHtml(c.name)}</td>
+          <td><code style="font-size:0.75rem;" title="${escapeHtml(c.image)}">${escapeHtml(c.imageTag)}</code></td>
+          <td style="color:${stateColour};">${escapeHtml(stateText)}${c.ready ? '' : ' <span style="color:#8a7a5a; font-size:0.75rem;">(not ready)</span>'}</td>
+          <td>${c.restarts}</td>
+          <td style="font-size:0.85rem;">${last}</td>
+          <td><a href="/admin/health/${slug}${escapeHtml(q)}#logs">logs</a></td>
+        </tr>`;
+      }).join('');
+      return head + cs;
+    }).join('');
+    body += `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Container</th><th>Image tag</th><th>State</th><th>Restarts</th><th>Last terminated</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+  }
+
+  // Warning events
+  body += `<h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">Warning events (last hour)</h2>`;
+  if (!s.events.length) {
+    body += '<p class="help">No warning events in the last hour.</p>';
+  } else {
+    body += `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>When</th><th>Reason</th><th>Object</th><th>Count</th><th>Message</th></tr></thead>
+      <tbody>${s.events.map((e) => `
+        <tr>
+          <td style="white-space:nowrap;">${escapeHtml(whenLabel(e.lastTimestamp))}</td>
+          <td style="color:${['FailedScheduling', 'BackOff', 'Unhealthy'].includes(e.reason) ? '#e8b94a' : '#f3ead9'};">${escapeHtml(e.reason)}</td>
+          <td><code style="font-size:0.75rem;">${escapeHtml(e.involvedKind)}/${escapeHtml(e.involvedName)}</code></td>
+          <td>${e.count}</td>
+          <td style="font-size:0.8rem;">${escapeHtml(e.message)}</td>
+        </tr>`).join('')}</tbody>
+    </table></div>`;
+  }
+
+  // Quota
+  body += `<h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">Resource quota</h2>`;
+  if (!s.quota) {
+    body += '<p class="help">No ResourceQuota found for this namespace (or the lookup failed).</p>';
+  } else {
+    body += `<div style="max-width:34rem;">
+      ${quotaBar('CPU requests', s.quota.cpuUsed, s.quota.cpuHard, s.quota.cpuFraction)}
+      ${quotaBar('Memory requests', s.quota.memoryUsed, s.quota.memoryHard, s.quota.memoryFraction)}
+      ${quotaBar('Pods', s.quota.podsUsed, s.quota.podsHard, quotaFraction(s.quota.podsUsed, s.quota.podsHard))}
+    </div>
+    ${s.metrics ? `<p style="color:#8a7a5a; font-size:0.85rem;">Live usage (metrics.k8s.io): ${escapeHtml(fmtMillicores(s.metrics.cpuMillicores))} CPU, ${escapeHtml(fmtBytes(s.metrics.memoryBytes))} memory across ${s.pods.length} pods.</p>`
+      : '<p style="color:#8a7a5a; font-size:0.85rem;">Live usage: n/a (metrics.k8s.io unavailable).</p>'}`;
+  }
+
+  // Argo
+  body += `<h2 style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">ArgoCD</h2>`;
+  if (!s.argo) {
+    body += '<p class="help">No ArgoCD Application found for this project.</p>';
+  } else {
+    body += `<p>${argoCell(s.argo.sync, s.argo.health)}
+      ${s.argo.revision ? `<code style="font-size:0.75rem; margin-left:0.5rem;">${escapeHtml(s.argo.revision)}</code>` : ''}
+      ${s.argo.message ? `<br><span style="color:#8a7a5a; font-size:0.85rem;">${escapeHtml(s.argo.message)}</span>` : ''}</p>`;
+  }
+
+  // Log viewer
+  if (view.logs) {
+    body += `<h2 id="logs" style="font-size:1.05rem; color:#fdf6e8; margin-top:2rem;">Logs —
+      <code>${escapeHtml(view.logs.pod)}</code> / <code>${escapeHtml(view.logs.container)}</code>
+      <span style="color:#8a7a5a; font-size:0.8rem;">(last 200 lines)</span></h2>`;
+    body += view.logs.text === null
+      ? `<p class="help" style="color:#d9734a;">${escapeHtml(view.logs.error || 'Log fetch failed.')}</p>`
+      : `<pre class="snippet">${escapeHtml(view.logs.text || '(no output)')}</pre>`;
+  }
+
+  body += `<p style="color:#8a7a5a; font-size:0.8rem; margin-top:1.5rem;">Collected ${escapeHtml(whenLabel(s.collectedAt))}
+    — snapshots are cached for 30 s; reload after that for fresh data.</p>`;
+
+  return dashboardLayout(`Health — ${s.slug}`, body, email, true, 'admin-health');
 }
 
 // ── Admin: all projects + ownership transfer ───────────────────────────────
