@@ -116,11 +116,24 @@ func publicBase(r *http.Request, override string) string {
 
 // maxUpstreamBody caps how much of an upstream metadata response (npm packument,
 // PyPI Simple listing) we buffer in memory, bounding a memory-exhaustion DoS
-// from a hostile/compromised upstream. Even the largest real packuments/listings
-// (@types/*, aws-sdk, boto3) are tens of MiB, so 64 MiB is generous while
-// keeping the worst-case footprint small relative to the pod memory limit even
-// under concurrent requests.
-const maxUpstreamBody = 64 << 20 // 64 MiB
+// from a hostile/compromised upstream. Most real packuments/listings are tens
+// of MiB, but the full packument of a package with thousands of releases
+// (@prisma/client, @types/node) can exceed 64 MiB and would otherwise be
+// answered with 502, breaking every install that depends on it. The default is
+// 256 MiB; operators tune it with server.maxUpstreamBody /
+// COOLDEPS_SERVER_MAXUPSTREAMBODY (see SetMaxUpstreamBody).
+const defaultMaxUpstreamBody int64 = 256 << 20 // 256 MiB
+
+var maxUpstreamBody = defaultMaxUpstreamBody
+
+// SetMaxUpstreamBody sets the upstream metadata body cap for all backends. Call
+// it once at startup before serving; values <= 0 restore the default.
+func SetMaxUpstreamBody(n int64) {
+	if n <= 0 {
+		n = defaultMaxUpstreamBody
+	}
+	maxUpstreamBody = n
+}
 
 // readAllLimited reads up to maxUpstreamBody bytes, transparently gunzipping a
 // gzip-encoded body. It errors if the body exceeds the cap (truncating could

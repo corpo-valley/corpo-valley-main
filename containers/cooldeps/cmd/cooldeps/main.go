@@ -85,6 +85,8 @@ func run(cfg config.Config, log *slog.Logger) error {
 		FetchConcurrency: cfg.Cache.FetchConcurrency,
 	})
 
+	backend.SetMaxUpstreamBody(int64(cfg.Server.MaxUpstreamBody))
+
 	// Dedicated client for artifact streaming (longer timeout than metadata).
 	artifactHTTP := &http.Client{Timeout: 5 * time.Minute}
 

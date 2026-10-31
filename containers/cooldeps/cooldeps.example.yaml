@@ -17,6 +17,7 @@ server:
   pypiUpstream: https://pypi.org
   goUpstream: https://proxy.golang.org
   publicURL: ""                          # COOLDEPS_SERVER_PUBLICURL — base for rewritten npm tarball URLs (default: derived from request)
+  maxUpstreamBody: 256MB                 # COOLDEPS_SERVER_MAXUPSTREAMBODY — cap on a buffered upstream packument/listing; larger → 502
 
 cache:
   dataDir: /data                         # COOLDEPS_CACHE_DATADIR — metadata DB + artifact cache root

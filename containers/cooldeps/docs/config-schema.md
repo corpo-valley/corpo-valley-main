@@ -48,6 +48,7 @@ policy:   { ... }   # the gate (cooldown / license / cve / overrides)
 | `pypiUpstream` | URL | `https://pypi.org` | absolute `http(s)` + host | PyPI origin. |
 | `goUpstream` | URL | `https://proxy.golang.org` | absolute `http(s)` + host | Go module proxy origin. |
 | `publicURL` | URL | _(derived from request)_ | absolute `http(s)` + host (when set) | Base used to rewrite npm tarball URLs back through the proxy. |
+| `maxUpstreamBody` | bytes | `256MB` | `> 0` | Largest upstream metadata response (npm packument, PyPI Simple listing) buffered in memory; larger responses are answered with 502. Full packuments of packages with thousands of releases (`@prisma/client`) exceed 64 MB. |
 
 ### 1.2 `cache`
 
@@ -149,6 +150,7 @@ COOLDEPS_SERVER_NPMUPSTREAM     COOLDEPS_CACHE_ARTIFACTMAXBYTES    COOLDEPS_POLI
 COOLDEPS_SERVER_PYPIUPSTREAM    COOLDEPS_CACHE_VULNTTL             COOLDEPS_POLICY_RELEASEAGE_BLOCKONUNKNOWN
 COOLDEPS_SERVER_GOUPSTREAM      COOLDEPS_CACHE_METATTL             COOLDEPS_POLICY_CVE_MAXSEVERITY
 COOLDEPS_SERVER_PUBLICURL       COOLDEPS_CACHE_METANOTFOUNDREFRESH COOLDEPS_POLICY_CVE_WARNONLY
+COOLDEPS_SERVER_MAXUPSTREAMBODY
                                 COOLDEPS_CACHE_FETCHCONCURRENCY    COOLDEPS_POLICY_CVE_FETCHSEVERITY
 ```
 
@@ -329,7 +331,8 @@ Draft 2020-12. Covers structure, types, and enums; the cross-field semantics in
         "npmUpstream": { "type": "string", "format": "uri" },
         "pypiUpstream": { "type": "string", "format": "uri" },
         "goUpstream": { "type": "string", "format": "uri" },
-        "publicURL": { "type": "string" }
+        "publicURL": { "type": "string" },
+        "maxUpstreamBody": { "type": ["string", "integer"] }
       }
     },
     "cache": {

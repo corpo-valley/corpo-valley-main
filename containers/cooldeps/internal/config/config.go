@@ -51,6 +51,11 @@ type Server struct {
 	PyPIUpstream  string `yaml:"pypiUpstream"`  // COOLDEPS_SERVER_PYPIUPSTREAM
 	GoUpstream    string `yaml:"goUpstream"`    // COOLDEPS_SERVER_GOUPSTREAM
 	PublicURL     string `yaml:"publicURL"`     // COOLDEPS_SERVER_PUBLICURL
+	// MaxUpstreamBody caps how much of an upstream metadata response (npm
+	// packument, PyPI Simple listing) is buffered in memory. Oversized responses
+	// are answered with 502. Full packuments of very large packages such as
+	// @prisma/client exceed 64 MiB, so the default is 256 MiB.
+	MaxUpstreamBody Bytes `yaml:"maxUpstreamBody"` // COOLDEPS_SERVER_MAXUPSTREAMBODY
 }
 
 // Cache is storage and freshness tuning.
@@ -69,11 +74,12 @@ type Cache struct {
 func defaults() Config {
 	return Config{
 		Server: Server{
-			Addr:         ":8080",
-			LogLevel:     "info",
-			NPMUpstream:  "https://registry.npmjs.org",
-			PyPIUpstream: "https://pypi.org",
-			GoUpstream:   "https://proxy.golang.org",
+			Addr:            ":8080",
+			LogLevel:        "info",
+			NPMUpstream:     "https://registry.npmjs.org",
+			PyPIUpstream:    "https://pypi.org",
+			GoUpstream:      "https://proxy.golang.org",
+			MaxUpstreamBody: Bytes(256 << 20), // 256 MiB
 		},
 		Cache: Cache{
 			DataDir:             "/data",
@@ -143,6 +149,7 @@ func applyEnv(c *Config, l *loader) {
 	l.str(&s.PyPIUpstream, "COOLDEPS_SERVER_PYPIUPSTREAM")
 	l.str(&s.GoUpstream, "COOLDEPS_SERVER_GOUPSTREAM")
 	l.str(&s.PublicURL, "COOLDEPS_SERVER_PUBLICURL")
+	l.bytes(&s.MaxUpstreamBody, "COOLDEPS_SERVER_MAXUPSTREAMBODY")
 
 	ch := &c.Cache
 	l.str(&ch.DataDir, "COOLDEPS_CACHE_DATADIR")
